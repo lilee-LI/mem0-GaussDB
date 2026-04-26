@@ -1,0 +1,273 @@
+import pytest
+from pydantic import ValidationError
+from unittest.mock import MagicMock, patch
+
+from mem0.configs.vector_stores.gaussdb import GaussDBConfig
+from mem0.utils.factory import VectorStoreFactory
+from mem0.vector_stores.configs import VectorStoreConfig
+from mem0.vector_stores.gaussdb import GaussDB
+
+
+def make_gaussdb(**kwargs):
+    mock_conn = MagicMock()
+    mock_cursor = MagicMock()
+    mock_conn.cursor.return_value = mock_cursor
+    mock_pool = MagicMock()
+    mock_pool.getconn.return_value = mock_conn
+
+    config = {
+        "connection_pool": mock_pool,
+        "collection_name": "test_collection",
+        "embedding_model_dims": 3,
+        "enable_capability_probe": False,
+        "auto_create": False,
+    }
+    config.update(kwargs)
+    db = GaussDB(**config)
+    return db, mock_pool, mock_conn, mock_cursor
+
+
+def executed_sql(mock_cursor):
+    return "\n".join(str(call.args[0]) for call in mock_cursor.execute.call_args_list)
+
+
+def test_gaussdb_config_defaults_and_alias():
+    cfg = GaussDBConfig(
+        dbname="mem0db",
+        connection_pool=object(),
+        auto_create=False,
+        enable_capability_probe=False,
+    )
+
+    assert cfg.database == "mem0db"
+    assert cfg.table_storage == "ustore"
+    assert cfg.compatibility_mode == "A"
+    assert cfg.gaussdb_version_baseline == "506"
+    assert cfg.vector_index_type == "gsdiskann"
+    assert cfg.vector_metric == "cosine"
+    assert cfg.bm25_ranking_metric == 0
+    assert cfg.bm25_ncandidates == 128
+    assert cfg.require_scoped_filters is True
+
+
+def test_gaussdb_config_rejects_extra_fields():
+    with pytest.raises(ValidationError):
+        GaussDBConfig(connection_pool=object(), unexpected=True)
+
+
+def test_vector_store_config_and_factory_register_gaussdb():
+    cfg = VectorStoreConfig(
+        provider="gaussdb",
+        config={
+            "connection_pool": object(),
+            "auto_create": False,
+            "enable_capability_probe": False,
+        },
+    )
+
+    assert isinstance(cfg.config, GaussDBConfig)
+    assert VectorStoreFactory.provider_to_class["gaussdb"] == "mem0.vector_stores.gaussdb.GaussDB"
+
+
+def test_factory_creates_gaussdb_instance():
+    db, mock_pool, _, _ = make_gaussdb()
+    created = VectorStoreFactory.create(
+        "gaussdb",
+        {
+            "connection_pool": mock_pool,
+            "collection_name": "test_collection",
+            "embedding_model_dims": 3,
+            "enable_capability_probe": False,
+            "auto_create": False,
+        },
+    )
+
+    assert isinstance(created, GaussDB)
+    assert created.collection_name == db.collection_name
+
+
+def test_rejects_unsafe_identifier():
+    with pytest.raises(ValueError, match="Unsafe collection_name"):
+        make_gaussdb(collection_name='bad";drop')
+
+
+def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
+    db, _, mock_conn, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    db.create_col()
+
+    sql = executed_sql(mock_cursor)
+    assert "WITH (storage_type=ustore)" in sql
+    assert "FLOATVECTOR(3)" in sql
+    assert "USING gsdiskann (vector COSINE)" in sql
+    assert "USING bm25 (text_lemmatized)" in sql
+    assert "storage_parameter='USTORE'" in sql
+    assert "payload->>'user_id'" in sql
+    mock_conn.commit.assert_called()
+
+
+def test_insert_uses_upsert_and_vector_cast():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    with patch("mem0.vector_stores.gaussdb.execute_values", None):
+        db.insert(
+            vectors=[[0.1, 0.2, 0.3]],
+            payloads=[{"data": "hello", "text_lemmatized": "hello", "user_id": "u1"}],
+            ids=["11111111-1111-1111-1111-111111111111"],
+        )
+
+    assert mock_cursor.executemany.called
+    sql = mock_cursor.executemany.call_args.args[0]
+    rows = mock_cursor.executemany.call_args.args[1]
+    assert "ON CONFLICT (id) DO UPDATE" in sql
+    assert "%s::FLOATVECTOR" in sql
+    assert rows[0][1] == "[0.1,0.2,0.3]"
+    assert rows[0][3] == "hello"
+
+
+def test_search_uses_cosine_operator_filters_and_normalized_score():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = [("id1", 0.25, {"data": "hello", "user_id": "u1"})]
+
+    results = db.search("hello", [0.1, 0.2, 0.3], top_k=5, filters={"user_id": "u1"})
+
+    sql = executed_sql(mock_cursor)
+    assert "vector <+> %s::FLOATVECTOR AS distance" in sql
+    assert "payload->>%s = %s" in sql
+    assert results[0].id == "id1"
+    assert results[0].score == pytest.approx(0.8)
+    assert results[0].payload["data"] == "hello"
+
+
+def test_search_requires_scoped_filters_by_default():
+    db, _, _, _ = make_gaussdb()
+
+    with pytest.raises(ValueError, match="requires at least one scoped filter"):
+        db.search("hello", [0.1, 0.2, 0.3], filters={"category": "test"})
+
+
+def test_filter_builder_rejects_unsafe_keys():
+    db, _, _, _ = make_gaussdb(require_scoped_filters=False)
+
+    with pytest.raises(ValueError, match="Unsafe filter key"):
+        db.list(filters={"bad-key": "x"})
+
+
+def test_keyword_search_uses_bm25_defaults_and_filters():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = [("id1", 2.5, {"data": "hello", "user_id": "u1"})]
+
+    results = db.keyword_search("hello", top_k=3, filters={"user_id": "u1"})
+
+    sql = executed_sql(mock_cursor)
+    assert "SET bm25_ranking_metric = 0" in sql
+    assert "SET bm25_ncandidates = 128" in sql
+    assert "text_lemmatized ### %s AS score" in sql
+    assert "ORDER BY score DESC, id ASC" in sql
+    assert results[0].score == 2.5
+
+
+def test_keyword_search_empty_query_returns_empty_list():
+    db, _, _, mock_cursor = make_gaussdb()
+
+    assert db.keyword_search(" ", filters={"user_id": "u1"}) == []
+    mock_cursor.execute.assert_not_called()
+
+
+def test_keyword_search_returns_none_when_bm25_disabled():
+    db, _, _, _ = make_gaussdb(bm25_enabled=False)
+
+    assert db.keyword_search("hello", filters={"user_id": "u1"}) is None
+
+
+def test_search_batch_returns_one_result_list_per_query():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = [
+        (0, "id1", 0.1, {"data": "a", "user_id": "u1"}),
+        (1, "id2", 0.2, {"data": "b", "user_id": "u1"}),
+    ]
+
+    results = db.search_batch(
+        queries=["a", "b"],
+        vectors_list=[[0.1, 0.2, 0.3], [0.3, 0.2, 0.1]],
+        filters={"user_id": "u1"},
+    )
+
+    assert len(results) == 2
+    assert results[0][0].id == "id1"
+    assert results[1][0].id == "id2"
+    assert "CROSS JOIN LATERAL" in executed_sql(mock_cursor)
+
+
+def test_search_batch_falls_back_to_sequential_when_native_batch_fails():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.execute.side_effect = [Exception("lateral unsupported"), None, None]
+    mock_cursor.fetchall.side_effect = [
+        [("id1", 0.1, {"data": "a", "user_id": "u1"})],
+        [("id2", 0.2, {"data": "b", "user_id": "u1"})],
+    ]
+
+    results = db.search_batch(
+        queries=["a", "b"],
+        vectors_list=[[0.1, 0.2, 0.3], [0.3, 0.2, 0.1]],
+        filters={"user_id": "u1"},
+    )
+
+    assert len(results) == 2
+    assert results[0][0].id == "id1"
+    assert results[1][0].id == "id2"
+    assert db.metrics["gaussdb_fallback_count"] == 1
+
+
+def test_update_vector_and_payload_updates_timestamp():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    db.update("id1", vector=[0.1, 0.2, 0.3], payload={"data": "new", "text_lemmatized": "new"})
+
+    sql = executed_sql(mock_cursor)
+    assert 'UPDATE "test_collection"' in sql
+    assert "vector = %s::FLOATVECTOR" in sql
+    assert "payload = %s" in sql
+    assert "updated_at = CURRENT_TIMESTAMP" in sql
+
+
+def test_delete_is_idempotent_sql_path():
+    db, _, mock_conn, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    db.delete("id1")
+
+    sql = executed_sql(mock_cursor)
+    assert 'DELETE FROM "test_collection" WHERE id = %s' in sql
+    mock_conn.commit.assert_called()
+
+
+def test_list_returns_wrapped_results():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = [("id1", {"data": "hello", "user_id": "u1"})]
+
+    results = db.list(filters={"user_id": "u1"})
+
+    assert isinstance(results, list)
+    assert isinstance(results[0], list)
+    assert results[0][0].id == "id1"
+
+
+def test_transaction_rollback_on_error():
+    db, _, mock_conn, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.execute.side_effect = Exception("Database error")
+
+    with pytest.raises(Exception, match="Database error"):
+        db.delete("id1")
+
+    mock_conn.rollback.assert_called()
+
+
+def test_migration_dry_run_and_backfill_report():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchone.return_value = (7,)
+
+    plan = db.migration_dry_run()
+    report = db.backfill_derived_fields(dry_run=True)
+
+    assert plan["mutates_data"] is False
+    assert report == {"dry_run": True, "estimated_rows": 7}

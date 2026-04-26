@@ -1,0 +1,174 @@
+---
+title: "GaussDB"
+description: "Use GaussDB centralized A-mode Ustore as a Mem0 vector store with native floatvector, BM25, and metadata filtering."
+---
+
+GaussDB support stores Mem0 memories in a centralized GaussDB Ustore table and uses native database capabilities for retrieval:
+
+- `FLOATVECTOR` for semantic vector search
+- `gsdiskann` or `gsivfflat` for vector indexes
+- native BM25 on `text_lemmatized` for `keyword_search`
+- metadata filters for `user_id`, `agent_id`, and `run_id`
+
+The provider targets GaussDB `506` centralized deployments running in A compatibility mode with Ustore tables.
+
+### Driver
+
+Use the GaussDB official `psycopg2` driver package for your GaussDB build. Do not use PyPI `psycopg2-binary` as the production default driver unless your GaussDB team has validated it for your database version.
+
+The provider imports the driver through the `psycopg2` API and uses `ThreadedConnectionPool`.
+
+### Usage
+
+```python Python
+import os
+from mem0 import Memory
+
+os.environ["OPENAI_API_KEY"] = "sk-xx"
+
+config = {
+    "vector_store": {
+        "provider": "gaussdb",
+        "config": {
+            "host": "127.0.0.1",
+            "port": 8000,
+            "database": "postgres",
+            "user": "gaussdb_user",
+            "password": "gaussdb_password",
+            "collection_name": "memories",
+            "embedding_model_dims": 1536,
+            "vector_index_type": "gsdiskann",
+            "vector_metric": "cosine",
+            "bm25_enabled": True,
+            "require_scoped_filters": True,
+        },
+    },
+}
+
+memory = Memory.from_config(config)
+memory.add("I prefer window seats on morning flights.", user_id="alice")
+results = memory.search("flight seat preference", filters={"user_id": "alice"})
+```
+
+### Config
+
+| Parameter | Description | Default Value |
+| --- | --- | --- |
+| `database` / `dbname` | GaussDB database name | `postgres` |
+| `collection_name` | Collection table name | `mem0` |
+| `embedding_model_dims` | Embedding vector dimension | `1536` |
+| `user` | Database user | `None` |
+| `password` | Database password | `None` |
+| `host` | Database host | `None` |
+| `port` | Database port | `None` |
+| `connection_string` | Connection string; overrides individual connection fields | `None` |
+| `connection_pool` | Existing `psycopg2` pool | `None` |
+| `minconn` / `maxconn` | Connection pool bounds | `1` / `5` |
+| `sslmode` | SSL mode | `None` |
+| `sslrootcert` | SSL root certificate path | `None` |
+| `table_storage` | Table storage type | `ustore` |
+| `compatibility_mode` | Compatibility mode | `A` |
+| `gaussdb_version_baseline` | Commercial baseline family | `506` |
+| `id_column_type` | `uuid` or `varchar` | `uuid` |
+| `vector_index_type` | `gsdiskann` or `gsivfflat` | `gsdiskann` |
+| `vector_metric` | `cosine` or `l2` | `cosine` |
+| `bm25_enabled` | Enable native BM25 keyword search | `True` |
+| `bm25_fail_fast` | Raise BM25 errors instead of semantic-only fallback | `False` |
+| `bm25_ranking_metric` | GaussDB BM25 ranking metric; `0` is BM25_OKAPI | `0` |
+| `bm25_ncandidates` | GaussDB BM25 candidate count | `128` |
+| `bm25_dictionary` | Optional BM25 dictionary | `None` |
+| `metadata_column_mode` | `jsonb`, `text`, or `redundant_columns` | `jsonb` |
+| `allowed_filter_keys` | Optional metadata filter allowlist | `None` |
+| `require_scoped_filters` | Require scoped read filters | `True` |
+| `scope_filter_keys` | Scoped filter keys | `["user_id", "agent_id", "run_id"]` |
+| `enable_capability_probe` | Probe vector, BM25, and metadata capabilities on init | `True` |
+| `slow_query_ms` | Slow query warning threshold | `1000` |
+| `retry_attempts` | Retry attempts for transient database failures | `2` |
+
+### Defaults
+
+The default vector metric is `cosine`. Semantic search uses the `FLOATVECTOR` cosine distance operator `<+>` and creates vector indexes with `COSINE`, for example:
+
+```sql
+CREATE INDEX memories_vector_idx
+ON memories
+USING gsdiskann (vector COSINE);
+```
+
+BM25 uses GaussDB native defaults unless overridden:
+
+- `bm25_ranking_metric = 0`
+- `bm25_ncandidates = 128`
+- database/default dictionary
+
+`require_scoped_filters` is enabled by default. In commercial deployments, `search`, `keyword_search`, `search_batch`, and `list` must include at least one of `user_id`, `agent_id`, or `run_id`. Disable this only for tests, migrations, or trusted administrator workflows.
+
+### Capability Checks
+
+Before production traffic, validate the target GaussDB environment:
+
+```sql
+SET enable_vectordb = on;
+
+CREATE TABLE mem0_probe (
+    id UUID PRIMARY KEY,
+    vector FLOATVECTOR(1536),
+    payload JSONB,
+    text_lemmatized TEXT
+) WITH (storage_type=ustore);
+
+CREATE INDEX mem0_probe_vector_idx
+ON mem0_probe
+USING gsdiskann (vector COSINE);
+
+CREATE INDEX mem0_probe_bm25_idx
+ON mem0_probe
+USING bm25 (text_lemmatized)
+WITH (storage_parameter='USTORE');
+
+SELECT text_lemmatized ### 'probe' AS score
+FROM mem0_probe
+ORDER BY score DESC
+LIMIT 1;
+```
+
+If `JSONB` or JSON expression indexes are unavailable in your A-mode environment, set `metadata_column_mode="redundant_columns"` to index `user_id`, `agent_id`, and `run_id` as normal columns.
+
+### Operations
+
+The provider includes helper methods for operational workflows:
+
+- `migration_dry_run()` reports planned schema and backfill actions.
+- `backfill_derived_fields(dry_run=True)` reports rows missing `memory` or `text_lemmatized`.
+- `backfill_derived_fields(dry_run=False)` fills derived fields from payload values when possible.
+- `rebuild_indexes()` recreates vector, BM25, and filter indexes.
+- `analyze()` runs `ANALYZE` on the collection table.
+
+### Migration and Rollback
+
+Use `migration_dry_run()` before changing collection schema or metadata mode. Review the planned actions and affected rows before running any mutating backfill.
+
+Recommended rollout sequence:
+
+1. Run capability checks against the target GaussDB `506` build.
+2. Create a fresh collection with the target config.
+3. Backfill or import records.
+4. Run semantic, BM25, filter-isolation, and entity batch-search checks.
+5. Switch Mem0 configuration to the GaussDB provider.
+
+Rollback options:
+
+- Before data migration: switch Mem0 back to the previous vector store provider.
+- After data migration: restore from the database backup or keep the previous provider collection intact until replay checks pass.
+- BM25-specific failure: set `bm25_enabled=False` only if semantic-only fallback is acceptable for the workflow.
+- Vector capability failure: keep fail-fast behavior and do not serve traffic from the collection.
+
+### Troubleshooting
+
+| Symptom | Likely Cause | Action |
+| --- | --- | --- |
+| Import error for `psycopg2` | GaussDB official driver package is not installed | Install the GaussDB `psycopg2` wheel for your database build |
+| Initialization fails on vector probe | `enable_vectordb`, `FLOATVECTOR`, or vector index support is unavailable | Check GaussDB version/build and vector feature enablement |
+| BM25 is disabled | BM25 index creation or score query failed and `bm25_fail_fast=False` | Verify BM25 support on Ustore and check `storage_parameter='USTORE'` |
+| Filter queries are slow | JSON expression indexes are unavailable or not used | Use `metadata_column_mode="redundant_columns"` |
+| Read operation raises scoped filter error | `require_scoped_filters=True` and no tenant filter was supplied | Pass `filters={"user_id": ...}` or another configured scope key |
