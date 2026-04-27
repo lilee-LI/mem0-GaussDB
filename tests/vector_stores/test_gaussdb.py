@@ -332,6 +332,31 @@ def test_list_returns_wrapped_results():
     assert results[0][0].id == "id1"
 
 
+def test_col_info_reads_schema_version_from_metadata_table():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchone.side_effect = [(3,), (True,), (7,)]
+    mock_cursor.fetchall.return_value = [("test_collection_vector_idx",), ("test_collection_bm25_idx",)]
+
+    info = db.col_info()
+
+    sql = executed_sql(mock_cursor)
+    assert "information_schema.tables" in sql
+    assert 'FROM "test_collection_schema_meta"' in sql
+    assert info["count"] == 3
+    assert info["schema_version"] == 7
+    assert info["indexes"] == ["test_collection_vector_idx", "test_collection_bm25_idx"]
+
+
+def test_col_info_defaults_schema_version_when_metadata_table_is_missing():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchone.side_effect = [(3,), (False,)]
+    mock_cursor.fetchall.return_value = []
+
+    info = db.col_info()
+
+    assert info["schema_version"] == 1
+
+
 def test_transaction_rollback_on_error():
     db, _, mock_conn, mock_cursor = make_gaussdb(require_scoped_filters=False)
     mock_cursor.execute.side_effect = Exception("Database error")

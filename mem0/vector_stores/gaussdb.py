@@ -880,6 +880,7 @@ class GaussDB(VectorStoreBase):
             with self._get_cursor() as cur:
                 cur.execute(f"SELECT COUNT(*) FROM {self.table_name}")
                 row_count = cur.fetchone()[0]
+                schema_version = self._read_schema_version(cur)
                 cur.execute(
                     """
                     SELECT indexname
@@ -894,7 +895,7 @@ class GaussDB(VectorStoreBase):
                 "name": self.collection_name,
                 "count": row_count,
                 "dimension": self.embedding_model_dims,
-                "schema_version": 1,
+                "schema_version": schema_version,
                 "metadata_column_mode": self.metadata_column_mode,
                 "vector_index_type": self.vector_index_type,
                 "vector_metric": self.vector_metric,
@@ -903,6 +904,31 @@ class GaussDB(VectorStoreBase):
             }
 
         return self._run_with_retry("col_info", op)
+
+    def _read_schema_version(self, cur) -> int:
+        cur.execute(
+            """
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public' AND table_name = %s
+            )
+            """,
+            (f"{self.collection_name}_schema_meta",),
+        )
+        if not cur.fetchone()[0]:
+            return 1
+
+        cur.execute(
+            f"""
+            SELECT schema_version
+            FROM {self.schema_meta_table_name}
+            WHERE collection_name = %s
+            """,
+            (self.collection_name,),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row else 1
 
     def list(self, filters: Optional[dict] = None, top_k: Optional[int] = 100) -> List[List[OutputData]]:
         where_clause, params = self._build_where_clause(filters, require_scope=True)
