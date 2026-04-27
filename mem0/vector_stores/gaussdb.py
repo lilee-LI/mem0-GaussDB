@@ -35,6 +35,19 @@ _RETRYABLE_ERROR_FRAGMENTS = (
     "terminating connection",
 )
 
+_METADATA_MODE_MAP = {
+    "jsonb": ("jsonb", "json_expression"),
+    "redundant_columns": ("jsonb", "redundant_columns"),
+    "compatible": ("text", "redundant_columns"),
+    "text": ("text", "redundant_columns"),
+}
+
+_BM25_MODE_MAP = {
+    "auto": (True, False),
+    "required": (True, True),
+    "disabled": (False, False),
+}
+
 
 def _first_env(*names: str) -> Optional[str]:
     for name in names:
@@ -60,6 +73,8 @@ class CapabilityReport:
     jsonb: bool = False
     uuid: bool = False
     expression_index: bool = False
+    payload_storage_mode: str = "jsonb"
+    filter_storage_mode: str = "json_expression"
     metadata_column_mode: str = "jsonb"
 
 
@@ -105,7 +120,11 @@ class GaussDB(VectorStoreBase):
         bm25_ranking_metric: int = 0,
         bm25_ncandidates: int = 128,
         bm25_dictionary: Optional[str] = None,
+        bm25_mode: Optional[str] = None,
         metadata_column_mode: str = "jsonb",
+        metadata_mode: Optional[str] = "auto",
+        payload_storage_mode: Optional[str] = None,
+        filter_storage_mode: Optional[str] = None,
         allowed_filter_keys: Optional[List[str]] = None,
         require_scoped_filters: bool = True,
         scope_filter_keys: Optional[List[str]] = None,
@@ -115,6 +134,7 @@ class GaussDB(VectorStoreBase):
         retry_attempts: int = 2,
         retry_backoff_seconds: float = 0.1,
         auto_create: bool = True,
+        profile: str = "commercial",
     ):
         connection_string = (
             connection_string or dsn or url or _first_env("GAUSSDB_CONNECTION_STRING", "GAUSSDB_DSN", "GAUSSDB_URL")
@@ -143,19 +163,36 @@ class GaussDB(VectorStoreBase):
         self.table_storage = self._validate_choice(table_storage.lower(), "table_storage", {"ustore"})
         self.compatibility_mode = self._validate_choice(compatibility_mode.upper(), "compatibility_mode", {"A"})
         self.gaussdb_version_baseline = gaussdb_version_baseline
+        self.profile = self._validate_choice(str(profile).lower(), "profile", {"commercial", "compatibility"})
         self.id_column_type = self._validate_choice(id_column_type.lower(), "id_column_type", {"uuid", "varchar"})
         self.vector_index_type = self._validate_choice(
             vector_index_type.lower(), "vector_index_type", {"gsdiskann", "gsivfflat"}
         )
         self.vector_metric = self._validate_choice(vector_metric.lower(), "vector_metric", {"cosine", "l2"})
         self.vector_index_maintenance_work_mem = vector_index_maintenance_work_mem
-        self.bm25_enabled = bm25_enabled
-        self.bm25_fail_fast = bm25_fail_fast
+        self.bm25_enabled, self.bm25_fail_fast, self.bm25_mode = self._resolve_bm25_mode(
+            bm25_mode=bm25_mode,
+            bm25_enabled=bm25_enabled,
+            bm25_fail_fast=bm25_fail_fast,
+        )
         self.bm25_ranking_metric = int(bm25_ranking_metric)
         self.bm25_ncandidates = self._validate_positive_int(bm25_ncandidates, "bm25_ncandidates")
         self.bm25_dictionary = bm25_dictionary
-        self.metadata_column_mode = self._validate_choice(
-            metadata_column_mode.lower(), "metadata_column_mode", {"jsonb", "text", "redundant_columns"}
+        requested_metadata_mode = metadata_mode.lower() if isinstance(metadata_mode, str) else metadata_mode
+        if (
+            self.profile == "compatibility"
+            and requested_metadata_mode == "auto"
+            and payload_storage_mode is None
+            and filter_storage_mode is None
+            and metadata_column_mode.lower() == "jsonb"
+        ):
+            requested_metadata_mode = "compatible"
+        self.metadata_mode = requested_metadata_mode
+        self.payload_storage_mode, self.filter_storage_mode, self.metadata_column_mode = self._resolve_metadata_modes(
+            metadata_mode=self.metadata_mode,
+            metadata_column_mode=metadata_column_mode,
+            payload_storage_mode=payload_storage_mode,
+            filter_storage_mode=filter_storage_mode,
         )
         self.allowed_filter_keys = set(allowed_filter_keys) if allowed_filter_keys else None
         self.require_scoped_filters = require_scoped_filters
@@ -168,6 +205,8 @@ class GaussDB(VectorStoreBase):
         self.connection_pool = connection_pool
         self.capabilities = CapabilityReport(
             baseline=self.gaussdb_version_baseline,
+            payload_storage_mode=self.payload_storage_mode,
+            filter_storage_mode=self.filter_storage_mode,
             metadata_column_mode=self.metadata_column_mode,
         )
         self.metrics: Dict[str, int] = {}
@@ -200,10 +239,78 @@ class GaussDB(VectorStoreBase):
         return value
 
     @staticmethod
+    def _resolve_metadata_modes(
+        metadata_mode: Optional[str],
+        metadata_column_mode: str,
+        payload_storage_mode: Optional[str],
+        filter_storage_mode: Optional[str],
+    ) -> Tuple[str, str, str]:
+        if metadata_mode is not None:
+            metadata_mode = GaussDB._validate_choice(
+                metadata_mode.lower(),
+                "metadata_mode",
+                {"auto", "jsonb", "redundant_columns", "compatible", "text"},
+            )
+        legacy_mode = GaussDB._validate_choice(
+            metadata_column_mode.lower(), "metadata_column_mode", {"jsonb", "text", "redundant_columns"}
+        )
+
+        if metadata_mode not in (None, "auto") and payload_storage_mode is None and filter_storage_mode is None:
+            payload_storage_mode, filter_storage_mode = _METADATA_MODE_MAP[metadata_mode]
+
+        if payload_storage_mode is None:
+            payload_mode = "text" if legacy_mode == "text" else "jsonb"
+        else:
+            payload_mode = GaussDB._validate_choice(
+                payload_storage_mode.lower(), "payload_storage_mode", {"jsonb", "text"}
+            )
+
+        if filter_storage_mode is None:
+            if payload_mode == "text" or legacy_mode in {"text", "redundant_columns"}:
+                filter_mode = "redundant_columns"
+            else:
+                filter_mode = "json_expression"
+        else:
+            filter_mode = GaussDB._validate_choice(
+                filter_storage_mode.lower(), "filter_storage_mode", {"json_expression", "redundant_columns"}
+            )
+
+        if payload_mode == "text" and filter_mode == "json_expression":
+            raise ValueError("filter_storage_mode='json_expression' requires payload_storage_mode='jsonb'")
+
+        if payload_mode == "text":
+            resolved_legacy_mode = "text"
+        elif filter_mode == "redundant_columns":
+            resolved_legacy_mode = "redundant_columns"
+        else:
+            resolved_legacy_mode = "jsonb"
+        return payload_mode, filter_mode, resolved_legacy_mode
+
+    @staticmethod
+    def _resolve_bm25_mode(
+        bm25_mode: Optional[str],
+        bm25_enabled: bool,
+        bm25_fail_fast: bool,
+    ) -> Tuple[bool, bool, Optional[str]]:
+        if bm25_mode is None:
+            return bm25_enabled, bm25_fail_fast, None
+        mode = GaussDB._validate_choice(bm25_mode.lower(), "bm25_mode", {"auto", "required", "disabled"})
+        enabled, fail_fast = _BM25_MODE_MAP[mode]
+        return enabled, fail_fast, mode
+
+    @staticmethod
     def _validate_choice(value: str, field_name: str, choices: set[str]) -> str:
         if value not in choices:
             raise ValueError(f"{field_name} must be one of {sorted(choices)}")
         return value
+
+    def _sync_metadata_column_mode(self) -> None:
+        if self.payload_storage_mode == "text":
+            self.metadata_column_mode = "text"
+        elif self.filter_storage_mode == "redundant_columns":
+            self.metadata_column_mode = "redundant_columns"
+        else:
+            self.metadata_column_mode = "jsonb"
 
     @classmethod
     def _validate_identifier(cls, value: str, field_name: str = "identifier") -> str:
@@ -367,10 +474,10 @@ class GaussDB(VectorStoreBase):
         return "UUID" if self.id_column_type == "uuid" else "VARCHAR(36)"
 
     def _payload_column_sql(self) -> str:
-        return "TEXT" if self.metadata_column_mode == "text" else "JSONB"
+        return "TEXT" if self.payload_storage_mode == "text" else "JSONB"
 
     def _payload_value(self, payload: dict):
-        if self.metadata_column_mode == "text" or Json is None:
+        if self.payload_storage_mode == "text" or Json is None:
             return json.dumps(payload, ensure_ascii=False)
         return Json(payload)
 
@@ -391,6 +498,8 @@ class GaussDB(VectorStoreBase):
     def _probe_capabilities(self):
         report = CapabilityReport(
             baseline=self.gaussdb_version_baseline,
+            payload_storage_mode=self.payload_storage_mode,
+            filter_storage_mode=self.filter_storage_mode,
             metadata_column_mode=self.metadata_column_mode,
         )
 
@@ -425,7 +534,7 @@ class GaussDB(VectorStoreBase):
                 )
                 report.floatvector = True
                 report.uuid = self.id_column_type == "uuid"
-                report.jsonb = self.metadata_column_mode != "text"
+                report.jsonb = self.payload_storage_mode == "jsonb"
 
                 index_name = self._quote_identifier(self._index_name(f"probe_{uuid.uuid4().hex[:8]}", "vector_idx"))
                 self._set_vector_index_maintenance_work_mem(cur)
@@ -439,26 +548,76 @@ class GaussDB(VectorStoreBase):
                 report.vector_index = True
 
                 if self.bm25_enabled:
+                    bm25_enabled_before_probe = self.bm25_enabled
                     bm25_index = self._quote_identifier(self._index_name(f"probe_{uuid.uuid4().hex[:8]}", "bm25_idx"))
-                    cur.execute(
-                        f"""
-                        CREATE INDEX {bm25_index}
-                        ON {probe_table}
-                        USING bm25 (text_lemmatized)
-                        WITH (storage_type='USTORE')
-                        """
-                    )
-                    report.bm25 = True
+                    self._create_bm25_index(cur, probe_table, index_name=bm25_index)
+                    if bm25_enabled_before_probe and self.bm25_enabled:
+                        savepoint = self._quote_identifier(f"mem0_bm25_probe_{uuid.uuid4().hex[:8]}")
+                        cur.execute(f"SAVEPOINT {savepoint}")
+                        try:
+                            cur.execute(
+                                f"""
+                                INSERT INTO {probe_table} (id, vector, payload, text_lemmatized)
+                                VALUES (%s::{self._id_column_sql()}, %s::FLOATVECTOR, %s::{self._payload_column_sql()}, %s)
+                                """,
+                                (
+                                    str(uuid.uuid4()),
+                                    self._vector_literal([0.0] * self.embedding_model_dims),
+                                    self._payload_value({"probe": True}),
+                                    "probe memory",
+                                ),
+                            )
+                            self._apply_bm25_settings(cur)
+                            cur.execute(
+                                f"""
+                                SELECT text_lemmatized ### %s AS score
+                                FROM {probe_table}
+                                WHERE (text_lemmatized ### %s) >= 0
+                                ORDER BY score DESC
+                                LIMIT 1
+                                """,
+                                ("probe", "probe"),
+                            )
+                            if cur.fetchone() is None:
+                                raise RuntimeError("GaussDB BM25 probe did not return a score")
+                            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                            report.bm25 = True
+                        except Exception as exc:
+                            try:
+                                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                            except Exception:
+                                logger.debug("Failed to roll back BM25 score probe savepoint", exc_info=True)
+                            if self.bm25_fail_fast:
+                                raise
+                            logger.warning("BM25 score probe failed; keyword_search will be disabled: %s", exc)
+                            self.bm25_enabled = False
+                            self._increment_metric("gaussdb_fallback_count")
 
-                if self.metadata_column_mode == "jsonb":
+                if self.filter_storage_mode == "json_expression":
                     expr_index = self._quote_identifier(self._index_name(f"probe_{uuid.uuid4().hex[:8]}", "user_idx"))
-                    cur.execute(f"CREATE INDEX {expr_index} ON {probe_table} ((payload->>'user_id'))")
-                    report.expression_index = True
+                    try:
+                        cur.execute(f"CREATE INDEX {expr_index} ON {probe_table} ((payload->>'user_id'))")
+                        report.expression_index = True
+                    except Exception as exc:
+                        logger.warning(
+                            "JSON expression index probe failed; falling back to redundant scope columns: %s", exc
+                        )
+                        self.filter_storage_mode = "redundant_columns"
+                        self._sync_metadata_column_mode()
+                        report.filter_storage_mode = self.filter_storage_mode
+                        report.metadata_column_mode = self.metadata_column_mode
         except Exception as exc:
-            if "jsonb" in str(exc).lower() and self.metadata_column_mode == "jsonb":
-                logger.warning("JSONB probe failed; falling back to TEXT metadata mode: %s", exc)
-                self.metadata_column_mode = "text"
-                report.metadata_column_mode = "text"
+            if self.payload_storage_mode == "jsonb" and "jsonb" in str(exc).lower():
+                logger.warning("JSONB probe failed; falling back to TEXT payload and redundant scope columns: %s", exc)
+                self.payload_storage_mode = "text"
+                self.filter_storage_mode = "redundant_columns"
+                self._sync_metadata_column_mode()
+                report.payload_storage_mode = self.payload_storage_mode
+                report.filter_storage_mode = self.filter_storage_mode
+                report.metadata_column_mode = self.metadata_column_mode
+                report.jsonb = False
+                report.expression_index = False
             elif self.bm25_enabled and "bm25" in str(exc).lower() and not self.bm25_fail_fast:
                 logger.warning("BM25 probe failed; keyword_search will be disabled: %s", exc)
                 self.bm25_enabled = False
@@ -503,7 +662,7 @@ class GaussDB(VectorStoreBase):
         return self._run_with_retry("create_col", op)
 
     def _redundant_column_sql(self) -> str:
-        if self.metadata_column_mode != "redundant_columns":
+        if self.filter_storage_mode != "redundant_columns":
             return ""
         return ", user_id VARCHAR(128), agent_id VARCHAR(128), run_id VARCHAR(128)"
 
@@ -551,8 +710,10 @@ class GaussDB(VectorStoreBase):
         if self.vector_index_maintenance_work_mem:
             cur.execute("SET LOCAL maintenance_work_mem = %s", (self.vector_index_maintenance_work_mem,))
 
-    def _create_bm25_index(self, cur, table: str):
-        index_name = self._quote_identifier(self._index_name(self.collection_name, "bm25_idx"))
+    def _create_bm25_index(self, cur, table: str, index_name: Optional[str] = None):
+        index_name = index_name or self._quote_identifier(self._index_name(self.collection_name, "bm25_idx"))
+        savepoint = self._quote_identifier(f"mem0_bm25_{uuid.uuid4().hex[:8]}")
+        cur.execute(f"SAVEPOINT {savepoint}")
         try:
             cur.execute(
                 f"""
@@ -562,7 +723,13 @@ class GaussDB(VectorStoreBase):
                 WITH (storage_type='USTORE')
                 """
             )
+            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
         except Exception:
+            try:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except Exception:
+                logger.debug("Failed to roll back optional BM25 index savepoint", exc_info=True)
             if self.bm25_fail_fast:
                 raise
             self.bm25_enabled = False
@@ -573,9 +740,9 @@ class GaussDB(VectorStoreBase):
         for key in self.scope_filter_keys:
             safe_key = self._validate_filter_key(key)
             index_name = self._quote_identifier(self._index_name(self.collection_name, f"{safe_key}_idx"))
-            if self.metadata_column_mode == "redundant_columns" and safe_key in self._redundant_scope_columns:
+            if self.filter_storage_mode == "redundant_columns" and safe_key in self._redundant_scope_columns:
                 cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({self._quote_identifier(safe_key)})")
-            elif self.metadata_column_mode == "jsonb":
+            elif self.filter_storage_mode == "json_expression":
                 cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ((payload->>'{safe_key}'))")
 
     def _ensure_indexes(self, cur, table: str):
@@ -598,7 +765,7 @@ class GaussDB(VectorStoreBase):
         if not rows:
             return None
         columns = ["id", "vector", "payload", "memory", "text_lemmatized", "schema_version"]
-        if self.metadata_column_mode == "redundant_columns":
+        if self.filter_storage_mode == "redundant_columns":
             columns.extend(self._redundant_scope_columns)
         column_sql = ", ".join(self._quote_identifier(column) for column in columns)
         update_columns = [column for column in columns if column != "id"]
@@ -669,7 +836,7 @@ class GaussDB(VectorStoreBase):
             text_lemmatized,
             1,
         ]
-        if self.metadata_column_mode == "redundant_columns":
+        if self.filter_storage_mode == "redundant_columns":
             row.extend(payload.get(key) for key in self._redundant_scope_columns)
         return tuple(row)
 
@@ -820,7 +987,7 @@ class GaussDB(VectorStoreBase):
             text_lemmatized = payload.get("text_lemmatized") or memory
             set_clauses.extend(["payload = %s", "memory = %s", "text_lemmatized = %s"])
             params.extend([self._payload_value(payload), memory, text_lemmatized])
-            if self.metadata_column_mode == "redundant_columns":
+            if self.filter_storage_mode == "redundant_columns":
                 for key in self._redundant_scope_columns:
                     if key in payload:
                         set_clauses.append(f"{self._quote_identifier(key)} = %s")
@@ -900,9 +1067,14 @@ class GaussDB(VectorStoreBase):
                 "count": row_count,
                 "dimension": self.embedding_model_dims,
                 "schema_version": schema_version,
+                "profile": self.profile,
+                "metadata_mode": self.metadata_mode,
                 "metadata_column_mode": self.metadata_column_mode,
+                "payload_storage_mode": self.payload_storage_mode,
+                "filter_storage_mode": self.filter_storage_mode,
                 "vector_index_type": self.vector_index_type,
                 "vector_metric": self.vector_metric,
+                "bm25_mode": self.bm25_mode,
                 "bm25_enabled": self.bm25_enabled,
                 "indexes": indexes,
             }
@@ -963,17 +1135,25 @@ class GaussDB(VectorStoreBase):
         return {
             "collection_name": self.collection_name,
             "schema_version": 1,
+            "profile": self.profile,
+            "metadata_mode": self.metadata_mode,
+            "payload_storage_mode": self.payload_storage_mode,
+            "filter_storage_mode": self.filter_storage_mode,
             "planned_actions": [
                 "create_schema_meta_table_if_missing",
                 "ensure_text_lemmatized_column",
-                "ensure_scope_columns_when_metadata_column_mode_is_redundant_columns",
+                "ensure_scope_columns_when_filter_storage_mode_is_redundant_columns",
                 "ensure_vector_bm25_and_filter_indexes",
             ],
             "mutates_data": False,
+            "limits": [
+                "v1 dry-run reports provider-managed derived-field actions only",
+                "full schema diff and index rebuild planning should be handled by a dedicated migration workflow",
+            ],
         }
 
     def backfill_derived_fields(self, dry_run: bool = True) -> Dict[str, Any]:
-        if self.metadata_column_mode == "text":
+        if self.payload_storage_mode == "text":
             return {
                 "dry_run": dry_run,
                 "estimated_rows": None,
@@ -1145,14 +1325,14 @@ class GaussDB(VectorStoreBase):
         return f"{field_sql} {operator} ({placeholders})", [*params, *[str(value) for value in values]]
 
     def _field_sql(self, key: str) -> Tuple[str, List[Any]]:
-        if self.metadata_column_mode == "redundant_columns" and key in self._redundant_scope_columns:
+        if self.filter_storage_mode == "redundant_columns" and key in self._redundant_scope_columns:
             return self._quote_identifier(key), []
-        if self.metadata_column_mode == "jsonb":
+        if self.filter_storage_mode == "json_expression":
             self._validate_filter_key(key)
             return f"payload->>'{key}'", []
         raise ValueError(
-            f"Filter key {key!r} is not available in metadata_column_mode={self.metadata_column_mode!r}; "
-            "use redundant_columns for scoped filters or jsonb for payload filters."
+            f"Filter key {key!r} is not available in filter_storage_mode={self.filter_storage_mode!r}; "
+            "use redundant_columns for scoped filters or json_expression for payload filters."
         )
 
     def __del__(self):

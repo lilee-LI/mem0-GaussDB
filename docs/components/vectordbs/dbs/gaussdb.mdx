@@ -69,7 +69,16 @@ Most users should start with the minimal connection fields below.
 | `collection_name` | Collection table name | `mem0` |
 | `embedding_model_dims` | Embedding vector dimension | `1536` |
 
-Advanced parameters are optional and should usually be changed only for tuning, compatibility fallback, or operations.
+Use the high-level mode parameters first. They derive the lower-level compatibility settings while keeping the common
+configuration short.
+
+| Parameter | Description | Default Value |
+| --- | --- | --- |
+| `profile` | Defaults profile: `commercial` or `compatibility`. `compatibility` prefers safer A-mode fallbacks. | `commercial` |
+| `metadata_mode` | Metadata storage/filter mode: `auto`, `jsonb`, `redundant_columns`, `compatible`, or `text` | `auto` |
+| `bm25_mode` | BM25 behavior: `auto`, `required`, or `disabled` | `auto` |
+
+Advanced parameters are optional and should usually be changed only for tuning, explicit compatibility fallback, or operations.
 
 | Parameter | Description | Default Value |
 | --- | --- | --- |
@@ -90,7 +99,9 @@ Advanced parameters are optional and should usually be changed only for tuning, 
 | `bm25_ranking_metric` | GaussDB BM25 ranking metric; `0` is BM25_OKAPI | `0` |
 | `bm25_ncandidates` | GaussDB BM25 candidate count | `128` |
 | `bm25_dictionary` | Optional BM25 dictionary | `None` |
-| `metadata_column_mode` | `jsonb`, `text`, or `redundant_columns` | `jsonb` |
+| `payload_storage_mode` | Expert override for payload storage: `jsonb` or `text` | Derived from `metadata_mode` / `metadata_column_mode` |
+| `filter_storage_mode` | Expert override for filter implementation: `json_expression` or `redundant_columns` | Derived from `metadata_mode` / payload mode |
+| `metadata_column_mode` | Legacy combined metadata mode: `jsonb`, `text`, or `redundant_columns` | `jsonb` |
 | `allowed_filter_keys` | Optional metadata filter allowlist | `None` |
 | `require_scoped_filters` | Require scoped read filters | `True` |
 | `scope_filter_keys` | Scoped filter keys | `["user_id", "agent_id", "run_id"]` |
@@ -150,7 +161,11 @@ ORDER BY score DESC
 LIMIT 1;
 ```
 
-If `JSONB` or JSON expression indexes are unavailable in your A-mode environment, set `metadata_column_mode="redundant_columns"` to index `user_id`, `agent_id`, and `run_id` as normal columns.
+If `JSONB` or JSON expression indexes are unavailable in your A-mode environment, start with
+`metadata_mode="compatible"` or `profile="compatibility"`. This maps payloads to text and keeps `user_id`, `agent_id`,
+and `run_id` indexed as normal columns. The equivalent expert override is `payload_storage_mode="text"` plus
+`filter_storage_mode="redundant_columns"`; the legacy shortcut `metadata_column_mode="text"` maps to the same safe
+fallback.
 
 ### Operations
 
@@ -166,7 +181,7 @@ rebuilds as a database operations task because they can take locks and consume s
 
 ### Migration and Rollback
 
-Use `migration_dry_run()` before changing collection schema or metadata mode. Review the planned actions and affected rows before running any mutating backfill.
+Use `migration_dry_run()` before changing collection schema or metadata mode. Review the planned actions and affected rows before running any mutating backfill. The current migration helpers are v1 provider utilities for derived-field backfill and index/payload mode planning; full schema diffing and online index rebuilds should be handled as explicit database migration work.
 
 Recommended rollout sequence:
 
@@ -192,5 +207,5 @@ Rollback options:
 | `gsdiskann` index creation fails with `Maintenance_work_mem is below the required value` | The database memory setting is too low for DiskANN index build | Set `vector_index_maintenance_work_mem` to a larger value, increase the database/session `maintenance_work_mem`, or use `vector_index_type="gsivfflat"` for smaller test environments |
 | BM25 is disabled | BM25 index creation or score query failed and `bm25_fail_fast=False` | Verify BM25 support on Ustore and check `storage_type='USTORE'` |
 | Chinese or mixed-language payloads fail with JSON/encoding errors | The database `server_encoding` is `SQL_ASCII` | Use a UTF8 database in A compatibility mode for multilingual memories |
-| Filter queries are slow | JSON expression indexes are unavailable or not used | Use `metadata_column_mode="redundant_columns"` |
+| Filter queries are slow | JSON expression indexes are unavailable or not used | Use `metadata_mode="redundant_columns"` or `metadata_mode="compatible"` |
 | Read operation raises scoped filter error | `require_scoped_filters=True` and no tenant filter was supplied | Pass `filters={"user_id": ...}` or another configured scope key |

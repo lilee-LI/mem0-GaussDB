@@ -16,6 +16,20 @@ _ENV_DEFAULTS = {
 }
 
 
+_METADATA_MODE_MAP = {
+    "jsonb": {"payload_storage_mode": "jsonb", "filter_storage_mode": "json_expression"},
+    "redundant_columns": {"payload_storage_mode": "jsonb", "filter_storage_mode": "redundant_columns"},
+    "compatible": {"payload_storage_mode": "text", "filter_storage_mode": "redundant_columns"},
+    "text": {"payload_storage_mode": "text", "filter_storage_mode": "redundant_columns"},
+}
+
+_BM25_MODE_MAP = {
+    "auto": {"bm25_enabled": True, "bm25_fail_fast": False},
+    "required": {"bm25_enabled": True, "bm25_fail_fast": True},
+    "disabled": {"bm25_enabled": False, "bm25_fail_fast": False},
+}
+
+
 def _first_env(names: tuple[str, ...]) -> Optional[str]:
     for name in names:
         value = os.getenv(name)
@@ -58,7 +72,15 @@ class GaussDBConfig(BaseModel):
     bm25_dictionary: Optional[str] = Field(None, description="Optional BM25 dictionary name")
     metadata_column_mode: str = Field(
         "jsonb",
-        description="Metadata storage mode: jsonb, text, or redundant_columns",
+        description="Legacy combined metadata mode: jsonb, text, or redundant_columns",
+    )
+    payload_storage_mode: Optional[str] = Field(
+        None,
+        description="Payload storage mode: jsonb or text. Defaults are derived from metadata_column_mode.",
+    )
+    filter_storage_mode: Optional[str] = Field(
+        None,
+        description="Filter storage mode: json_expression or redundant_columns. Defaults are derived from payload mode.",
     )
     allowed_filter_keys: Optional[List[str]] = Field(None, description="Optional allowlist for metadata filter keys")
     require_scoped_filters: bool = Field(True, description="Require user_id, agent_id, or run_id on read paths")
@@ -72,11 +94,18 @@ class GaussDBConfig(BaseModel):
     retry_attempts: int = Field(2, description="Retry attempts for transient database errors")
     retry_backoff_seconds: float = Field(0.1, description="Initial retry backoff in seconds")
     auto_create: bool = Field(True, description="Create the collection on provider initialization")
+    profile: str = Field("commercial", description="High-level defaults profile: commercial or compatibility")
+    metadata_mode: Optional[str] = Field(
+        "auto",
+        description="High-level metadata mode: auto, jsonb, redundant_columns, compatible, or text",
+    )
+    bm25_mode: Optional[str] = Field("auto", description="High-level BM25 mode: auto, required, or disabled")
 
     @model_validator(mode="before")
     @classmethod
     def normalize_and_validate_input(cls, values: Dict[str, Any]) -> Dict[str, Any]:
         values = dict(values or {})
+        original_fields = set(values.keys())
         allowed_fields = set(cls.model_fields.keys())
         input_fields = set(values.keys())
         extra_fields = input_fields - allowed_fields
@@ -93,6 +122,44 @@ class GaussDBConfig(BaseModel):
         for alias in ("dsn", "url"):
             if values.get(alias) and not values.get("connection_string"):
                 values["connection_string"] = values[alias]
+
+        profile = str(values.get("profile", "commercial")).lower()
+        if profile == "compatibility":
+            values.setdefault("metadata_mode", "compatible")
+            values.setdefault("vector_index_type", "gsivfflat")
+
+        explicit_metadata_low_level = bool(
+            original_fields & {"metadata_column_mode", "payload_storage_mode", "filter_storage_mode"}
+        )
+        metadata_mode = values.get("metadata_mode")
+        if metadata_mode is None and explicit_metadata_low_level:
+            values["metadata_mode"] = None
+        elif metadata_mode is not None:
+            metadata_mode = str(metadata_mode).lower()
+            values["metadata_mode"] = metadata_mode
+            if explicit_metadata_low_level:
+                if "metadata_mode" in original_fields and metadata_mode not in {"auto", "none"}:
+                    raise ValueError(
+                        "metadata_mode cannot be combined with metadata_column_mode, "
+                        "payload_storage_mode, or filter_storage_mode"
+                    )
+                values["metadata_mode"] = None
+            elif metadata_mode != "auto":
+                values.update(_METADATA_MODE_MAP.get(metadata_mode, {}))
+
+        explicit_bm25_low_level = bool(original_fields & {"bm25_enabled", "bm25_fail_fast"})
+        bm25_mode = values.get("bm25_mode")
+        if bm25_mode is None and explicit_bm25_low_level:
+            values["bm25_mode"] = None
+        elif bm25_mode is not None:
+            bm25_mode = str(bm25_mode).lower()
+            values["bm25_mode"] = bm25_mode
+            if explicit_bm25_low_level:
+                if "bm25_mode" in original_fields and bm25_mode not in {"auto", "none"}:
+                    raise ValueError("bm25_mode cannot be combined with bm25_enabled or bm25_fail_fast")
+                values["bm25_mode"] = None
+            else:
+                values.update(_BM25_MODE_MAP.get(bm25_mode, {}))
 
         for field_name, env_names in _ENV_DEFAULTS.items():
             if not values.get(field_name):
@@ -182,11 +249,65 @@ class GaussDBConfig(BaseModel):
             raise ValueError("metadata_column_mode must be 'jsonb', 'text', or 'redundant_columns'")
         return normalized
 
+    @field_validator("payload_storage_mode")
+    @classmethod
+    def validate_payload_storage_mode(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.lower()
+        if normalized not in {"jsonb", "text"}:
+            raise ValueError("payload_storage_mode must be 'jsonb' or 'text'")
+        return normalized
+
+    @field_validator("filter_storage_mode")
+    @classmethod
+    def validate_filter_storage_mode(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.lower()
+        if normalized not in {"json_expression", "redundant_columns"}:
+            raise ValueError("filter_storage_mode must be 'json_expression' or 'redundant_columns'")
+        return normalized
+
+    @field_validator("profile")
+    @classmethod
+    def validate_profile(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in {"commercial", "compatibility"}:
+            raise ValueError("profile must be 'commercial' or 'compatibility'")
+        return normalized
+
+    @field_validator("metadata_mode")
+    @classmethod
+    def validate_metadata_mode(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.lower()
+        if normalized not in {"auto", "jsonb", "redundant_columns", "compatible", "text"}:
+            raise ValueError("metadata_mode must be 'auto', 'jsonb', 'redundant_columns', 'compatible', or 'text'")
+        return normalized
+
+    @field_validator("bm25_mode")
+    @classmethod
+    def validate_bm25_mode(cls, value: Optional[str]) -> Optional[str]:
+        if value is None:
+            return value
+        normalized = value.lower()
+        if normalized not in {"auto", "required", "disabled"}:
+            raise ValueError("bm25_mode must be 'auto', 'required', or 'disabled'")
+        return normalized
+
     @field_validator("scope_filter_keys")
     @classmethod
     def validate_scope_filter_keys(cls, value: List[str]) -> List[str]:
         if not value:
             raise ValueError("scope_filter_keys must contain at least one key")
         return value
+
+    @model_validator(mode="after")
+    def validate_storage_mode_combination(self) -> "GaussDBConfig":
+        if self.payload_storage_mode == "text" and self.filter_storage_mode == "json_expression":
+            raise ValueError("filter_storage_mode='json_expression' requires payload_storage_mode='jsonb'")
+        return self
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

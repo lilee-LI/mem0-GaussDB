@@ -48,7 +48,103 @@ def test_gaussdb_config_defaults_and_alias():
     assert cfg.vector_index_maintenance_work_mem == "128MB"
     assert cfg.bm25_ranking_metric == 0
     assert cfg.bm25_ncandidates == 128
+    assert cfg.payload_storage_mode is None
+    assert cfg.filter_storage_mode is None
+    assert cfg.profile == "commercial"
+    assert cfg.metadata_mode == "auto"
+    assert cfg.bm25_mode == "auto"
     assert cfg.require_scoped_filters is True
+
+
+def test_gaussdb_config_maps_high_level_modes():
+    cfg = GaussDBConfig(
+        connection_pool=object(),
+        profile="compatibility",
+        bm25_mode="required",
+        auto_create=False,
+        enable_capability_probe=False,
+    )
+
+    assert cfg.profile == "compatibility"
+    assert cfg.metadata_mode == "compatible"
+    assert cfg.payload_storage_mode == "text"
+    assert cfg.filter_storage_mode == "redundant_columns"
+    assert cfg.vector_index_type == "gsivfflat"
+    assert cfg.bm25_enabled is True
+    assert cfg.bm25_fail_fast is True
+
+
+def test_gaussdb_config_low_level_overrides_high_level_defaults():
+    cfg = GaussDBConfig(
+        connection_pool=object(),
+        bm25_enabled=False,
+        payload_storage_mode="text",
+        filter_storage_mode="redundant_columns",
+        auto_create=False,
+        enable_capability_probe=False,
+    )
+
+    assert cfg.bm25_mode is None
+    assert cfg.bm25_enabled is False
+    assert cfg.metadata_mode is None
+    assert cfg.payload_storage_mode == "text"
+    assert cfg.filter_storage_mode == "redundant_columns"
+
+
+def test_gaussdb_config_rejects_mixed_high_and_low_level_modes():
+    with pytest.raises(ValidationError, match="metadata_mode cannot be combined"):
+        GaussDBConfig(
+            connection_pool=object(),
+            metadata_mode="compatible",
+            payload_storage_mode="text",
+            auto_create=False,
+            enable_capability_probe=False,
+        )
+
+    with pytest.raises(ValidationError, match="bm25_mode cannot be combined"):
+        GaussDBConfig(
+            connection_pool=object(),
+            bm25_mode="disabled",
+            bm25_enabled=True,
+            auto_create=False,
+            enable_capability_probe=False,
+        )
+
+
+def test_gaussdb_config_accepts_split_metadata_storage_modes():
+    cfg = GaussDBConfig(
+        connection_pool=object(),
+        payload_storage_mode="text",
+        filter_storage_mode="redundant_columns",
+        auto_create=False,
+        enable_capability_probe=False,
+    )
+
+    assert cfg.payload_storage_mode == "text"
+    assert cfg.filter_storage_mode == "redundant_columns"
+
+
+def test_gaussdb_provider_accepts_high_level_modes():
+    db, _, _, _ = make_gaussdb(metadata_mode="compatible", bm25_mode="disabled")
+
+    assert db.metadata_mode == "compatible"
+    assert db.payload_storage_mode == "text"
+    assert db.filter_storage_mode == "redundant_columns"
+    assert db.metadata_column_mode == "text"
+    assert db.bm25_mode == "disabled"
+    assert db.bm25_enabled is False
+    assert db.bm25_fail_fast is False
+
+
+def test_gaussdb_config_rejects_text_payload_with_json_expression_filters():
+    with pytest.raises(ValidationError, match="json_expression"):
+        GaussDBConfig(
+            connection_pool=object(),
+            payload_storage_mode="text",
+            filter_storage_mode="json_expression",
+            auto_create=False,
+            enable_capability_probe=False,
+        )
 
 
 def test_gaussdb_config_accepts_dsn_alias():
@@ -131,6 +227,22 @@ def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
     mock_conn.commit.assert_called()
 
 
+def test_text_payload_mode_uses_redundant_scope_filters():
+    db, _, _, mock_cursor = make_gaussdb(metadata_column_mode="text")
+    mock_cursor.fetchall.return_value = []
+
+    db.create_col()
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1"})
+
+    sql = executed_sql(mock_cursor)
+    assert "payload TEXT NOT NULL" in sql
+    assert "user_id VARCHAR(128)" in sql
+    assert '"user_id" = %s' in sql
+    assert "payload->>'user_id'" not in sql
+    assert db.payload_storage_mode == "text"
+    assert db.filter_storage_mode == "redundant_columns"
+
+
 def test_capability_probe_sets_vector_index_maintenance_work_mem():
     db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
     mock_cursor.fetchone.return_value = ("on",)
@@ -140,7 +252,76 @@ def test_capability_probe_sets_vector_index_maintenance_work_mem():
     sql = executed_sql(mock_cursor)
     assert "SHOW enable_vectordb" in sql
     assert "CREATE INDEX" in sql
+    assert "INSERT INTO" in sql
+    assert "text_lemmatized ### %s AS score" in sql
     mock_cursor.execute.assert_any_call("SET LOCAL maintenance_work_mem = %s", ("128MB",))
+
+
+def test_capability_probe_falls_back_to_text_payload_and_redundant_filters_on_jsonb_failure():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchone.return_value = ("on",)
+
+    def execute_side_effect(sql, *args):
+        if "CREATE TABLE" in str(sql) and "payload JSONB" in str(sql):
+            raise Exception("jsonb type unsupported")
+
+    mock_cursor.execute.side_effect = execute_side_effect
+
+    db._probe_capabilities()
+
+    assert db.payload_storage_mode == "text"
+    assert db.filter_storage_mode == "redundant_columns"
+    assert db.metadata_column_mode == "text"
+
+
+def test_capability_probe_falls_back_to_redundant_filters_on_expression_index_failure():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchone.return_value = ("on",)
+
+    def execute_side_effect(sql, *args):
+        if "payload->>'user_id'" in str(sql):
+            raise Exception("expression index unsupported")
+
+    mock_cursor.execute.side_effect = execute_side_effect
+
+    db._probe_capabilities()
+
+    assert db.payload_storage_mode == "jsonb"
+    assert db.filter_storage_mode == "redundant_columns"
+    assert db.metadata_column_mode == "redundant_columns"
+
+
+def test_bm25_index_failure_rolls_back_savepoint_and_disables_bm25():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.execute.side_effect = [None, Exception("bm25 unsupported"), None, None]
+
+    db._create_bm25_index(mock_cursor, '"test_collection"')
+
+    sql = executed_sql(mock_cursor)
+    assert "SAVEPOINT" in sql
+    assert "ROLLBACK TO SAVEPOINT" in sql
+    assert "RELEASE SAVEPOINT" in sql
+    assert db.bm25_enabled is False
+    assert db.metrics["gaussdb_fallback_count"] == 1
+
+
+def test_capability_probe_bm25_score_failure_uses_savepoint_fallback():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchone.return_value = ("on",)
+
+    def execute_side_effect(sql, *args):
+        if "SELECT text_lemmatized ###" in str(sql):
+            raise Exception("operator ### unsupported")
+
+    mock_cursor.execute.side_effect = execute_side_effect
+
+    db._probe_capabilities()
+
+    sql = executed_sql(mock_cursor)
+    assert "ROLLBACK TO SAVEPOINT" in sql
+    assert "payload->>'user_id'" in sql
+    assert db.bm25_enabled is False
+    assert db.metrics["gaussdb_fallback_count"] == 1
 
 
 def test_insert_uses_upsert_and_vector_cast():
