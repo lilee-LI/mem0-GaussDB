@@ -20,30 +20,19 @@ The provider imports the driver through the `psycopg2` API and uses `ThreadedCon
 
 ### Usage
 
+Most applications only need to provide GaussDB connection information. Vector index, BM25, Ustore, scoped filters, retries, and capability probes use production defaults.
+
 ```python Python
 import os
 from mem0 import Memory
 
 os.environ["OPENAI_API_KEY"] = "sk-xx"
+os.environ["GAUSSDB_DSN"] = "postgresql://gaussdb_user:gaussdb_password@127.0.0.1:19995/postgres"
 
 config = {
     "vector_store": {
         "provider": "gaussdb",
-        "config": {
-            "host": "127.0.0.1",
-            "port": 8000,
-            "database": "postgres",
-            "user": "gaussdb_user",
-            "password": "gaussdb_password",
-            "client_encoding": "UTF8",
-            "collection_name": "memories",
-            "embedding_model_dims": 1536,
-            "vector_index_type": "gsdiskann",
-            "vector_index_maintenance_work_mem": "128MB",
-            "vector_metric": "cosine",
-            "bm25_enabled": True,
-            "require_scoped_filters": True,
-        },
+        "config": {},
     },
 }
 
@@ -52,18 +41,38 @@ memory.add("I prefer window seats on morning flights.", user_id="alice")
 results = memory.search("flight seat preference", filters={"user_id": "alice"})
 ```
 
+You can also put the DSN directly in the config:
+
+```python Python
+config = {
+    "vector_store": {
+        "provider": "gaussdb",
+        "config": {
+            "connection_string": "postgresql://gaussdb_user:gaussdb_password@127.0.0.1:19995/postgres",
+        },
+    },
+}
+```
+
 ### Config
+
+Most users should start with the minimal connection fields below.
 
 | Parameter | Description | Default Value |
 | --- | --- | --- |
-| `database` / `dbname` | GaussDB database name | `postgres` |
+| `connection_string` / `dsn` / `url` | GaussDB DSN; overrides individual connection fields | `GAUSSDB_CONNECTION_STRING`, `GAUSSDB_DSN`, or `GAUSSDB_URL` |
+| `host` | Database host | `GAUSSDB_HOST` |
+| `port` | Database port | `GAUSSDB_PORT` |
+| `database` / `dbname` | GaussDB database name | `GAUSSDB_DATABASE`, `GAUSSDB_DBNAME`, or `postgres` |
+| `user` | Database user | `GAUSSDB_USER` |
+| `password` | Database password | `GAUSSDB_PASSWORD` |
 | `collection_name` | Collection table name | `mem0` |
 | `embedding_model_dims` | Embedding vector dimension | `1536` |
-| `user` | Database user | `None` |
-| `password` | Database password | `None` |
-| `host` | Database host | `None` |
-| `port` | Database port | `None` |
-| `connection_string` | Connection string; overrides individual connection fields | `None` |
+
+Advanced parameters are optional and should usually be changed only for tuning, compatibility fallback, or operations.
+
+| Parameter | Description | Default Value |
+| --- | --- | --- |
 | `connection_pool` | Existing `psycopg2` pool | `None` |
 | `minconn` / `maxconn` | Connection pool bounds | `1` / `5` |
 | `sslmode` | SSL mode | `None` |
@@ -112,7 +121,7 @@ BM25 uses GaussDB native defaults unless overridden:
 Before production traffic, validate the target GaussDB environment:
 
 ```sql
-SET enable_vectordb = on;
+SHOW enable_vectordb;
 
 CREATE TABLE mem0_probe (
     id UUID PRIMARY KEY,
@@ -121,9 +130,14 @@ CREATE TABLE mem0_probe (
     text_lemmatized TEXT
 ) WITH (storage_type=ustore);
 
+BEGIN;
+SET LOCAL maintenance_work_mem = '128MB';
+
 CREATE INDEX mem0_probe_vector_idx
 ON mem0_probe
 USING gsdiskann (vector COSINE);
+
+COMMIT;
 
 CREATE INDEX mem0_probe_bm25_idx
 ON mem0_probe

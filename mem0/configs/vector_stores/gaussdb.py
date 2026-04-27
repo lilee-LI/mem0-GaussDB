@@ -1,6 +1,27 @@
+import os
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+_ENV_DEFAULTS = {
+    "connection_string": ("GAUSSDB_CONNECTION_STRING", "GAUSSDB_DSN", "GAUSSDB_URL"),
+    "host": ("GAUSSDB_HOST",),
+    "port": ("GAUSSDB_PORT",),
+    "database": ("GAUSSDB_DATABASE", "GAUSSDB_DBNAME"),
+    "user": ("GAUSSDB_USER",),
+    "password": ("GAUSSDB_PASSWORD",),
+    "sslmode": ("GAUSSDB_SSLMODE",),
+    "sslrootcert": ("GAUSSDB_SSLROOTCERT",),
+}
+
+
+def _first_env(names: tuple[str, ...]) -> Optional[str]:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
 
 
 class GaussDBConfig(BaseModel):
@@ -13,6 +34,8 @@ class GaussDBConfig(BaseModel):
     host: Optional[str] = Field(None, description="Database host")
     port: Optional[int] = Field(None, description="Database port")
     connection_string: Optional[str] = Field(None, description="GaussDB connection string")
+    dsn: Optional[str] = Field(None, description="Alias for connection_string")
+    url: Optional[str] = Field(None, description="Alias for connection_string")
     connection_pool: Optional[Any] = Field(None, description="Existing psycopg2 connection pool")
     minconn: int = Field(1, description="Minimum number of connections in the pool")
     maxconn: int = Field(5, description="Maximum number of connections in the pool")
@@ -52,28 +75,8 @@ class GaussDBConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def normalize_database_alias(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        if values.get("dbname") and not values.get("database"):
-            values["database"] = values["dbname"]
-        return values
-
-    @model_validator(mode="before")
-    @classmethod
-    def check_auth_and_connection(cls, values: Dict[str, Any]) -> Dict[str, Any]:
-        if values.get("connection_pool") is not None or values.get("connection_string"):
-            return values
-
-        missing = [key for key in ("user", "password", "host", "port") if not values.get(key)]
-        if missing:
-            raise ValueError(
-                "GaussDB config requires connection_pool, connection_string, or individual "
-                f"connection fields. Missing: {', '.join(missing)}"
-            )
-        return values
-
-    @model_validator(mode="before")
-    @classmethod
-    def validate_extra_fields(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+    def normalize_and_validate_input(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+        values = dict(values or {})
         allowed_fields = set(cls.model_fields.keys())
         input_fields = set(values.keys())
         extra_fields = input_fields - allowed_fields
@@ -82,6 +85,30 @@ class GaussDBConfig(BaseModel):
                 "Extra fields not allowed: "
                 f"{', '.join(sorted(extra_fields))}. Please input only the following fields: "
                 f"{', '.join(sorted(allowed_fields))}"
+            )
+
+        if values.get("dbname") and not values.get("database"):
+            values["database"] = values["dbname"]
+
+        for alias in ("dsn", "url"):
+            if values.get(alias) and not values.get("connection_string"):
+                values["connection_string"] = values[alias]
+
+        for field_name, env_names in _ENV_DEFAULTS.items():
+            if not values.get(field_name):
+                env_value = _first_env(env_names)
+                if env_value:
+                    values[field_name] = env_value
+
+        if values.get("connection_pool") is not None or values.get("connection_string"):
+            return values
+
+        missing = [key for key in ("user", "password", "host", "port") if not values.get(key)]
+        if missing:
+            raise ValueError(
+                "GaussDB config requires connection_pool, connection_string, GAUSSDB_* environment variables, "
+                "or individual connection fields. "
+                f"Missing: {', '.join(missing)}"
             )
         return values
 

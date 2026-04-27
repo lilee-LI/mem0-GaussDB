@@ -1,6 +1,7 @@
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 import uuid
@@ -33,6 +34,14 @@ _RETRYABLE_ERROR_FRAGMENTS = (
     "server closed",
     "terminating connection",
 )
+
+
+def _first_env(*names: str) -> Optional[str]:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
 
 
 class OutputData(BaseModel):
@@ -76,6 +85,8 @@ class GaussDB(VectorStoreBase):
         host: Optional[str] = None,
         port: Optional[int] = None,
         connection_string: Optional[str] = None,
+        dsn: Optional[str] = None,
+        url: Optional[str] = None,
         connection_pool: Optional[Any] = None,
         minconn: int = 1,
         maxconn: int = 5,
@@ -105,13 +116,24 @@ class GaussDB(VectorStoreBase):
         retry_backoff_seconds: float = 0.1,
         auto_create: bool = True,
     ):
-        self.database = dbname or database
+        connection_string = (
+            connection_string or dsn or url or _first_env("GAUSSDB_CONNECTION_STRING", "GAUSSDB_DSN", "GAUSSDB_URL")
+        )
+        database = dbname or _first_env("GAUSSDB_DATABASE", "GAUSSDB_DBNAME") or database
+        user = user or _first_env("GAUSSDB_USER")
+        password = password or _first_env("GAUSSDB_PASSWORD")
+        host = host or _first_env("GAUSSDB_HOST")
+        port = port or _first_env("GAUSSDB_PORT")
+        sslmode = sslmode or _first_env("GAUSSDB_SSLMODE")
+        sslrootcert = sslrootcert or _first_env("GAUSSDB_SSLROOTCERT")
+
+        self.database = database
         self.collection_name = self._validate_identifier(collection_name, "collection_name")
         self.embedding_model_dims = self._validate_positive_int(embedding_model_dims, "embedding_model_dims")
         self.user = user
         self.password = password
         self.host = host
-        self.port = port
+        self.port = int(port) if port is not None else None
         self.connection_string = connection_string
         self.minconn = self._validate_positive_int(minconn, "minconn")
         self.maxconn = self._validate_positive_int(maxconn, "maxconn")

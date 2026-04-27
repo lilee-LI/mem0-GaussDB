@@ -51,6 +51,28 @@ def test_gaussdb_config_defaults_and_alias():
     assert cfg.require_scoped_filters is True
 
 
+def test_gaussdb_config_accepts_dsn_alias():
+    cfg = GaussDBConfig(dsn="postgresql://user:pass@localhost:19995/mem0db")
+
+    assert cfg.connection_string == "postgresql://user:pass@localhost:19995/mem0db"
+
+
+def test_gaussdb_config_reads_connection_from_env(monkeypatch):
+    monkeypatch.setenv("GAUSSDB_HOST", "db.example.com")
+    monkeypatch.setenv("GAUSSDB_PORT", "19995")
+    monkeypatch.setenv("GAUSSDB_DATABASE", "mem0db")
+    monkeypatch.setenv("GAUSSDB_USER", "mem0_user")
+    monkeypatch.setenv("GAUSSDB_PASSWORD", "secret")
+
+    cfg = GaussDBConfig()
+
+    assert cfg.host == "db.example.com"
+    assert cfg.port == 19995
+    assert cfg.database == "mem0db"
+    assert cfg.user == "mem0_user"
+    assert cfg.password == "secret"
+
+
 def test_gaussdb_config_rejects_extra_fields():
     with pytest.raises(ValidationError):
         GaussDBConfig(connection_pool=object(), unexpected=True)
