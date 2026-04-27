@@ -193,11 +193,13 @@ def test_search_requires_scoped_filters_by_default():
     [
         {"OR": [{"user_id": "alice"}, {"category": "public"}]},
         {"$or": [{"user_id": "alice"}, {"category": "public"}]},
+        {"$or": []},
         {"NOT": [{"user_id": "alice"}]},
         {"user_id": {"ne": "alice"}},
         {"user_id": {"nin": ["alice"]}},
         {"user_id": "*"},
         {"AND": [{"category": "travel"}, {"OR": [{"user_id": "alice"}, {"category": "public"}]}]},
+        {"AND": [{"category": "travel"}, {"OR": [{"user_id": "alice"}, {"user_id": {"ne": "bob"}}]}]},
     ],
 )
 def test_search_rejects_non_constraining_scope_filters(filters):
@@ -215,6 +217,9 @@ def test_search_rejects_non_constraining_scope_filters(filters):
         {"user_id": {"in": ["alice", "bob"]}},
         {"AND": [{"category": "travel"}, {"user_id": "alice"}]},
         {"$and": [{"category": "travel"}, {"user_id": {"eq": "alice"}}]},
+        {"OR": [{"user_id": "alice"}, {"user_id": "bob"}]},
+        {"$or": [{"user_id": {"eq": "alice"}}, {"agent_id": {"in": ["agent-1", "agent-2"]}}]},
+        {"AND": [{"category": "travel"}, {"OR": [{"user_id": "alice"}, {"run_id": "run-1"}]}]},
     ],
 )
 def test_search_accepts_positive_constraining_scope_filters(filters):

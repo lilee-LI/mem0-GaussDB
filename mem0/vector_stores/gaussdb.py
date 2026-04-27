@@ -1047,7 +1047,10 @@ class GaussDB(VectorStoreBase):
             if normalized_key == "AND" and isinstance(value, list):
                 if any(self._has_scope_filter(item) for item in value if isinstance(item, dict)):
                     return True
-            elif normalized_key in {"OR", "NOT"}:
+            elif normalized_key == "OR" and isinstance(value, list):
+                if value and all(isinstance(item, dict) and self._has_scope_filter(item) for item in value):
+                    return True
+            elif normalized_key == "NOT":
                 continue
             elif key in self.scope_filter_keys and self._is_positive_scope_filter_value(value):
                 return True
