@@ -11,11 +11,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from pydantic import BaseModel
 
 try:
-    from psycopg2.extras import Json, execute_values
+    from psycopg2.extras import Json
     from psycopg2.pool import ThreadedConnectionPool
 except ImportError:
     Json = None
-    execute_values = None
     ThreadedConnectionPool = None
 
 from mem0.vector_stores.base import VectorStoreBase
@@ -82,6 +81,7 @@ class GaussDB(VectorStoreBase):
         maxconn: int = 5,
         sslmode: Optional[str] = None,
         sslrootcert: Optional[str] = None,
+        client_encoding: Optional[str] = "UTF8",
         table_storage: str = "ustore",
         compatibility_mode: str = "A",
         gaussdb_version_baseline: str = "506",
@@ -116,6 +116,7 @@ class GaussDB(VectorStoreBase):
         self.maxconn = self._validate_positive_int(maxconn, "maxconn")
         self.sslmode = sslmode
         self.sslrootcert = sslrootcert
+        self.client_encoding = client_encoding
         self.table_storage = self._validate_choice(table_storage.lower(), "table_storage", {"ustore"})
         self.compatibility_mode = self._validate_choice(compatibility_mode.upper(), "compatibility_mode", {"A"})
         self.gaussdb_version_baseline = gaussdb_version_baseline
@@ -273,11 +274,15 @@ class GaussDB(VectorStoreBase):
     @contextmanager
     def _get_cursor(self, commit: bool = False):
         conn = self.connection_pool.getconn()
+        if self.client_encoding:
+            conn.set_client_encoding(self.client_encoding)
         cur = conn.cursor()
         try:
             yield cur
             if commit:
                 conn.commit()
+            else:
+                conn.rollback()
         except Exception:
             conn.rollback()
             self._increment_metric("gaussdb_error_count")
@@ -367,8 +372,17 @@ class GaussDB(VectorStoreBase):
 
         def probe():
             with self._get_cursor(commit=True) as cur:
-                cur.execute("SET enable_vectordb = on")
-                report.vector_enabled = True
+                try:
+                    cur.execute("SHOW enable_vectordb")
+                    setting = str(cur.fetchone()[0]).lower()
+                    report.vector_enabled = setting in {"on", "true", "1"}
+                except Exception:
+                    logger.debug(
+                        "Unable to read enable_vectordb; validating vector support with DDL probe", exc_info=True
+                    )
+                    report.vector_enabled = True
+                if not report.vector_enabled:
+                    raise RuntimeError("GaussDB enable_vectordb is not enabled")
 
         self._run_with_retry("capability_probe", probe)
 
@@ -377,7 +391,7 @@ class GaussDB(VectorStoreBase):
             with self._get_cursor(commit=True) as cur:
                 cur.execute(
                     f"""
-                    CREATE TEMP TABLE {probe_table} (
+                    CREATE TABLE {probe_table} (
                         id {self._id_column_sql()} PRIMARY KEY,
                         vector FLOATVECTOR({self.embedding_model_dims}),
                         payload {self._payload_column_sql()},
@@ -406,7 +420,7 @@ class GaussDB(VectorStoreBase):
                         CREATE INDEX {bm25_index}
                         ON {probe_table}
                         USING bm25 (text_lemmatized)
-                        WITH (storage_parameter='USTORE')
+                        WITH (storage_type='USTORE')
                         """
                     )
                     report.bm25 = True
@@ -427,6 +441,11 @@ class GaussDB(VectorStoreBase):
             else:
                 raise
         finally:
+            try:
+                with self._get_cursor(commit=True) as cur:
+                    cur.execute(f"DROP TABLE IF EXISTS {probe_table}")
+            except Exception:
+                logger.debug("Failed to clean up GaussDB probe table %s", probe_table, exc_info=True)
             self.capabilities = report
 
     def create_col(self, name: str = None, vector_size: int = None, distance: str = None) -> None:
@@ -480,13 +499,20 @@ class GaussDB(VectorStoreBase):
     def _upsert_schema_meta(self, cur, collection_name: str, schema_version: int):
         cur.execute(
             f"""
-            INSERT INTO {self.schema_meta_table_name} (collection_name, schema_version, updated_at)
-            VALUES (%s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (collection_name)
-            DO UPDATE SET schema_version = EXCLUDED.schema_version, updated_at = CURRENT_TIMESTAMP
+            UPDATE {self.schema_meta_table_name}
+            SET schema_version = %s, updated_at = CURRENT_TIMESTAMP
+            WHERE collection_name = %s
             """,
-            (collection_name, schema_version),
+            (schema_version, collection_name),
         )
+        if cur.rowcount == 0:
+            cur.execute(
+                f"""
+                INSERT INTO {self.schema_meta_table_name} (collection_name, schema_version, updated_at)
+                VALUES (%s, %s, CURRENT_TIMESTAMP)
+                """,
+                (collection_name, schema_version),
+            )
 
     def _create_vector_index(self, cur, table: str):
         index_name = self._quote_identifier(self._index_name(self.collection_name, "vector_idx"))
@@ -506,7 +532,7 @@ class GaussDB(VectorStoreBase):
                 CREATE INDEX IF NOT EXISTS {index_name}
                 ON {table}
                 USING bm25 (text_lemmatized)
-                WITH (storage_parameter='USTORE')
+                WITH (storage_type='USTORE')
                 """
             )
         except Exception:
@@ -542,30 +568,31 @@ class GaussDB(VectorStoreBase):
         column_sql = ", ".join(self._quote_identifier(column) for column in columns)
         update_columns = [column for column in columns if column != "id"]
         update_sql = ", ".join(
-            f"{self._quote_identifier(column)} = EXCLUDED.{self._quote_identifier(column)}" for column in update_columns
+            f"{self._quote_identifier(column)} = {'%s::FLOATVECTOR' if column == 'vector' else '%s'}"
+            for column in update_columns
         )
         update_sql += ", updated_at = CURRENT_TIMESTAMP"
-        template = "(" + ", ".join(["%s", "%s::FLOATVECTOR", *["%s" for _ in columns[2:]]]) + ")"
+        insert_values_sql = "(" + ", ".join(["%s", "%s::FLOATVECTOR", *["%s" for _ in columns[2:]]]) + ")"
 
         def op():
             with self._get_cursor(commit=True) as cur:
-                query = f"""
-                    INSERT INTO {self.table_name} ({column_sql})
-                    VALUES %s
-                    ON CONFLICT (id) DO UPDATE SET {update_sql}
-                """
-                if execute_values is not None:
-                    execute_values(cur, query, rows, template=template)
-                else:
-                    placeholders = "(" + ", ".join(["%s", "%s::FLOATVECTOR", *["%s" for _ in columns[2:]]]) + ")"
-                    cur.executemany(
+                for row in rows:
+                    cur.execute(
                         f"""
-                        INSERT INTO {self.table_name} ({column_sql})
-                        VALUES {placeholders}
-                        ON CONFLICT (id) DO UPDATE SET {update_sql}
+                        UPDATE {self.table_name}
+                        SET {update_sql}
+                        WHERE id = %s
                         """,
-                        rows,
+                        (*row[1:], row[0]),
                     )
+                    if cur.rowcount == 0:
+                        cur.execute(
+                            f"""
+                            INSERT INTO {self.table_name} ({column_sql})
+                            VALUES {insert_values_sql}
+                            """,
+                            row,
+                        )
 
         return self._run_with_retry("insert", op)
 
@@ -635,7 +662,7 @@ class GaussDB(VectorStoreBase):
                         FROM {self.table_name}
                         {where_clause}
                         {prefix}(text_lemmatized ### %s) > 0
-                        ORDER BY score DESC, id ASC
+                        ORDER BY score DESC
                         LIMIT %s
                         """,
                         (query, *params, query, top_k),
@@ -655,11 +682,12 @@ class GaussDB(VectorStoreBase):
         return self._run_with_retry("keyword_search", op)
 
     def _apply_bm25_settings(self, cur):
-        cur.execute(f"SET bm25_ranking_metric = {int(self.bm25_ranking_metric)}")
-        cur.execute(f"SET bm25_ncandidates = {int(self.bm25_ncandidates)}")
+        cur.execute(f"SET LOCAL bm25_ranking_metric = {int(self.bm25_ranking_metric)}")
+        cur.execute(f"SET LOCAL bm25_ncandidates = {int(self.bm25_ncandidates)}")
+        cur.execute("SET LOCAL enable_seqscan = off")
         if self.bm25_dictionary:
             self._validate_identifier(self.bm25_dictionary, "bm25_dictionary")
-            cur.execute(f"SET bm25_dictionary = '{self.bm25_dictionary}'")
+            cur.execute(f"SET LOCAL bm25_dictionary = '{self.bm25_dictionary}'")
 
     def search_batch(self, queries: list, vectors_list: list, top_k: int = 1, filters: Optional[dict] = None):
         if not vectors_list:
@@ -1020,7 +1048,8 @@ class GaussDB(VectorStoreBase):
         if self.metadata_column_mode == "redundant_columns" and key in self._redundant_scope_columns:
             return self._quote_identifier(key), []
         if self.metadata_column_mode == "jsonb":
-            return "payload->>%s", [key]
+            self._validate_filter_key(key)
+            return f"payload->>'{key}'", []
         raise ValueError(
             f"Filter key {key!r} is not available in metadata_column_mode={self.metadata_column_mode!r}; "
             "use redundant_columns for scoped filters or jsonb for payload filters."

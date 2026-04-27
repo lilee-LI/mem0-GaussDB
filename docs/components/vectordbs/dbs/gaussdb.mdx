@@ -10,7 +10,7 @@ GaussDB support stores Mem0 memories in a centralized GaussDB Ustore table and u
 - native BM25 on `text_lemmatized` for `keyword_search`
 - metadata filters for `user_id`, `agent_id`, and `run_id`
 
-The provider targets GaussDB `506` centralized deployments running in A compatibility mode with Ustore tables.
+The provider targets GaussDB `506` centralized deployments running in A compatibility mode with Ustore tables. It has also been live-validated against GaussDB Kernel `507.0.0 build 1268bd4d`.
 
 ### Driver
 
@@ -35,6 +35,7 @@ config = {
             "database": "postgres",
             "user": "gaussdb_user",
             "password": "gaussdb_password",
+            "client_encoding": "UTF8",
             "collection_name": "memories",
             "embedding_model_dims": 1536,
             "vector_index_type": "gsdiskann",
@@ -66,6 +67,7 @@ results = memory.search("flight seat preference", filters={"user_id": "alice"})
 | `minconn` / `maxconn` | Connection pool bounds | `1` / `5` |
 | `sslmode` | SSL mode | `None` |
 | `sslrootcert` | SSL root certificate path | `None` |
+| `client_encoding` | Client encoding used by `psycopg2` connections | `UTF8` |
 | `table_storage` | Table storage type | `ustore` |
 | `compatibility_mode` | Compatibility mode | `A` |
 | `gaussdb_version_baseline` | Commercial baseline family | `506` |
@@ -124,7 +126,7 @@ USING gsdiskann (vector COSINE);
 CREATE INDEX mem0_probe_bm25_idx
 ON mem0_probe
 USING bm25 (text_lemmatized)
-WITH (storage_parameter='USTORE');
+WITH (storage_type='USTORE');
 
 SELECT text_lemmatized ### 'probe' AS score
 FROM mem0_probe
@@ -169,6 +171,8 @@ Rollback options:
 | --- | --- | --- |
 | Import error for `psycopg2` | GaussDB official driver package is not installed | Install the GaussDB `psycopg2` wheel for your database build |
 | Initialization fails on vector probe | `enable_vectordb`, `FLOATVECTOR`, or vector index support is unavailable | Check GaussDB version/build and vector feature enablement |
-| BM25 is disabled | BM25 index creation or score query failed and `bm25_fail_fast=False` | Verify BM25 support on Ustore and check `storage_parameter='USTORE'` |
+| `gsdiskann` index creation fails with `Maintenance_work_mem is below the required value` | The database memory setting is too low for DiskANN index build | Increase `maintenance_work_mem` before index creation, or use `vector_index_type="gsivfflat"` for smaller test environments |
+| BM25 is disabled | BM25 index creation or score query failed and `bm25_fail_fast=False` | Verify BM25 support on Ustore and check `storage_type='USTORE'` |
+| Chinese or mixed-language payloads fail with JSON/encoding errors | The database `server_encoding` is `SQL_ASCII` | Use a UTF8 database in A compatibility mode for multilingual memories |
 | Filter queries are slow | JSON expression indexes are unavailable or not used | Use `metadata_column_mode="redundant_columns"` |
 | Read operation raises scoped filter error | `require_scoped_filters=True` and no tenant filter was supplied | Pass `filters={"user_id": ...}` or another configured scope key |

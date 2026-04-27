@@ -1,6 +1,6 @@
 import pytest
 from pydantic import ValidationError
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from mem0.configs.vector_stores.gaussdb import GaussDBConfig
 from mem0.utils.factory import VectorStoreFactory
@@ -101,28 +101,28 @@ def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
     assert "FLOATVECTOR(3)" in sql
     assert "USING gsdiskann (vector COSINE)" in sql
     assert "USING bm25 (text_lemmatized)" in sql
-    assert "storage_parameter='USTORE'" in sql
+    assert "storage_type='USTORE'" in sql
     assert "payload->>'user_id'" in sql
     mock_conn.commit.assert_called()
 
 
 def test_insert_uses_upsert_and_vector_cast():
     db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.rowcount = 0
 
-    with patch("mem0.vector_stores.gaussdb.execute_values", None):
-        db.insert(
-            vectors=[[0.1, 0.2, 0.3]],
-            payloads=[{"data": "hello", "text_lemmatized": "hello", "user_id": "u1"}],
-            ids=["11111111-1111-1111-1111-111111111111"],
-        )
+    db.insert(
+        vectors=[[0.1, 0.2, 0.3]],
+        payloads=[{"data": "hello", "text_lemmatized": "hello", "user_id": "u1"}],
+        ids=["11111111-1111-1111-1111-111111111111"],
+    )
 
-    assert mock_cursor.executemany.called
-    sql = mock_cursor.executemany.call_args.args[0]
-    rows = mock_cursor.executemany.call_args.args[1]
-    assert "ON CONFLICT (id) DO UPDATE" in sql
+    sql = executed_sql(mock_cursor)
+    insert_args = mock_cursor.execute.call_args_list[-1].args[1]
+    assert "UPDATE" in sql
+    assert "INSERT INTO" in sql
     assert "%s::FLOATVECTOR" in sql
-    assert rows[0][1] == "[0.1,0.2,0.3]"
-    assert rows[0][3] == "hello"
+    assert insert_args[1] == "[0.1,0.2,0.3]"
+    assert insert_args[3] == "hello"
 
 
 def test_search_uses_cosine_operator_filters_and_normalized_score():
@@ -133,7 +133,7 @@ def test_search_uses_cosine_operator_filters_and_normalized_score():
 
     sql = executed_sql(mock_cursor)
     assert "vector <+> %s::FLOATVECTOR AS distance" in sql
-    assert "payload->>%s = %s" in sql
+    assert "payload->>'user_id' = %s" in sql
     assert results[0].id == "id1"
     assert results[0].score == pytest.approx(0.8)
     assert results[0].payload["data"] == "hello"
@@ -160,10 +160,11 @@ def test_keyword_search_uses_bm25_defaults_and_filters():
     results = db.keyword_search("hello", top_k=3, filters={"user_id": "u1"})
 
     sql = executed_sql(mock_cursor)
-    assert "SET bm25_ranking_metric = 0" in sql
-    assert "SET bm25_ncandidates = 128" in sql
+    assert "SET LOCAL bm25_ranking_metric = 0" in sql
+    assert "SET LOCAL bm25_ncandidates = 128" in sql
+    assert "SET LOCAL enable_seqscan = off" in sql
     assert "text_lemmatized ### %s AS score" in sql
-    assert "ORDER BY score DESC, id ASC" in sql
+    assert "ORDER BY score DESC" in sql
     assert results[0].score == 2.5
 
 

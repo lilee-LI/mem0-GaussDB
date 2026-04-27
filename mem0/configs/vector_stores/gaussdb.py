@@ -18,6 +18,7 @@ class GaussDBConfig(BaseModel):
     maxconn: int = Field(5, description="Maximum number of connections in the pool")
     sslmode: Optional[str] = Field(None, description="SSL mode")
     sslrootcert: Optional[str] = Field(None, description="SSL root certificate path")
+    client_encoding: Optional[str] = Field("UTF8", description="Client encoding used by psycopg2 connections")
     table_storage: str = Field("ustore", description="GaussDB table storage type")
     compatibility_mode: str = Field("A", description="GaussDB compatibility mode")
     gaussdb_version_baseline: str = Field("506", description="Commercial baseline version family")

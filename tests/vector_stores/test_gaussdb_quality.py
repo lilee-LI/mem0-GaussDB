@@ -53,6 +53,8 @@ def _new_db(collection_name: str):
     return GaussDB(
         **config,
         embedding_model_dims=3,
+        vector_index_type=os.getenv("GAUSSDB_TEST_VECTOR_INDEX", "gsdiskann"),
+        vector_metric=os.getenv("GAUSSDB_TEST_VECTOR_METRIC", "cosine"),
         bm25_enabled=True,
         bm25_fail_fast=True,
         require_scoped_filters=True,
