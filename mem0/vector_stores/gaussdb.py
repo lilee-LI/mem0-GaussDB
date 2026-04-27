@@ -592,39 +592,67 @@ class GaussDB(VectorStoreBase):
         rows = [
             self._insert_row(vector, payload, vector_id) for vector, payload, vector_id in zip(vectors, payloads, ids)
         ]
+        if not rows:
+            return None
         columns = ["id", "vector", "payload", "memory", "text_lemmatized", "schema_version"]
         if self.metadata_column_mode == "redundant_columns":
             columns.extend(self._redundant_scope_columns)
         column_sql = ", ".join(self._quote_identifier(column) for column in columns)
         update_columns = [column for column in columns if column != "id"]
         update_sql = ", ".join(
-            f"{self._quote_identifier(column)} = {'%s::FLOATVECTOR' if column == 'vector' else '%s'}"
-            for column in update_columns
+            f"{self._quote_identifier(column)} = incoming.{self._quote_identifier(column)}" for column in update_columns
         )
         update_sql += ", updated_at = CURRENT_TIMESTAMP"
-        insert_values_sql = "(" + ", ".join(["%s", "%s::FLOATVECTOR", *["%s" for _ in columns[2:]]]) + ")"
+        values_sql = ", ".join([self._incoming_values_sql(columns)] * len(rows))
+        incoming_columns_sql = ", ".join(self._quote_identifier(column) for column in columns)
+        incoming_select_sql = ", ".join(f"incoming.{self._quote_identifier(column)}" for column in columns)
+        flat_params = tuple(value for row in rows for value in row)
 
         def op():
             with self._get_cursor(commit=True) as cur:
-                for row in rows:
-                    cur.execute(
-                        f"""
-                        UPDATE {self.table_name}
-                        SET {update_sql}
-                        WHERE id = %s
-                        """,
-                        (*row[1:], row[0]),
+                cur.execute(
+                    f"""
+                    WITH incoming ({incoming_columns_sql}) AS (
+                        VALUES {values_sql}
                     )
-                    if cur.rowcount == 0:
-                        cur.execute(
-                            f"""
-                            INSERT INTO {self.table_name} ({column_sql})
-                            VALUES {insert_values_sql}
-                            """,
-                            row,
-                        )
+                    UPDATE {self.table_name} AS target
+                    SET {update_sql}
+                    FROM incoming
+                    WHERE target.id = incoming.id
+                    """,
+                    flat_params,
+                )
+                cur.execute(
+                    f"""
+                    WITH incoming ({incoming_columns_sql}) AS (
+                        VALUES {values_sql}
+                    )
+                    INSERT INTO {self.table_name} ({column_sql})
+                    SELECT {incoming_select_sql}
+                    FROM incoming
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM {self.table_name} AS target
+                        WHERE target.id = incoming.id
+                    )
+                    """,
+                    flat_params,
+                )
 
         return self._run_with_retry("insert", op)
+
+    def _incoming_values_sql(self, columns: List[str]) -> str:
+        casts = {
+            "id": self._id_column_sql(),
+            "vector": "FLOATVECTOR",
+            "payload": self._payload_column_sql(),
+            "schema_version": "INTEGER",
+            "user_id": "VARCHAR(128)",
+            "agent_id": "VARCHAR(128)",
+            "run_id": "VARCHAR(128)",
+        }
+        placeholders = [f"%s::{casts[column]}" if column in casts else "%s" for column in columns]
+        return "(" + ", ".join(placeholders) + ")"
 
     def _insert_row(self, vector: Sequence[float], payload: dict, vector_id: str) -> Tuple:
         payload = payload or {}
@@ -985,16 +1013,35 @@ class GaussDB(VectorStoreBase):
         return f"WHERE {expression}", params
 
     def _has_scope_filter(self, filters: Optional[dict]) -> bool:
-        if not filters:
+        if not filters or not isinstance(filters, dict):
             return False
         for key, value in filters.items():
             normalized_key = {"$and": "AND", "$or": "OR", "$not": "NOT"}.get(key, key)
-            if normalized_key in {"AND", "OR", "NOT"} and isinstance(value, list):
+            if normalized_key == "AND" and isinstance(value, list):
                 if any(self._has_scope_filter(item) for item in value if isinstance(item, dict)):
                     return True
-            elif key in self.scope_filter_keys and value not in (None, "", [], {}):
+            elif normalized_key in {"OR", "NOT"}:
+                continue
+            elif key in self.scope_filter_keys and self._is_positive_scope_filter_value(value):
                 return True
         return False
+
+    @staticmethod
+    def _is_positive_scope_filter_value(value: Any) -> bool:
+        if value is None or value == "" or value == "*":
+            return False
+        if isinstance(value, list):
+            return any(GaussDB._is_positive_scope_filter_value(item) for item in value)
+        if isinstance(value, dict):
+            if "eq" in value:
+                return GaussDB._is_positive_scope_filter_value(value["eq"])
+            if "in" in value:
+                in_values = value["in"]
+                if not isinstance(in_values, (list, tuple, set)):
+                    return False
+                return any(GaussDB._is_positive_scope_filter_value(item) for item in in_values)
+            return False
+        return True
 
     def _build_filter_expression(self, filters: dict) -> Tuple[str, List[Any]]:
         if not isinstance(filters, dict):

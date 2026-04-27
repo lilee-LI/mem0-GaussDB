@@ -145,18 +145,23 @@ def test_capability_probe_sets_vector_index_maintenance_work_mem():
 
 def test_insert_uses_upsert_and_vector_cast():
     db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
-    mock_cursor.rowcount = 0
 
     db.insert(
-        vectors=[[0.1, 0.2, 0.3]],
-        payloads=[{"data": "hello", "text_lemmatized": "hello", "user_id": "u1"}],
-        ids=["11111111-1111-1111-1111-111111111111"],
+        vectors=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]],
+        payloads=[
+            {"data": "hello", "text_lemmatized": "hello", "user_id": "u1"},
+            {"data": "world", "text_lemmatized": "world", "user_id": "u1"},
+        ],
+        ids=["11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"],
     )
 
     sql = executed_sql(mock_cursor)
     insert_args = mock_cursor.execute.call_args_list[-1].args[1]
     assert "UPDATE" in sql
     assert "INSERT INTO" in sql
+    assert "WITH incoming" in sql
+    assert "FROM incoming" in sql
+    assert mock_cursor.execute.call_count == 2
     assert "%s::FLOATVECTOR" in sql
     assert insert_args[1] == "[0.1,0.2,0.3]"
     assert insert_args[3] == "hello"
@@ -181,6 +186,43 @@ def test_search_requires_scoped_filters_by_default():
 
     with pytest.raises(ValueError, match="requires at least one scoped filter"):
         db.search("hello", [0.1, 0.2, 0.3], filters={"category": "test"})
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"OR": [{"user_id": "alice"}, {"category": "public"}]},
+        {"$or": [{"user_id": "alice"}, {"category": "public"}]},
+        {"NOT": [{"user_id": "alice"}]},
+        {"user_id": {"ne": "alice"}},
+        {"user_id": {"nin": ["alice"]}},
+        {"user_id": "*"},
+        {"AND": [{"category": "travel"}, {"OR": [{"user_id": "alice"}, {"category": "public"}]}]},
+    ],
+)
+def test_search_rejects_non_constraining_scope_filters(filters):
+    db, _, _, _ = make_gaussdb()
+
+    with pytest.raises(ValueError, match="requires at least one scoped filter"):
+        db.search("hello", [0.1, 0.2, 0.3], filters=filters)
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"user_id": "alice"},
+        {"user_id": {"eq": "alice"}},
+        {"user_id": {"in": ["alice", "bob"]}},
+        {"AND": [{"category": "travel"}, {"user_id": "alice"}]},
+        {"$and": [{"category": "travel"}, {"user_id": {"eq": "alice"}}]},
+    ],
+)
+def test_search_accepts_positive_constraining_scope_filters(filters):
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    assert db.search("hello", [0.1, 0.2, 0.3], filters=filters) == []
+    assert mock_cursor.execute.called
 
 
 def test_filter_builder_rejects_unsafe_keys():
