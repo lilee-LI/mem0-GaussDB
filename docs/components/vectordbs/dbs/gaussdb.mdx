@@ -159,8 +159,10 @@ The provider includes helper methods for operational workflows:
 - `migration_dry_run()` reports planned schema and backfill actions.
 - `backfill_derived_fields(dry_run=True)` reports rows missing `memory` or `text_lemmatized`.
 - `backfill_derived_fields(dry_run=False)` fills derived fields from payload values when possible.
-- `rebuild_indexes()` recreates vector, BM25, and filter indexes.
 - `analyze()` runs `ANALYZE` on the collection table.
+
+Vector, BM25, and filter indexes are ensured internally when collections are created or reset. Plan explicit index
+rebuilds as a database operations task because they can take locks and consume significant resources.
 
 ### Migration and Rollback
 

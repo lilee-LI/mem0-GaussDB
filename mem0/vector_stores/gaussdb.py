@@ -498,10 +498,7 @@ class GaussDB(VectorStoreBase):
                 )
                 self._create_schema_meta(cur)
                 self._upsert_schema_meta(cur, self.collection_name, 1)
-                self._create_vector_index(cur, table)
-                if self.bm25_enabled:
-                    self._create_bm25_index(cur, table)
-                self._create_filter_indexes(cur, table)
+                self._ensure_indexes(cur, table)
 
         return self._run_with_retry("create_col", op)
 
@@ -580,6 +577,12 @@ class GaussDB(VectorStoreBase):
                 cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({self._quote_identifier(safe_key)})")
             elif self.metadata_column_mode == "jsonb":
                 cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ((payload->>'{safe_key}'))")
+
+    def _ensure_indexes(self, cur, table: str):
+        self._create_vector_index(cur, table)
+        if self.bm25_enabled:
+            self._create_bm25_index(cur, table)
+        self._create_filter_indexes(cur, table)
 
     def insert(
         self, vectors: List[List[float]], payloads: Optional[List[Dict]] = None, ids: Optional[List[str]] = None
@@ -1009,16 +1012,6 @@ class GaussDB(VectorStoreBase):
             return {"dry_run": False, "affected_rows": affected}
 
         return self._run_with_retry("migration", op)
-
-    def rebuild_indexes(self) -> None:
-        def op():
-            with self._get_cursor(commit=True) as cur:
-                self._create_vector_index(cur, self.table_name)
-                if self.bm25_enabled:
-                    self._create_bm25_index(cur, self.table_name)
-                self._create_filter_indexes(cur, self.table_name)
-
-        return self._run_with_retry("index_rebuild", op)
 
     def analyze(self) -> None:
         def op():
