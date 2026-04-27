@@ -819,8 +819,9 @@ class GaussDB(VectorStoreBase):
             params.extend([self._payload_value(payload), memory, text_lemmatized])
             if self.metadata_column_mode == "redundant_columns":
                 for key in self._redundant_scope_columns:
-                    set_clauses.append(f"{self._quote_identifier(key)} = %s")
-                    params.append(payload.get(key))
+                    if key in payload:
+                        set_clauses.append(f"{self._quote_identifier(key)} = %s")
+                        params.append(payload.get(key))
         set_clauses.append("updated_at = CURRENT_TIMESTAMP")
         params.append(vector_id)
 
