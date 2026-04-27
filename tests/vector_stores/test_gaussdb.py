@@ -45,6 +45,7 @@ def test_gaussdb_config_defaults_and_alias():
     assert cfg.gaussdb_version_baseline == "506"
     assert cfg.vector_index_type == "gsdiskann"
     assert cfg.vector_metric == "cosine"
+    assert cfg.vector_index_maintenance_work_mem == "128MB"
     assert cfg.bm25_ranking_metric == 0
     assert cfg.bm25_ncandidates == 128
     assert cfg.require_scoped_filters is True
@@ -99,11 +100,25 @@ def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
     sql = executed_sql(mock_cursor)
     assert "WITH (storage_type=ustore)" in sql
     assert "FLOATVECTOR(3)" in sql
+    assert "SET LOCAL maintenance_work_mem" in sql
     assert "USING gsdiskann (vector COSINE)" in sql
     assert "USING bm25 (text_lemmatized)" in sql
     assert "storage_type='USTORE'" in sql
     assert "payload->>'user_id'" in sql
+    mock_cursor.execute.assert_any_call("SET LOCAL maintenance_work_mem = %s", ("128MB",))
     mock_conn.commit.assert_called()
+
+
+def test_capability_probe_sets_vector_index_maintenance_work_mem():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchone.return_value = ("on",)
+
+    db._probe_capabilities()
+
+    sql = executed_sql(mock_cursor)
+    assert "SHOW enable_vectordb" in sql
+    assert "CREATE INDEX" in sql
+    mock_cursor.execute.assert_any_call("SET LOCAL maintenance_work_mem = %s", ("128MB",))
 
 
 def test_insert_uses_upsert_and_vector_cast():

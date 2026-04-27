@@ -25,6 +25,9 @@ class GaussDBConfig(BaseModel):
     id_column_type: str = Field("uuid", description="id column type: uuid or varchar")
     vector_index_type: str = Field("gsdiskann", description="Vector index type: gsdiskann or gsivfflat")
     vector_metric: str = Field("cosine", description="Vector metric: cosine or l2")
+    vector_index_maintenance_work_mem: Optional[str] = Field(
+        "128MB", description="Session-local maintenance_work_mem used while building vector indexes"
+    )
     bm25_enabled: bool = Field(True, description="Enable native GaussDB BM25 keyword search")
     bm25_fail_fast: bool = Field(False, description="Raise BM25 errors instead of returning None")
     bm25_ranking_metric: int = Field(0, description="GaussDB BM25 ranking metric; 0 is BM25_OKAPI")

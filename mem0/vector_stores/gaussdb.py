@@ -88,6 +88,7 @@ class GaussDB(VectorStoreBase):
         id_column_type: str = "uuid",
         vector_index_type: str = "gsdiskann",
         vector_metric: str = "cosine",
+        vector_index_maintenance_work_mem: Optional[str] = "128MB",
         bm25_enabled: bool = True,
         bm25_fail_fast: bool = False,
         bm25_ranking_metric: int = 0,
@@ -125,6 +126,7 @@ class GaussDB(VectorStoreBase):
             vector_index_type.lower(), "vector_index_type", {"gsdiskann", "gsivfflat"}
         )
         self.vector_metric = self._validate_choice(vector_metric.lower(), "vector_metric", {"cosine", "l2"})
+        self.vector_index_maintenance_work_mem = vector_index_maintenance_work_mem
         self.bm25_enabled = bm25_enabled
         self.bm25_fail_fast = bm25_fail_fast
         self.bm25_ranking_metric = int(bm25_ranking_metric)
@@ -404,6 +406,7 @@ class GaussDB(VectorStoreBase):
                 report.jsonb = self.metadata_column_mode != "text"
 
                 index_name = self._quote_identifier(self._index_name(f"probe_{uuid.uuid4().hex[:8]}", "vector_idx"))
+                self._set_vector_index_maintenance_work_mem(cur)
                 cur.execute(
                     f"""
                     CREATE INDEX {index_name}
@@ -516,6 +519,7 @@ class GaussDB(VectorStoreBase):
 
     def _create_vector_index(self, cur, table: str):
         index_name = self._quote_identifier(self._index_name(self.collection_name, "vector_idx"))
+        self._set_vector_index_maintenance_work_mem(cur)
         cur.execute(
             f"""
             CREATE INDEX IF NOT EXISTS {index_name}
@@ -523,6 +527,10 @@ class GaussDB(VectorStoreBase):
             USING {self.vector_index_type} (vector {self._vector_index_metric})
             """
         )
+
+    def _set_vector_index_maintenance_work_mem(self, cur):
+        if self.vector_index_maintenance_work_mem:
+            cur.execute("SET LOCAL maintenance_work_mem = %s", (self.vector_index_maintenance_work_mem,))
 
     def _create_bm25_index(self, cur, table: str):
         index_name = self._quote_identifier(self._index_name(self.collection_name, "bm25_idx"))

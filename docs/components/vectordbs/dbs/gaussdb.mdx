@@ -39,6 +39,7 @@ config = {
             "collection_name": "memories",
             "embedding_model_dims": 1536,
             "vector_index_type": "gsdiskann",
+            "vector_index_maintenance_work_mem": "128MB",
             "vector_metric": "cosine",
             "bm25_enabled": True,
             "require_scoped_filters": True,
@@ -73,6 +74,7 @@ results = memory.search("flight seat preference", filters={"user_id": "alice"})
 | `gaussdb_version_baseline` | Commercial baseline family | `506` |
 | `id_column_type` | `uuid` or `varchar` | `uuid` |
 | `vector_index_type` | `gsdiskann` or `gsivfflat` | `gsdiskann` |
+| `vector_index_maintenance_work_mem` | Session-local `maintenance_work_mem` used while building vector indexes | `128MB` |
 | `vector_metric` | `cosine` or `l2` | `cosine` |
 | `bm25_enabled` | Enable native BM25 keyword search | `True` |
 | `bm25_fail_fast` | Raise BM25 errors instead of semantic-only fallback | `False` |
@@ -171,7 +173,7 @@ Rollback options:
 | --- | --- | --- |
 | Import error for `psycopg2` | GaussDB official driver package is not installed | Install the GaussDB `psycopg2` wheel for your database build |
 | Initialization fails on vector probe | `enable_vectordb`, `FLOATVECTOR`, or vector index support is unavailable | Check GaussDB version/build and vector feature enablement |
-| `gsdiskann` index creation fails with `Maintenance_work_mem is below the required value` | The database memory setting is too low for DiskANN index build | Increase `maintenance_work_mem` before index creation, or use `vector_index_type="gsivfflat"` for smaller test environments |
+| `gsdiskann` index creation fails with `Maintenance_work_mem is below the required value` | The database memory setting is too low for DiskANN index build | Set `vector_index_maintenance_work_mem` to a larger value, increase the database/session `maintenance_work_mem`, or use `vector_index_type="gsivfflat"` for smaller test environments |
 | BM25 is disabled | BM25 index creation or score query failed and `bm25_fail_fast=False` | Verify BM25 support on Ustore and check `storage_type='USTORE'` |
 | Chinese or mixed-language payloads fail with JSON/encoding errors | The database `server_encoding` is `SQL_ASCII` | Use a UTF8 database in A compatibility mode for multilingual memories |
 | Filter queries are slow | JSON expression indexes are unavailable or not used | Use `metadata_column_mode="redundant_columns"` |
