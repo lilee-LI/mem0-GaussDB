@@ -132,3 +132,54 @@ def test_gaussdb_live_ustore_vector_bm25_crud_and_batch_search():
         assert dry_run["mutates_data"] is False
     finally:
         db.delete_col()
+
+
+def test_gaussdb_live_redundant_scope_survives_partial_payload_update():
+    collection_name = f"mem0_gdb_scope_{uuid.uuid4().hex[:8]}"
+    config = _gaussdb_env_config(collection_name)
+    db = GaussDB(
+        **config,
+        embedding_model_dims=3,
+        vector_index_type=os.getenv("GAUSSDB_TEST_VECTOR_INDEX", "gsdiskann"),
+        vector_metric=os.getenv("GAUSSDB_TEST_VECTOR_METRIC", "cosine"),
+        bm25_enabled=False,
+        metadata_column_mode="redundant_columns",
+        require_scoped_filters=True,
+        enable_capability_probe=os.getenv("GAUSSDB_TEST_ENABLE_PROBE", "true").lower() == "true",
+        retry_attempts=1,
+    )
+
+    vector_id = "33333333-3333-3333-3333-333333333333"
+    try:
+        db.insert(
+            vectors=[[0.2, 0.3, 0.4]],
+            ids=[vector_id],
+            payloads=[
+                {
+                    "data": "Alice likes compact window seats",
+                    "text_lemmatized": "alice like compact window seat",
+                    "user_id": "alice",
+                    "agent_id": "agent1",
+                    "run_id": "run1",
+                }
+            ],
+        )
+
+        db.update(
+            vector_id,
+            payload={
+                "data": "Alice likes quiet window seats",
+                "text_lemmatized": "alice like quiet window seat",
+            },
+        )
+
+        semantic = db.search("window seat", [0.2, 0.3, 0.4], top_k=5, filters={"user_id": "alice"})
+        assert [item.id for item in semantic] == [vector_id]
+
+        listed = db.list(filters={"agent_id": "agent1"}, top_k=5)
+        assert [item.id for item in listed[0]] == [vector_id]
+
+        other_tenant = db.search("window seat", [0.2, 0.3, 0.4], top_k=5, filters={"user_id": "bob"})
+        assert other_tenant == []
+    finally:
+        db.delete_col()

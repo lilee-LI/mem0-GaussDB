@@ -513,6 +513,22 @@ def test_update_payload_preserves_missing_redundant_scope_columns():
     assert params[-2:] == ("u2", "id1")
 
 
+def test_update_payload_without_scope_keys_does_not_touch_redundant_scope_columns():
+    db, _, _, mock_cursor = make_gaussdb(
+        metadata_column_mode="redundant_columns",
+        require_scoped_filters=False,
+    )
+
+    db.update("id1", payload={"data": "new", "text_lemmatized": "new"})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert '"user_id" = %s' not in sql
+    assert '"agent_id" = %s' not in sql
+    assert '"run_id" = %s' not in sql
+    assert params[-1] == "id1"
+
+
 def test_delete_is_idempotent_sql_path():
     db, _, mock_conn, mock_cursor = make_gaussdb(require_scoped_filters=False)
 
