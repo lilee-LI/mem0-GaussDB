@@ -15,6 +15,160 @@
 
 如果用“mem0 现有 provider 适配成熟度”来衡量，GaussDB 当前属于高适配度，功能面已经接近或超过 `pgvector`，并在商用可交付性上更重。
 
+### 1.1 mem0 的具体作用
+
+mem0 是面向 AI 应用的 memory layer。它本身不是一个向量数据库，也不是单纯的 embedding wrapper，而是把“用户长期记忆、会话上下文、事实抽取、向量检索、关键词检索、更新/删除历史”组织成一套可被应用直接调用的记忆系统。
+
+在典型 AI 应用里，大模型本身没有可靠的长期状态。mem0 的作用是把对话或业务事件中值得保留的信息抽取出来，存成可检索的 memory，并在后续请求中根据用户、agent、run 等 scope 找回相关 memory，作为个性化上下文或业务上下文提供给 LLM。
+
+mem0 在系统中通常承担这些职责：
+
+| 职责 | 说明 |
+|---|---|
+| 记忆写入 | 接收用户消息、助手消息或业务文本，抽取或直接写入 memory。 |
+| 事实抽取 | `infer=True` 时使用 LLM 从原始消息中抽取更稳定的事实型 memory。 |
+| 向量化 | 使用 embedder 把 memory 文本转成 embedding。 |
+| 持久化 | 通过 vector store provider 保存 id、vector、payload、scope metadata。 |
+| 语义检索 | 根据 query embedding 找回语义相似 memory。 |
+| 关键词检索 | 如果 provider 支持 `keyword_search`，mem0 会把 BM25/全文检索结果纳入候选。 |
+| 融合排序 | 合并 semantic score、keyword score、entity boost，输出最终 memory 列表。 |
+| 隔离与管理 | 通过 `user_id`、`agent_id`、`run_id` 区分不同用户、智能体或运行会话。 |
+| 更新/删除 | 支持 memory 更新、删除、删除某个 scope 下全部 memory。 |
+| 历史追踪 | 通过 history DB 记录 memory add/update/delete 历史。 |
+
+一句话概括：mem0 负责“什么应该被记住、怎么存、怎么找、怎么更新”；GaussDB provider 负责“把这些 memory 用 GaussDB 的表、向量索引、BM25、filter 和事务能力可靠落地”。
+
+### 1.2 mem0 怎么使用
+
+最常见的使用方式是通过 `Memory.from_config()` 初始化一个 memory 实例，然后调用 `add/search/update/delete`。
+
+示例配置，使用 GaussDB 作为 vector store：
+
+```python
+from mem0 import Memory
+
+config = {
+    "vector_store": {
+        "provider": "gaussdb",
+        "config": {
+            "host": "<gaussdb-host>",
+            "port": 19995,
+            "database": "<database>",
+            "user": "<user>",
+            "password": "<password>",
+            "collection_name": "mem0_memories",
+            "embedding_model_dims": 1536,
+            "profile": "commercial",
+            "metadata_mode": "auto",
+            "bm25_mode": "auto",
+        },
+    },
+    "embedder": {
+        "provider": "openai",
+        "config": {
+            "model": "text-embedding-3-small",
+            "api_key": "<api-key>",
+        },
+    },
+    "llm": {
+        "provider": "openai",
+        "config": {
+            "model": "gpt-4o-mini",
+            "api_key": "<api-key>",
+        },
+    },
+}
+
+memory = Memory.from_config(config)
+```
+
+写入 memory：
+
+```python
+memory.add(
+    "用户喜欢早晨喝拿铁咖啡，出差时优先选择靠窗座位。",
+    user_id="user-001",
+    agent_id="travel-agent",
+    run_id="run-20260428",
+)
+```
+
+检索 memory：
+
+```python
+result = memory.search(
+    "帮用户安排明早的航班和早餐",
+    filters={"user_id": "user-001"},
+    top_k=5,
+)
+
+for item in result["results"]:
+    print(item["memory"], item["score"])
+```
+
+更新 memory：
+
+```python
+memory.update(
+    memory_id="<memory-id>",
+    data="用户现在更喜欢走廊座位，但早餐仍然喜欢拿铁咖啡。",
+)
+```
+
+删除 memory：
+
+```python
+memory.delete(memory_id="<memory-id>")
+```
+
+删除某个用户下的全部 memory：
+
+```python
+memory.delete_all(user_id="user-001")
+```
+
+对 GaussDB 商用模式，读路径建议始终携带 scope filter：
+
+```python
+filters={"user_id": "user-001"}
+```
+
+或：
+
+```python
+filters={"agent_id": "travel-agent", "run_id": "run-20260428"}
+```
+
+这样可以避免跨用户、跨 agent、跨 run 的 memory 泄漏。
+
+### 1.3 mem0 能应用在哪些地方
+
+mem0 适合所有需要“长期记忆 + 个性化上下文 + 可更新知识”的 AI 应用。典型场景如下：
+
+| 场景 | mem0 的作用 | GaussDB 适配价值 |
+|---|---|---|
+| AI 助手 / 个人助手 | 记住用户偏好、习惯、历史任务、常用表达。 | 用 scope filter 隔离不同用户，用向量 + BM25 找回相关偏好。 |
+| 智能客服 | 记住客户历史问题、工单状态、产品偏好、服务记录。 | 用事务型数据库承载客户 memory，支持审计、更新和删除。 |
+| 企业知识助手 | 记住员工查询习惯、项目上下文、团队术语。 | 数据留在企业数据库内，便于统一安全和运维。 |
+| Agent 平台 | 每个 agent 拥有独立记忆，按 run 记录任务过程。 | `agent_id/run_id` 可以直接映射到 GaussDB filter/index。 |
+| 销售/CRM Copilot | 记住客户画像、沟通历史、购买意向、下一步动作。 | 关系型数据库更适合和业务系统集成。 |
+| 医疗/教育/金融助理 | 需要强隔离、可审计、可删除、可追踪 memory。 | GaussDB 的事务、权限、备份、审计和隔离策略更适合商用合规。 |
+| 多轮任务规划 | 记住任务约束、用户反馈、阶段性决策。 | semantic search 找相似历史任务，BM25 找关键词约束。 |
+| RAG 个性化增强 | 在检索外部知识前，先召回用户长期偏好和会话事实。 | GaussDB 同时承载 memory 向量检索和关键词检索。 |
+
+mem0 和传统 RAG 的区别在于：
+
+| 维度 | 传统 RAG | mem0 |
+|---|---|---|
+| 数据来源 | 文档、知识库、网页、结构化资料 | 用户对话、业务事件、agent 运行过程、长期偏好 |
+| 数据粒度 | 文档 chunk | memory/fact |
+| 生命周期 | 通常较稳定，批量构建 | 持续 add/update/delete |
+| 检索目标 | 找外部知识 | 找用户/agent/run 相关历史记忆 |
+| 隔离重点 | 多租户文档权限 | user_id/agent_id/run_id 记忆隔离 |
+| 更新方式 | 离线重建或增量同步 | 在线实时更新 memory |
+
+因此，mem0 更适合做 AI 应用的“长期状态层”。GaussDB 适配的意义，是让这个长期状态层可以落在企业级数据库中，而不是只能依赖专用向量库或外部搜索服务。
+
 ## 2. mem0 是怎么执行 Vector Store 的
 
 ### 2.1 初始化链路
@@ -630,4 +784,3 @@ filters={"agent_id": "...", "run_id": "..."}
 4. 相比 `pgvector`，GaussDB 当前在 batch search、scope guard、BM25 商用策略、schema meta、backfill 和测试矩阵上更完整。
 5. 相比 Qdrant/ES/MongoDB 等 provider，GaussDB 的特色是数据库内闭环、事务能力、SQL 运维能力和商用隔离策略；专用向量库的优势则在原生向量服务生态和托管便利性。
 6. P0/P1/P2 测试已经完成，并在 UTF-8 真实库 `mem0_e2e_db` 上全量通过。
-
