@@ -1,5 +1,11 @@
 # Mintlify Starter Kit
 
+## GaussDB mem0 适配文档
+
+- [需求分析文档](gaussdb-mem0-requirements-analysis.md)
+- [技术设计文档](gaussdb-mem0-technical-design.md)
+- [实现深度说明与 Provider 对比](gaussdb-mem0-integration-deep-dive.md)
+
 Click on `Use this template` to copy the Mintlify starter kit. The starter kit contains examples including
 
 - Guide pages
