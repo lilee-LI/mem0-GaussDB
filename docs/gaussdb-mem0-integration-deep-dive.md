@@ -655,6 +655,173 @@ GaussDB 适配增加了现有多数 provider 没有的商用辅助能力：
 | `vertex_ai_vector_search` | 644 | 是 | 否 | 高 | Vertex AI Vector Search。 |
 | `weaviate` | 392 | 是 | 否 | 高 | 专用向量库，支持 keyword 方向。 |
 
+### 6.4 GaussDB 适配点逐项走读：为什么这么做，友商怎么做
+
+本节按当前 `mem0/vector_stores/gaussdb.py` 的实现顺序走读。这里的“友商”指 mem0 已有 provider 背后的同类后端，包括 `pgvector`、`qdrant`、`mongodb`、`elasticsearch`、`opensearch`、`azure_mysql`、`azure_ai_search`、`pinecone`、`weaviate` 等。
+
+#### 6.4.1 Provider 注册与配置入口
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| provider 注册 | 在 `VectorStoreFactory.provider_to_class` 中注册 `"gaussdb": "mem0.vector_stores.gaussdb.GaussDB"`。 | mem0 统一通过 `Memory.from_config()` 和 `VectorStoreFactory.create()` 创建 vector store，必须注册 provider 名称。 | 所有 provider 都走这个工厂注册，例如 `pgvector`、`qdrant`、`mongodb`、`elasticsearch`。 | 与 mem0 标准一致。 |
+| 配置模型 | 新增 `GaussDBConfig`，支持连接参数、索引参数、metadata mode、BM25 mode、profile、probe、retry、observability。 | GaussDB 商用部署参数较多，如果只暴露低层字段，用户使用成本高；因此用高层 profile/mode 收敛默认行为。 | `qdrant`、`pinecone`、`weaviate` 更偏服务连接配置；`pgvector` 主要是 DB 连接和 index 开关；`databricks` 配置也很重。 | GaussDB 配置复杂度高于 pgvector，但通过 profile 降低了用户感知。 |
+| 环境变量 | 支持 `GAUSSDB_CONNECTION_STRING`、`GAUSSDB_DSN`、`GAUSSDB_URL`、`GAUSSDB_HOST` 等。 | 方便容器、CI、生产环境注入，不把密码写进代码。 | PostgreSQL/MySQL/云服务 provider 通常都支持显式参数，环境变量支持程度不一。 | 对商用部署更友好。 |
+
+设计取舍：
+
+- 不要求用户必须提供所有底层参数；推荐 `profile="commercial"`、`metadata_mode="auto"`、`bm25_mode="auto"`。
+- 允许低层参数覆盖高层模式，但通过配置校验避免混用造成语义不清。
+
+#### 6.4.2 驱动、连接池与事务
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| Python driver | 使用 psycopg2-compatible API，`ThreadedConnectionPool`。 | GaussDB 官方 Python 示例和生态更接近 psycopg2；避免引入 psycopg3 特性导致兼容风险。 | `pgvector` 同时兼容 psycopg2/psycopg3；`azure_mysql` 使用 PyMySQL/DBUtils；云向量库使用各自 SDK。 | 对 GaussDB 兼容性优先。 |
+| 连接池 | 默认 `minconn=1`、`maxconn=5`，也可传入外部 connection_pool。 | mem0 search/add 会频繁调用 provider；连接池避免每次创建连接。 | SQL 类 provider 通常有连接池或客户端复用；Qdrant/ES/MongoDB 复用 SDK client。 | 商用必要能力。 |
+| 事务处理 | `_get_cursor(commit=True)` 成功 commit，异常 rollback，并归还连接。 | DDL/DML 任一失败必须回滚，避免连接留在 aborted transaction 状态。 | `pgvector` 有 cursor context；部分云 SDK provider 由 SDK 管理事务或无显式事务。 | GaussDB 做法符合数据库型 provider 要求。 |
+| retry | 对连接、timeout、deadlock、serialization 等 transient error 做重试。 | 商用数据库可能遇到瞬态锁冲突或网络抖动，provider 层要有基本恢复能力。 | 多数 provider 依赖 SDK retry；`pgvector` 当前没有同等显式重试策略。 | GaussDB 工程化更强。 |
+
+#### 6.4.3 Collection 映射与表结构
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| collection 形态 | 一个 mem0 collection 对应一张 GaussDB Ustore 表。 | mem0 collection 与 SQL table 天然对应；Ustore 是目标商用基线。 | `pgvector` 也是一张 PostgreSQL 表；`azure_mysql` 是 MySQL 表；`qdrant` 是 collection；ES/OpenSearch 是 index；MongoDB 是 collection。 | 与 SQL provider 对齐。 |
+| 主表字段 | `id`、`vector`、`payload`、`memory`、`text_lemmatized`、时间戳、`schema_version`、可选 scope 冗余列。 | mem0 不只需要向量，还需要 payload、关键词字段、scope 隔离、迁移标识。 | `pgvector` 只有 `id/vector/payload`，关键词直接从 payload 取；`azure_mysql` 用 JSON payload + generated `text_lemmatized`；ES/OpenSearch mapping 中拆 `vector/metadata`。 | GaussDB 表结构更面向 mem0 检索链路。 |
+| schema meta | 额外创建 `{collection}_schema_meta`。 | `col_info()` 和后续 migration 需要知道真实 schema version，不能硬编码。 | 多数 provider 没有 schema meta；云服务通常由 index metadata 承担。 | GaussDB 为后续升级预留空间。 |
+| Ustore | 主表和 meta 表都 `WITH (storage_type=ustore)`。 | 用户目标是集中式、A 模式、Ustore；BM25 已验证可在 Ustore 返回 score。 | PostgreSQL/MySQL/ES/Qdrant 没有 Ustore 概念。 | GaussDB 特有适配点。 |
+
+为什么不单独拆 BM25 影子表：
+
+- 当前已验证 Ustore 主表可建 BM25 并返回 score，因此不需要默认引入 Astore 影子表。
+- 单表设计减少同步复杂度，`insert/update/delete/reset` 更容易保持一致。
+- 如果未来某些商用版本限制 Ustore BM25，再考虑影子表或降级策略。
+
+#### 6.4.4 向量类型、metric 与索引
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| 向量类型 | `FLOATVECTOR(dim)`。 | 对接 GaussDB 向量数据库能力，避免用 JSON/list 模拟向量。 | `pgvector` 用 `vector(dim)`；ES 用 `dense_vector`；Qdrant 用 dense vector slot；MongoDB 用 Atlas vector index。 | 对齐 GaussDB 原生能力。 |
+| metric | 支持 `cosine` 和 `l2`。 | mem0 用户可能使用不同 embedding 模型和距离口径；GaussDB 算子需要显式映射。 | `pgvector` 当前主要使用 cosine 距离；Qdrant/Pinecone/Weaviate 等通常支持多 metric。 | 覆盖主流需求。 |
+| 算子映射 | cosine -> `<+>`，L2 -> `<->`。 | GaussDB 手册定义的向量距离算子；查询按 distance ASC。 | `pgvector` 使用 `<=>`；MySQL 适配中有 Python 侧 cosine 计算；ES/Qdrant 由服务端 query API 封装。 | GaussDB 使用数据库内原生算子。 |
+| index 类型 | `gsdiskann` / `gsivfflat`。 | `gsdiskann` 面向较大规模和性能，`gsivfflat` 适合兼容/轻量验收。 | `pgvector` 有 HNSW/DiskANN 逻辑；Qdrant 内部 HNSW；ES/OpenSearch KNN；MongoDB Atlas vectorSearch index。 | 与主流向量索引能力对齐。 |
+| maintenance_work_mem | 建索引前 `SET LOCAL maintenance_work_mem`。 | GaussDB 向量索引构建可能需要较高内存；session-local 设置比要求用户全局改参数更安全。 | `pgvector` 当前没有同等封装；部分服务型 provider 由服务端管理资源。 | 体现数据库运维适配。 |
+
+#### 6.4.5 Payload、metadata 与 filter 存储模式
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| 默认 payload | JSONB。 | mem0 payload 是半结构化 metadata，JSONB 适合保存并做表达式过滤。 | `pgvector` 用 JSONB；`azure_mysql` 用 JSON；ES/OpenSearch 用 object/metadata；Qdrant/MongoDB 用 payload/document。 | 与主流设计一致。 |
+| TEXT payload | compatibility 模式支持 TEXT。 | 某些 GaussDB 商用版本/环境可能 JSONB 或 JSON expression index 受限，需要兼容路径。 | `pgvector` 当前没有 TEXT fallback；ES/Qdrant/MongoDB 没有这个问题。 | GaussDB 特有兼容设计。 |
+| filter_storage_mode | `json_expression` 或 `redundant_columns`。 | payload 存储和 filter 实现分离；即使 payload 降 TEXT，也要保证 scope filter 可用。 | Qdrant 建 payload index；ES/OpenSearch 建 keyword field；Azure AI Search 将 user/run/agent 独立为 filterable field；pgvector 直接 `payload->>`。 | GaussDB redundant columns 对标搜索/向量服务中的独立 filter 字段。 |
+| allowed_filter_keys | 可选 allowlist。 | 防止任意 payload key 被拼进 SQL 表达式，降低误用和注入风险。 | ES/Qdrant 通常通过 schema/index field 限制；pgvector 当前较宽松。 | 商用安全性更强。 |
+
+核心原因：GaussDB 面向企业数据库，不应假设所有版本/模式都能稳定支持 JSONB expression index。拆分 storage 与 filter 后，provider 可以按能力自动选择更稳路径。
+
+#### 6.4.6 写入与 Upsert
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| insert 输入 | 接收批量 `vectors/payloads/ids`。 | mem0 `_create_memory`、批量抽取和测试都可能一次写多条。 | 所有 provider 基本都支持批量输入。 | 标准能力。 |
+| upsert 方式 | 两段 CTE：先 set-based UPDATE，再 INSERT-not-exists。 | A 模式下不直接依赖 PostgreSQL `ON CONFLICT`；同时避免逐行 UPDATE/INSERT。 | `qdrant` 是 upsert points；ES bulk index；Azure MySQL 用 `ON DUPLICATE KEY UPDATE`；`pgvector` 当前是 insert，不是显式 upsert。 | GaussDB 更兼容 A 模式且有批量性能。 |
+| 派生字段 | 写入 `memory`、`text_lemmatized`、`schema_version`，redundant 模式写 scope columns。 | Memory 层 keyword_search 需要 `text_lemmatized`；list/search 需要 payload；scope filter 需要冗余列。 | `pgvector` keyword 从 payload 读取；Azure MySQL 用 generated column；Qdrant 写 dense vector 时也可写 BM25 sparse vector。 | GaussDB 选择显式派生列，便于建索引和 backfill。 |
+
+为什么不用逐行 DML：
+
+- mem0 的 add 可能由 LLM 一次抽取多条 memory，逐行 DML 会放大网络往返和事务开销。
+- 当前测试已锁定多行 insert 只发两条 set-based SQL。
+
+#### 6.4.7 语义向量检索 search
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| 查询方式 | SQL 中 `vector <op> %s::FLOATVECTOR AS distance`，按 distance ASC。 | 使用 GaussDB 原生向量算子，保证索引可用。 | `pgvector` 类似 SQL distance；Qdrant/MongoDB/ES 使用各自 query API；Azure MySQL 当前更多在 Python 侧算 cosine。 | GaussDB 与 pgvector 同类，但更贴近数据库内执行。 |
+| score 输出 | `1 / (1 + distance)`。 | mem0 Memory 层融合排序要求 provider score 越大越好；距离越小越好，需要转换。 | 不同 provider 分数语义不完全一致；ES/Qdrant/Pinecone 通常服务端直接返回 similarity score。 | GaussDB 做了方向统一。 |
+| 排序稳定性 | `ORDER BY distance ASC, id ASC`。 | 距离相同或接近时保证结果稳定，测试和线上分页更可预测。 | 不同 provider 由服务端排序决定；pgvector 当前主要按 distance。 | GaussDB 结果更稳定。 |
+
+#### 6.4.8 BM25 / keyword_search
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| keyword 字段 | `text_lemmatized` 独立列。 | BM25 index 直接建在文本列上，避免每次从 JSON 解析。 | `pgvector` 从 `payload->>'text_lemmatized'` 做 `to_tsvector`；Azure MySQL 用 generated column；ES/OpenSearch match metadata 字段；Qdrant 用 sparse vector slot。 | GaussDB 更利于数据库原生 BM25。 |
+| keyword 算法 | GaussDB native BM25，`text_lemmatized ### query`。 | 用户目标明确包含 BM25；普通 FTS 不等价于 BM25。 | ES/OpenSearch 原生 BM25；MongoDB Atlas Search text；Qdrant 用 fastembed sparse BM25；pgvector 用 PostgreSQL FTS rank，不是 BM25。 | GaussDB 对标搜索引擎和 Qdrant 的 keyword 能力。 |
+| 失败策略 | `bm25_mode=auto/required/disabled`，auto 失败返回 `None`。 | mem0 约定不支持 keyword 时返回 `None`；验收场景可用 required 强制失败。 | pgvector keyword 异常返回 `None`；Azure MySQL FULLTEXT 异常也返回 `None`；Qdrant 缺 fastembed 或 sparse slot 时禁用。 | GaussDB 策略更明确。 |
+| 事务保护 | BM25 optional DDL 用 SAVEPOINT。 | DDL 失败后事务可能 aborted；必须 rollback 到 savepoint，不能拖垮主表/vector/filter index 创建。 | 部分 provider 没有 DDL 事务问题；pgvector 的 FTS index 失败没有同级 optional savepoint 设计。 | GaussDB 对数据库 DDL 风险处理更完整。 |
+
+#### 6.4.9 原生 search_batch
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| batch search | 使用 `WITH query_vectors ... CROSS JOIN LATERAL` 一次查询多个 query vector。 | mem0 默认基类逐条 search，网络往返多；SQL 能天然表达 per-query top-k。 | 当前只有 `qdrant` 和 `gaussdb` override `search_batch`；Qdrant 调用原生 batch points。 | GaussDB 在 batch 能力上处于第一梯队。 |
+| fallback | native batch 失败后逐条调用 `search()`。 | 兼容不支持 LATERAL 或某些版本 SQL 差异的场景。 | 基类默认就是逐条调用；GaussDB 在失败时回退到基类等价行为。 | 可用性优先。 |
+
+为什么要做 batch：
+
+- Memory 层或上层应用可能需要同时检索多个 query，例如多实体、多候选问题、多轮任务 planning。
+- 数据库内 batch 能显著减少连接池压力和网络往返。
+
+#### 6.4.10 Scope filter 与商用隔离
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| 默认策略 | read path 默认要求 `user_id/agent_id/run_id` 至少一个正向约束。 | mem0 memory 是用户/agent 长期状态，跨租户泄漏属于高风险问题。 | Memory 层也要求 search filters 包含 scope；但多数 provider 本身不强制，直接 provider 调用可能绕过。 | GaussDB provider-level guard 更安全。 |
+| OR/NOT 处理 | OR 必须每个分支都有正向 scope；NOT/NE/NIN 不算有效 scope。 | 防止 `OR(user_id=alice, category=public)` 或 `user_id != bob` 这类条件扩大结果集。 | 很多 provider 只是把 filters 转成后端 filter，不做“是否约束全查询”的逻辑判断。 | GaussDB 更符合商用隔离。 |
+| filter 能力 | 支持 eq/ne/in/nin/range/contains/icontains/AND/OR/NOT。 | mem0 上层已经支持增强 filter，provider 需要能落 SQL。 | Qdrant filter 表达能力强；ES/OpenSearch bool/term/match 强；pgvector 目前 filter 较简单；Azure AI Search 是 OData filter。 | GaussDB filter 表达能力高于 pgvector。 |
+
+注意：`get(id)` 是 mem0 标准接口，没有 filters 参数，因此当前不承诺 provider-level scoped get。若商用强隔离要求覆盖 ID 查询，需要修改 mem0 API 或在 Memory 层引入 scope 校验。
+
+#### 6.4.11 update 行为
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| vector-only update | 只更新 vector 和 `updated_at`，不改 payload/memory/text。 | 调用方可能只想刷新 embedding；不能隐式篡改文本和 BM25 字段。 | pgvector、ES、Azure MySQL 也大多按 vector/payload 分开更新。 | 行为清晰。 |
+| payload-only update | 更新 payload、`memory`、`text_lemmatized`、`updated_at`。 | payload 文本变化后，BM25 字段必须同步，否则 keyword_search 会 stale。 | Azure MySQL generated column 从 payload 派生；pgvector keyword 从 payload 派生；Qdrant payload update 也会影响 keyword 取决于 sparse vector 是否重建。 | GaussDB 显式同步派生列。 |
+| redundant scope partial update | payload 缺少某个 scope key 时，不把对应冗余列置空。 | 部分 payload 更新不应破坏隔离索引，否则后续 scoped 查询漏数据。 | 搜索服务中独立 filter 字段也需要显式维护；pgvector 没有 redundant column 问题。 | 已用 P1/P2 测试锁定。 |
+
+#### 6.4.12 能力探测与兼容 fallback
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| capability probe | 初始化可探测 vector、FLOATVECTOR、UUID、JSONB、expression index、vector index、BM25 index、BM25 score query。 | GaussDB 商用版本/构建号、兼容模式和参数可能不同，不能只靠静态配置判断能力。 | Qdrant 检查 collection 是否有 bm25 sparse slot；云服务 provider 通常依赖 API 报错；pgvector 检查 extension/index 较有限。 | GaussDB probe 更系统。 |
+| JSONB fallback | JSONB 不可用时降为 TEXT + redundant scope columns。 | 保证最核心的 memory 存储和租户隔离仍可工作。 | 多数 provider 没有类似 DB 类型 fallback；SQL provider 通常要求目标类型可用。 | GaussDB 兼容性更强。 |
+| expression index fallback | expression index 不可用时 JSONB payload 保留，但 scope filter 改 redundant columns。 | payload 能力和隔离能力分离，避免因为索引限制牺牲隔离。 | Azure AI Search/ES/Qdrant 通常把 scope 做成独立可过滤字段；GaussDB redundant columns 是 SQL 等价设计。 | 设计合理。 |
+| BM25 fallback | BM25 不可用时禁用 keyword_search，semantic search 保持可用。 | mem0 允许 keyword_search 返回 `None`；不能让可选 keyword 能力拖垮主链路。 | pgvector/Azure MySQL keyword 异常返回 `None`；Qdrant 缺 sparse slot 时禁用 keyword。 | 与 mem0 生态一致。 |
+
+#### 6.4.13 Collection 运维、schema 与 backfill
+
+| 维度 | GaussDB 当前适配 | 为什么这么适配 | 友商/已有 provider 做法 | 判断 |
+|---|---|---|---|---|
+| `col_info()` | 返回 name/count/dimension/schema_version/profile/modes/indexes/BM25 状态。 | 商用排障需要知道真实 schema 和索引状态。 | `pgvector` 返回 name/count/size；多数 provider 返回较基础信息。 | GaussDB 信息更完整。 |
+| `migration_dry_run()` | 返回 v1 provider-managed 计划。 | 当前不是完整 migration framework，但先提供安全可见性。 | 多数 provider 没有 provider 内 migration 计划。 | 后续可扩展。 |
+| `backfill_derived_fields()` | JSONB 模式可回填 `memory/text_lemmatized`；TEXT 模式明确要求应用侧 recompute。 | 旧数据或异常数据可能缺派生字段，影响 BM25 和展示。 | 其他 provider 通常不维护派生列，因此很少有 backfill helper。 | GaussDB 更偏商用运维。 |
+| `analyze()` | 执行数据库统计信息刷新。 | 向量/过滤/排序性能依赖统计信息，尤其批量导入后。 | SQL provider 可能需要手工运维；云服务 provider 由服务端处理。 | 数据库型 provider 的必要补充。 |
+
+#### 6.4.14 测试适配策略
+
+| 维度 | GaussDB 当前测试 | 为什么这么测 | 友商/已有 provider 测试常见情况 | 判断 |
+|---|---|---|---|---|
+| mock/unit | 覆盖配置、SQL 构造、scope guard、BM25 savepoint、insert batch、update、col_info、backfill。 | 不依赖真实库，快速锁住 P1/P2 行为。 | 其他 provider 多数也有 mock 单测，但商用隔离/DDL fallback 覆盖不一定完整。 | P1/P2 已闭合。 |
+| live P0 | 覆盖 Memory.from_config、CRUD、filter、compatibility、UTF-8、metric、search_batch、BM25、index matrix。 | provider 适配最终要证明真实 mem0 + 真实 GaussDB 可用。 | 云服务 provider 通常依赖环境变量跑 live tests；本地 provider 有本地测试。 | 已在 UTF-8 库 `mem0_e2e_db` 上 `22 passed`。 |
+| 敏感信息 | 测试文件不保留真实地址/密码默认值。 | 避免误连真实环境和泄密。 | 所有 provider 测试都应遵循此原则。 | 已修复并扫描。 |
+
+#### 6.4.15 总体走读结论
+
+GaussDB 的适配路线可以概括为：
+
+1. 先按 mem0 标准接口实现完整 CRUD 和 dense vector search，保证最小可用。
+2. 再对齐 mem0 Memory 层真实检索链路，补 `keyword_search`、`search_batch`、score normalization 和 payload 字段。
+3. 针对企业 memory 场景补强 scope filter guard，避免 provider 被直接调用时绕过 Memory 层隔离。
+4. 针对 GaussDB 商用形态补 Ustore、A 模式、能力探测、JSONB/TEXT fallback、redundant scope columns、BM25 savepoint。
+5. 针对生产运维补连接池、事务、retry、metrics、schema meta、backfill、analyze。
+6. 最后用 unit + live P0/P1/P2 验证，确保不是“代码看起来适配”，而是真实 mem0 + GaussDB 跑通。
+
+和友商/已有 provider 的核心差异是：
+
+- 相比 `pgvector`：GaussDB 更重视商用隔离、BM25 原生能力、batch search 和兼容 fallback。
+- 相比 `qdrant`：GaussDB 同样具备 keyword + batch，但选择数据库内 SQL/Ustore/事务闭环，而不是专用向量服务。
+- 相比 `elasticsearch` / `opensearch`：GaussDB 的 BM25 没有搜索引擎生态那么宽，但可以和事务型 memory 表、向量索引、payload/filter 在同一数据库内闭环。
+- 相比 `mongodb`：GaussDB 不是文档数据库 pipeline 模式，而是 SQL 表 + JSONB/TEXT payload + 索引组合，适合企业关系型数据库运维体系。
+- 相比 `azure_mysql`：GaussDB 使用数据库原生向量类型和 BM25，而不是 JSON 向量或 Python 侧距离计算，向量检索链路更直接。
+
 ## 7. GaussDB 与 pgvector 的细粒度对标
 
 | 维度 | pgvector 当前实现 | GaussDB 当前实现 | 结论 |
