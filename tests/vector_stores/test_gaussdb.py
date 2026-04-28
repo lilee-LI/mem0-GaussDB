@@ -124,6 +124,14 @@ def test_gaussdb_config_accepts_split_metadata_storage_modes():
     assert cfg.filter_storage_mode == "redundant_columns"
 
 
+def test_allowed_filter_keys_must_include_all_scope_keys():
+    with pytest.raises(ValueError, match="Unsupported filter key: 'agent_id'"):
+        make_gaussdb(allowed_filter_keys=["user_id"])
+
+    db, _, _, _ = make_gaussdb(allowed_filter_keys=["user_id", "agent_id", "run_id", "category"])
+    assert db.allowed_filter_keys == {"user_id", "agent_id", "run_id", "category"}
+
+
 def test_gaussdb_provider_accepts_high_level_modes():
     db, _, _, _ = make_gaussdb(metadata_mode="compatible", bm25_mode="disabled")
 
@@ -305,6 +313,28 @@ def test_bm25_index_failure_rolls_back_savepoint_and_disables_bm25():
     assert db.metrics["gaussdb_fallback_count"] == 1
 
 
+def test_create_col_keeps_collection_when_optional_bm25_index_fails():
+    db, _, mock_conn, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    def execute_side_effect(sql, *args):
+        if "USING bm25" in str(sql):
+            raise Exception("bm25 unsupported")
+
+    mock_cursor.execute.side_effect = execute_side_effect
+
+    db.create_col()
+
+    sql = executed_sql(mock_cursor)
+    assert "CREATE TABLE IF NOT EXISTS" in sql
+    assert "USING gsdiskann (vector COSINE)" in sql
+    assert "USING bm25 (text_lemmatized)" in sql
+    assert "ROLLBACK TO SAVEPOINT" in sql
+    assert "payload->>'user_id'" in sql
+    assert db.bm25_enabled is False
+    assert db.metrics["gaussdb_fallback_count"] == 1
+    mock_conn.commit.assert_called()
+
+
 def test_capability_probe_bm25_score_failure_uses_savepoint_fallback():
     db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
     mock_cursor.fetchone.return_value = ("on",)
@@ -348,6 +378,32 @@ def test_insert_uses_upsert_and_vector_cast():
     assert insert_args[3] == "hello"
 
 
+def test_insert_many_rows_uses_two_set_based_statements():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    db.insert(
+        vectors=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
+        payloads=[
+            {"data": "a", "text_lemmatized": "a", "user_id": "u1"},
+            {"data": "b", "text_lemmatized": "b", "user_id": "u1"},
+            {"data": "c", "text_lemmatized": "c", "user_id": "u1"},
+        ],
+        ids=[
+            "11111111-1111-1111-1111-111111111111",
+            "22222222-2222-2222-2222-222222222222",
+            "33333333-3333-3333-3333-333333333333",
+        ],
+    )
+
+    calls = mock_cursor.execute.call_args_list
+    assert len(calls) == 2
+    assert all("WITH incoming" in str(call.args[0]) for call in calls)
+    assert "UPDATE" in str(calls[0].args[0])
+    assert "INSERT INTO" in str(calls[1].args[0])
+    assert len(calls[0].args[1]) == 18
+    assert len(calls[1].args[1]) == 18
+
+
 def test_search_uses_cosine_operator_filters_and_normalized_score():
     db, _, _, mock_cursor = make_gaussdb()
     mock_cursor.fetchall.return_value = [("id1", 0.25, {"data": "hello", "user_id": "u1"})]
@@ -367,6 +423,44 @@ def test_search_requires_scoped_filters_by_default():
 
     with pytest.raises(ValueError, match="requires at least one scoped filter"):
         db.search("hello", [0.1, 0.2, 0.3], filters={"category": "test"})
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"OR": [{"user_id": "alice"}, {"category": "public"}]},
+        {"$or": [{"user_id": "alice"}, {"category": "public"}]},
+        {"NOT": [{"user_id": "alice"}]},
+        {"user_id": {"ne": "alice"}},
+        {"user_id": {"nin": ["alice"]}},
+    ],
+)
+def test_keyword_search_rejects_non_constraining_scope_filters(filters):
+    db, _, _, mock_cursor = make_gaussdb()
+
+    with pytest.raises(ValueError, match="requires at least one scoped filter"):
+        db.keyword_search("hello", top_k=3, filters=filters)
+
+    mock_cursor.execute.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"OR": [{"user_id": "alice"}, {"category": "public"}]},
+        {"$or": [{"user_id": "alice"}, {"category": "public"}]},
+        {"NOT": [{"user_id": "alice"}]},
+        {"user_id": {"ne": "alice"}},
+        {"user_id": {"nin": ["alice"]}},
+    ],
+)
+def test_search_batch_rejects_non_constraining_scope_filters(filters):
+    db, _, _, mock_cursor = make_gaussdb()
+
+    with pytest.raises(ValueError, match="requires at least one scoped filter"):
+        db.search_batch(["hello"], [[0.1, 0.2, 0.3]], filters=filters)
+
+    mock_cursor.execute.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -495,6 +589,34 @@ def test_update_vector_and_payload_updates_timestamp():
     assert "vector = %s::FLOATVECTOR" in sql
     assert "payload = %s" in sql
     assert "updated_at = CURRENT_TIMESTAMP" in sql
+
+
+def test_update_vector_only_does_not_touch_payload_or_text_fields():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    db.update("id1", vector=[0.1, 0.2, 0.3])
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "vector = %s::FLOATVECTOR" in sql
+    assert "payload = %s" not in sql
+    assert "memory = %s" not in sql
+    assert "text_lemmatized = %s" not in sql
+    assert params == ("[0.1,0.2,0.3]", "id1")
+
+
+def test_update_payload_only_refreshes_payload_memory_and_text_fields():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    db.update("id1", payload={"data": "new", "text_lemmatized": "new lemma"})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "vector = %s::FLOATVECTOR" not in sql
+    assert "payload = %s" in sql
+    assert "memory = %s" in sql
+    assert "text_lemmatized = %s" in sql
+    assert params[-3:] == ("new", "new lemma", "id1")
 
 
 def test_update_payload_preserves_missing_redundant_scope_columns():

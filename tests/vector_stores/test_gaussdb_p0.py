@@ -208,6 +208,9 @@ def test_memory_from_config_add_search_delete_uses_real_gaussdb_provider():
         assert rows[0]["user_id"] == "alice"
         assert rows[0]["metadata"]["source"] == "p0-memory"
 
+        with pytest.raises(ValueError, match="filters must contain at least one of"):
+            memory.search("window seat", filters={"category": "travel"}, top_k=5, threshold=0)
+
         memory.delete(memory_id)
         assert memory.vector_store.get(memory_id) is None
     finally:
@@ -354,6 +357,25 @@ def test_scoped_search_list_and_batch_do_not_cross_tenants():
 
         with pytest.raises(ValueError, match="requires at least one scoped filter"):
             db.list(filters={"category": "public"})
+    finally:
+        db.delete_col()
+
+
+def test_live_keyword_and_batch_paths_reject_non_constraining_scope_filters():
+    db = _new_db()
+    try:
+        db.bm25_enabled = True
+        bad_filters = [
+            {"$or": [{"user_id": "alice"}, {"category": "public"}]},
+            {"user_id": {"ne": "bob"}},
+            {"$not": [{"user_id": "alice"}]},
+        ]
+
+        for filters in bad_filters:
+            with pytest.raises(ValueError, match="requires at least one scoped filter"):
+                db.keyword_search("latte", top_k=5, filters=filters)
+            with pytest.raises(ValueError, match="requires at least one scoped filter"):
+                db.search_batch(["latte"], [VECTOR_COFFEE], top_k=1, filters=filters)
     finally:
         db.delete_col()
 
@@ -515,6 +537,111 @@ def test_utf8_chinese_and_mixed_payload_round_trip():
             db.search("拿铁", VECTOR_COFFEE, top_k=2, filters={"user_id": "zh_user"}), {chinese_id, mixed_id}
         )
         _assert_exact_ids(_list_rows(db, {"user_id": "zh_user"}), {chinese_id, mixed_id})
+    finally:
+        db.delete_col()
+
+
+def test_live_payload_only_and_vector_only_update_paths():
+    db = _new_db()
+    try:
+        memory_id = _uuid(131)
+        _insert_memories(
+            db,
+            [
+                (
+                    memory_id,
+                    VECTOR_COFFEE,
+                    {
+                        "data": "Original update path memory",
+                        "text_lemmatized": "original update path memory",
+                        "user_id": "update_user",
+                        "category": "initial",
+                    },
+                )
+            ],
+        )
+
+        db.update(
+            memory_id,
+            payload={
+                "data": "Payload-only update memory",
+                "text_lemmatized": "payload only update memory",
+                "user_id": "update_user",
+                "category": "changed",
+            },
+        )
+        payload_updated = db.get(memory_id)
+        assert payload_updated.payload["data"] == "Payload-only update memory"
+        assert payload_updated.payload["category"] == "changed"
+        assert _ids(db.search("payload", VECTOR_COFFEE, top_k=1, filters={"user_id": "update_user"})) == [memory_id]
+
+        db.update(memory_id, vector=VECTOR_AISLE)
+        vector_updated = db.get(memory_id)
+        assert vector_updated.payload["data"] == "Payload-only update memory"
+        assert vector_updated.payload["text_lemmatized"] == "payload only update memory"
+        assert _ids(db.search("aisle", VECTOR_AISLE, top_k=1, filters={"user_id": "update_user"})) == [memory_id]
+    finally:
+        db.delete_col()
+
+
+def test_live_multi_row_batch_upsert_updates_existing_and_inserts_new_rows():
+    db = _new_db()
+    try:
+        existing_id = _uuid(141)
+        untouched_id = _uuid(142)
+        new_id = _uuid(143)
+        _insert_memories(
+            db,
+            [
+                (
+                    existing_id,
+                    VECTOR_COFFEE,
+                    {
+                        "data": "Existing batch memory",
+                        "text_lemmatized": "existing batch memory",
+                        "user_id": "upsert_user",
+                    },
+                ),
+                (
+                    untouched_id,
+                    VECTOR_FLIGHT,
+                    {
+                        "data": "Untouched batch memory",
+                        "text_lemmatized": "untouched batch memory",
+                        "user_id": "upsert_user",
+                    },
+                ),
+            ],
+        )
+
+        _insert_memories(
+            db,
+            [
+                (
+                    existing_id,
+                    VECTOR_WINDOW,
+                    {
+                        "data": "Existing batch memory updated",
+                        "text_lemmatized": "existing batch memory updated",
+                        "user_id": "upsert_user",
+                    },
+                ),
+                (
+                    new_id,
+                    VECTOR_AISLE,
+                    {
+                        "data": "New batch memory",
+                        "text_lemmatized": "new batch memory",
+                        "user_id": "upsert_user",
+                    },
+                ),
+            ],
+        )
+
+        assert db.get(existing_id).payload["data"] == "Existing batch memory updated"
+        assert db.get(untouched_id).payload["data"] == "Untouched batch memory"
+        assert db.get(new_id).payload["data"] == "New batch memory"
+        _assert_exact_ids(_list_rows(db, {"user_id": "upsert_user"}), {existing_id, untouched_id, new_id})
     finally:
         db.delete_col()
 
@@ -683,6 +810,20 @@ def test_migration_dry_run_and_json_backfill_helpers():
         result = db.backfill_derived_fields(dry_run=False)
         assert result["affected_rows"] >= 1
         assert db.get(backfill_id).payload["data"] == "Backfill should restore derived text"
+    finally:
+        db.delete_col()
+
+
+def test_text_payload_backfill_reports_application_recompute_requirement():
+    db = _new_db(profile="compatibility", vector_index_type="gsivfflat")
+    try:
+        dry_run = db.backfill_derived_fields(dry_run=True)
+        execute = db.backfill_derived_fields(dry_run=False)
+
+        assert dry_run["requires_application_recompute"] is True
+        assert dry_run["estimated_rows"] is None
+        assert execute["requires_application_recompute"] is True
+        assert "TEXT" in execute["reason"]
     finally:
         db.delete_col()
 
