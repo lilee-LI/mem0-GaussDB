@@ -712,12 +712,14 @@ def test_search_batch_native_results_match_sequential_results():
             ],
         )
 
+        fallback_count_before = db.metrics.get("gaussdb_fallback_count", 0)
         batch_rows = db.search_batch(
             ["coffee", "flight"],
             [VECTOR_COFFEE, VECTOR_FLIGHT],
             top_k=1,
             filters={"user_id": "batch_user"},
         )
+        assert db.metrics.get("gaussdb_fallback_count", 0) == fallback_count_before
         sequential_rows = [
             db.search("coffee", VECTOR_COFFEE, top_k=1, filters={"user_id": "batch_user"}),
             db.search("flight", VECTOR_FLIGHT, top_k=1, filters={"user_id": "batch_user"}),
