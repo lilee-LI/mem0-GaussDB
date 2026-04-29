@@ -556,7 +556,9 @@ def test_search_batch_returns_one_result_list_per_query():
     assert len(results) == 2
     assert results[0][0].id == "id1"
     assert results[1][0].id == "id2"
-    assert "CROSS JOIN LATERAL" in executed_sql(mock_cursor)
+    sql = executed_sql(mock_cursor)
+    assert "ROW_NUMBER() OVER" in sql
+    assert "PARTITION BY q.query_index" in sql
 
 
 def test_search_batch_falls_back_to_sequential_when_native_batch_fails():

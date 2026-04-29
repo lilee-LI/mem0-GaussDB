@@ -931,17 +931,24 @@ class GaussDB(VectorStoreBase):
                         f"""
                         WITH query_vectors(query_index, query_vector) AS (
                             VALUES {values_sql}
-                        )
-                        SELECT q.query_index, r.id, r.distance, r.payload
-                        FROM query_vectors q
-                        CROSS JOIN LATERAL (
-                            SELECT id, vector {self._vector_operator} q.query_vector AS distance, payload
-                            FROM {self.table_name}
+                        ),
+                        ranked AS (
+                            SELECT
+                                q.query_index,
+                                id,
+                                vector {self._vector_operator} q.query_vector AS distance,
+                                payload,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY q.query_index
+                                    ORDER BY vector {self._vector_operator} q.query_vector ASC, id ASC
+                                ) AS rank
+                            FROM query_vectors q, {self.table_name}
                             {where_clause}
-                            ORDER BY distance ASC, id ASC
-                            LIMIT %s
-                        ) r
-                        ORDER BY q.query_index ASC, r.distance ASC, r.id ASC
+                        )
+                        SELECT query_index, id, distance, payload
+                        FROM ranked
+                        WHERE rank <= %s
+                        ORDER BY query_index ASC, distance ASC, id ASC
                         """,
                         (*vector_params, *filter_params, top_k),
                     )
