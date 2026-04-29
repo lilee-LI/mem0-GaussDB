@@ -23,6 +23,8 @@ class MinimaxConfig(BaseLlmConfig):
         http_client_proxies: Optional[dict] = None,
         # MiniMax-specific parameters
         minimax_base_url: Optional[str] = None,
+        reasoning_split: Optional[bool] = True,
+        extra_body: Optional[dict] = None,
     ):
         """
         Initialize MiniMax configuration.
@@ -38,6 +40,8 @@ class MinimaxConfig(BaseLlmConfig):
             vision_details: Vision detail level, defaults to "auto"
             http_client_proxies: HTTP client proxy settings, defaults to None
             minimax_base_url: MiniMax API base URL, defaults to None
+            reasoning_split: Return thinking content in reasoning_details instead of message.content
+            extra_body: Additional OpenAI-compatible MiniMax request body parameters
         """
         # Initialize base parameters
         super().__init__(
@@ -54,3 +58,5 @@ class MinimaxConfig(BaseLlmConfig):
 
         # MiniMax-specific parameters
         self.minimax_base_url = minimax_base_url
+        self.reasoning_split = reasoning_split
+        self.extra_body = extra_body or {}

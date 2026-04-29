@@ -34,15 +34,30 @@ class MiniMaxLLM(LLMBase):
         super().__init__(config)
 
         if not self.config.model:
-            self.config.model = "MiniMax-M2.7"
+            self.config.model = os.getenv("MINIMAX_MODEL") or "MiniMax-M2.7"
 
         api_key = self.config.api_key or os.getenv("MINIMAX_API_KEY")
         base_url = (
             self.config.minimax_base_url
+            or os.getenv("MINIMAX_BASE_URL")
             or os.getenv("MINIMAX_API_BASE")
             or "https://api.minimax.io/v1"
         )
         self.client = OpenAI(api_key=api_key, base_url=base_url)
+
+    def _get_minimax_params(self, messages: List[Dict[str, str]], **kwargs) -> Dict:
+        params = self._get_supported_params(messages=messages, **kwargs)
+        max_tokens = params.pop("max_tokens", None)
+        if max_tokens is not None:
+            params["max_completion_tokens"] = max_tokens
+
+        extra_body = dict(getattr(self.config, "extra_body", {}) or {})
+        reasoning_split = getattr(self.config, "reasoning_split", None)
+        if reasoning_split is not None:
+            extra_body.setdefault("reasoning_split", reasoning_split)
+        if extra_body:
+            params["extra_body"] = extra_body
+        return params
 
     def _parse_response(self, response, tools):
         """
@@ -95,7 +110,7 @@ class MiniMaxLLM(LLMBase):
         Returns:
             str: The generated response.
         """
-        params = self._get_supported_params(messages=messages, **kwargs)
+        params = self._get_minimax_params(messages=messages, **kwargs)
         params.update(
             {
                 "model": self.config.model,
