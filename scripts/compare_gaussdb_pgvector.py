@@ -18,7 +18,7 @@ Example local pgvector container:
     -p 15432:5432 pgvector/pgvector:pg16
 
 Example run:
-  python scripts/compare_gaussdb_pgvector.py --provider both --scale 8
+  python scripts/compare_gaussdb_pgvector.py --provider both --scenario complex --scale 4
 """
 
 from __future__ import annotations
@@ -76,6 +76,7 @@ class QueryCase:
     vector: list[float]
     keyword_query: str
     filters: dict[str, Any]
+    expected_key: str
     expected_id: str
 
 
@@ -98,7 +99,7 @@ def _offset(vector: list[float], amount: float) -> list[float]:
     return [round(value + amount, 4) for value in vector]
 
 
-def build_dataset(scale: int) -> list[MemoryCase]:
+def build_simple_dataset(scale: int) -> list[MemoryCase]:
     base_cases = [
         MemoryCase(
             key="travel-window-seat",
@@ -183,7 +184,7 @@ def build_dataset(scale: int) -> list[MemoryCase]:
     return records
 
 
-def build_queries(records: list[MemoryCase]) -> list[QueryCase]:
+def build_simple_queries(records: list[MemoryCase]) -> list[QueryCase]:
     by_key = {record.key: record for record in records}
     targets = [
         ("travel_window", "flight seat preference", "window seat", "travel-window-seat"),
@@ -200,10 +201,263 @@ def build_queries(records: list[MemoryCase]) -> list[QueryCase]:
             vector=by_key[key].vector,
             keyword_query=keyword,
             filters={"user_id": by_key[key].user_id},
+            expected_key=key,
             expected_id=by_key[key].id,
         )
         for name, text, keyword, key in targets
     ]
+
+
+def build_complex_dataset(scale: int) -> list[MemoryCase]:
+    base_cases = [
+        MemoryCase(
+            key="alice-window-seat",
+            data="Alice strongly prefers quiet window seats on early morning flights",
+            text_lemmatized="alice strongly prefer quiet window seat early morning flight",
+            user_id="alice",
+            agent_id="travel-agent",
+            category="travel",
+            language="en",
+            vector=[0.90, 0.12, 0.05, 0.05, 0.02, 0.02, 0.01, 0.01],
+        ),
+        MemoryCase(
+            key="alice-aisle-seat-negative",
+            data="Alice dislikes aisle seats unless the flight is overnight",
+            text_lemmatized="alice dislike aisle seat unless flight overnight",
+            user_id="alice",
+            agent_id="travel-agent",
+            category="travel",
+            language="en",
+            vector=[0.91, 0.13, 0.05, 0.05, 0.02, 0.02, 0.01, 0.01],
+        ),
+        MemoryCase(
+            key="bob-window-cross-tenant",
+            data="Bob prefers quiet window seats on morning flights",
+            text_lemmatized="bob prefer quiet window seat morning flight",
+            user_id="bob",
+            agent_id="travel-agent",
+            category="travel",
+            language="en",
+            vector=[0.90, 0.12, 0.05, 0.05, 0.02, 0.02, 0.01, 0.01],
+        ),
+        MemoryCase(
+            key="xiaoli-priority-boarding",
+            data="小李 books flights with priority boarding and upgrade coupons",
+            text_lemmatized="小李 book flight priority boarding upgrade coupon",
+            user_id="xiaoli",
+            agent_id="travel-agent",
+            category="travel",
+            language="mixed",
+            vector=[0.87, 0.16, 0.06, 0.06, 0.02, 0.02, 0.02, 0.02],
+        ),
+        MemoryCase(
+            key="xiaowang-latte",
+            data="小王喜欢早晨喝拿铁咖啡",
+            text_lemmatized="小王 喜欢 早晨 喝 拿铁 咖啡 latte coffee",
+            user_id="xiaowang",
+            agent_id="food-agent",
+            category="food",
+            language="zh",
+            vector=[0.10, 0.90, 0.05, 0.04, 0.05, 0.02, 0.02, 0.02],
+        ),
+        MemoryCase(
+            key="xiaowang-matcha-negative",
+            data="小王周末会点抹茶蛋糕但不喝咖啡",
+            text_lemmatized="小王 weekend order matcha cake not coffee",
+            user_id="xiaowang",
+            agent_id="food-agent",
+            category="food",
+            language="zh",
+            vector=[0.11, 0.89, 0.05, 0.04, 0.05, 0.02, 0.02, 0.02],
+        ),
+        MemoryCase(
+            key="dana-2fa-reset",
+            data="Dana needs help resetting two factor authentication for the finance portal",
+            text_lemmatized="dana need help reset two factor authentication 2fa finance portal authenticator",
+            user_id="dana",
+            agent_id="support-agent",
+            category="support",
+            language="en",
+            vector=[0.05, 0.04, 0.10, 0.90, 0.06, 0.03, 0.02, 0.02],
+        ),
+        MemoryCase(
+            key="dana-password-reset-negative",
+            data="Dana changed her finance portal password last month",
+            text_lemmatized="dana change finance portal password last month",
+            user_id="dana",
+            agent_id="support-agent",
+            category="support",
+            language="en",
+            vector=[0.05, 0.04, 0.10, 0.91, 0.06, 0.03, 0.02, 0.02],
+        ),
+        MemoryCase(
+            key="carol-invoice-approval",
+            data="Carol tracks invoice approvals before quarterly reporting",
+            text_lemmatized="carol track invoice approval quarterly reporting",
+            user_id="carol",
+            agent_id="finance-agent",
+            category="finance",
+            language="en",
+            vector=[0.04, 0.05, 0.91, 0.08, 0.05, 0.03, 0.02, 0.02],
+        ),
+        MemoryCase(
+            key="carol-reimbursement-negative",
+            data="Carol files travel reimbursements after conferences",
+            text_lemmatized="carol file travel reimbursement conference",
+            user_id="carol",
+            agent_id="finance-agent",
+            category="finance",
+            language="en",
+            vector=[0.05, 0.05, 0.90, 0.08, 0.05, 0.03, 0.02, 0.02],
+        ),
+        MemoryCase(
+            key="evan-running-wednesday",
+            data="Evan runs five kilometers after work every Wednesday",
+            text_lemmatized="evan run five kilometer after work every wednesday",
+            user_id="evan",
+            agent_id="health-agent",
+            category="health",
+            language="en",
+            vector=[0.03, 0.04, 0.05, 0.06, 0.90, 0.12, 0.02, 0.02],
+        ),
+        MemoryCase(
+            key="evan-cycling-negative",
+            data="Evan cycles indoors on rainy Sundays",
+            text_lemmatized="evan cycle indoors rainy sunday",
+            user_id="evan",
+            agent_id="health-agent",
+            category="health",
+            language="en",
+            vector=[0.03, 0.04, 0.05, 0.06, 0.89, 0.13, 0.02, 0.02],
+        ),
+        MemoryCase(
+            key="phoenix-launch-budget",
+            data="Project Phoenix launch budget requires approval from Mira",
+            text_lemmatized="project phoenix launch budget require approval mira",
+            user_id="mira",
+            agent_id="project-agent",
+            category="project",
+            language="en",
+            vector=[0.04, 0.04, 0.12, 0.04, 0.03, 0.90, 0.08, 0.02],
+        ),
+        MemoryCase(
+            key="phoenix-design-review-negative",
+            data="Project Phoenix design review moved to next Tuesday",
+            text_lemmatized="project phoenix design review moved next tuesday",
+            user_id="mira",
+            agent_id="project-agent",
+            category="project",
+            language="en",
+            vector=[0.04, 0.04, 0.12, 0.04, 0.03, 0.91, 0.08, 0.02],
+        ),
+    ]
+
+    records: list[MemoryCase] = list(base_cases)
+    for repeat in range(1, scale):
+        for case in base_cases:
+            records.append(
+                MemoryCase(
+                    key=f"{case.key}-distractor-{repeat}",
+                    data=f"{case.data} archived distractor {repeat}",
+                    text_lemmatized=f"{case.text_lemmatized} archived distractor {repeat}",
+                    user_id=case.user_id,
+                    agent_id=case.agent_id,
+                    category=case.category,
+                    language=case.language,
+                    vector=_offset(case.vector, repeat * 0.001),
+                )
+            )
+    return records
+
+
+def build_complex_queries(records: list[MemoryCase]) -> list[QueryCase]:
+    by_key = {record.key: record for record in records}
+    targets = [
+        (
+            "hard_window_vs_aisle",
+            "Alice flight seat preference",
+            "window seat morning flight",
+            "alice-window-seat",
+            by_key["alice-aisle-seat-negative"].vector,
+            {"user_id": "alice"},
+        ),
+        (
+            "cross_tenant_window",
+            "Bob flight seat preference",
+            "window seat morning flight",
+            "bob-window-cross-tenant",
+            by_key["alice-window-seat"].vector,
+            {"user_id": "bob"},
+        ),
+        (
+            "mixed_priority_boarding",
+            "flight upgrade boarding preference",
+            "priority boarding upgrade",
+            "xiaoli-priority-boarding",
+            by_key["xiaoli-priority-boarding"].vector,
+            {"user_id": "xiaoli"},
+        ),
+        (
+            "zh_latte_vs_matcha",
+            "早晨饮品偏好",
+            "拿铁 咖啡 latte coffee",
+            "xiaowang-latte",
+            by_key["xiaowang-matcha-negative"].vector,
+            {"user_id": "xiaowang"},
+        ),
+        (
+            "support_2fa_vs_password",
+            "finance portal login help",
+            "2fa authenticator two factor",
+            "dana-2fa-reset",
+            by_key["dana-password-reset-negative"].vector,
+            {"user_id": "dana"},
+        ),
+        (
+            "finance_invoice_vs_reimbursement",
+            "quarterly finance approval",
+            "invoice approval quarterly",
+            "carol-invoice-approval",
+            by_key["carol-reimbursement-negative"].vector,
+            {"user_id": "carol"},
+        ),
+        (
+            "health_running_vs_cycling",
+            "weekly exercise habit",
+            "five kilometer wednesday",
+            "evan-running-wednesday",
+            by_key["evan-cycling-negative"].vector,
+            {"user_id": "evan"},
+        ),
+        (
+            "project_budget_vs_design",
+            "phoenix project approval",
+            "launch budget approval mira",
+            "phoenix-launch-budget",
+            by_key["phoenix-design-review-negative"].vector,
+            {"user_id": "mira"},
+        ),
+    ]
+    return [
+        QueryCase(
+            name=name,
+            text=text,
+            keyword_query=keyword,
+            expected_key=key,
+            expected_id=by_key[key].id,
+            vector=vector,
+            filters=filters,
+        )
+        for name, text, keyword, key, vector, filters in targets
+    ]
+
+
+def build_workload(scenario: str, scale: int) -> tuple[list[MemoryCase], list[QueryCase]]:
+    if scenario == "simple":
+        records = build_simple_dataset(scale)
+        return records, build_simple_queries(records)
+    records = build_complex_dataset(scale)
+    return records, build_complex_queries(records)
 
 
 def percentile(values: list[float], pct: float) -> float:
@@ -232,12 +486,25 @@ def summarize_query_results(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "queries": len(rows),
         "hit_at_1": sum(1 for row in rows if row["rank"] == 1),
-        "hit_at_3": sum(1 for row in rows if 0 < row["rank"] <= 3),
+        "hit_at_3": sum(1 for row in rows if row["rank"] is not None and 0 < row["rank"] <= 3),
         "mrr": round(statistics.mean(row["rr"] for row in rows), 4) if rows else 0.0,
         "p50_ms": round(statistics.median(latencies), 2) if latencies else 0.0,
         "p95_ms": round(percentile(latencies, 0.95), 2),
         "details": rows,
     }
+
+
+def fused_result_ids(semantic_ids: list[str], keyword_ids: list[str]) -> list[str]:
+    scores: dict[str, float] = {}
+    first_seen: dict[str, int] = {}
+    counter = 0
+    for result_ids in (semantic_ids, keyword_ids):
+        for rank, result_id in enumerate(result_ids, start=1):
+            scores[result_id] = scores.get(result_id, 0.0) + 1.0 / (60 + rank)
+            if result_id not in first_seen:
+                first_seen[result_id] = counter
+                counter += 1
+    return sorted(scores, key=lambda item: (-scores[item], first_seen[item]))
 
 
 def rank_of(result_ids: list[str], expected_id: str) -> int | None:
@@ -263,6 +530,7 @@ def evaluate_provider(
     vectors = [record.vector for record in records]
     payloads = [record.payload for record in records]
     record_ids = [record.id for record in records]
+    key_by_id = {record.id: record.key for record in records}
 
     _, insert_ms = timed_call(lambda: store.insert(vectors=vectors, payloads=payloads, ids=record_ids))
 
@@ -274,32 +542,52 @@ def evaluate_provider(
         semantic_rows.append(
             {
                 "name": query.name,
+                "expected_key": query.expected_key,
                 "expected_id": query.expected_id,
                 "rank": rank,
                 "rr": reciprocal_rank(result_ids, query.expected_id),
+                "top_keys": [key_by_id.get(result_id, result_id) for result_id in result_ids[:top_k]],
                 "top_ids": result_ids[:top_k],
                 "latency_ms": round(latency_ms, 2),
             }
         )
 
     keyword_rows = []
+    fused_rows = []
     keyword_supported = True
     for query in queries:
-        results, latency_ms = timed_call(
+        keyword_results, latency_ms = timed_call(
             lambda q=query: store.keyword_search(q.keyword_query, top_k=top_k, filters=q.filters)
         )
-        if results is None:
+        if keyword_results is None:
             keyword_supported = False
-        result_ids = ids(results)
+        result_ids = ids(keyword_results)
         rank = rank_of(result_ids, query.expected_id)
         keyword_rows.append(
             {
                 "name": query.name,
+                "expected_key": query.expected_key,
                 "expected_id": query.expected_id,
                 "rank": rank,
                 "rr": reciprocal_rank(result_ids, query.expected_id),
+                "top_keys": [key_by_id.get(result_id, result_id) for result_id in result_ids[:top_k]],
                 "top_ids": result_ids[:top_k],
                 "latency_ms": round(latency_ms, 2),
+            }
+        )
+        semantic_ids = next(row["top_ids"] for row in semantic_rows if row["name"] == query.name)
+        fused_ids = fused_result_ids(semantic_ids, result_ids)[:top_k]
+        fused_rank = rank_of(fused_ids, query.expected_id)
+        fused_rows.append(
+            {
+                "name": query.name,
+                "expected_key": query.expected_key,
+                "expected_id": query.expected_id,
+                "rank": fused_rank,
+                "rr": reciprocal_rank(fused_ids, query.expected_id),
+                "top_keys": [key_by_id.get(result_id, result_id) for result_id in fused_ids],
+                "top_ids": fused_ids,
+                "latency_ms": 0.0,
             }
         )
 
@@ -319,9 +607,11 @@ def evaluate_provider(
         batch_rows.append(
             {
                 "name": query.name,
+                "expected_key": query.expected_key,
                 "expected_id": query.expected_id,
                 "rank": rank,
                 "rr": reciprocal_rank(result_ids, query.expected_id),
+                "top_keys": [key_by_id.get(result_id, result_id) for result_id in result_ids[:top_k]],
                 "top_ids": result_ids[:top_k],
             }
         )
@@ -339,6 +629,7 @@ def evaluate_provider(
         "semantic": summarize_query_results(semantic_rows),
         "keyword_supported": keyword_supported,
         "keyword": summarize_query_results(keyword_rows),
+        "fused": summarize_query_results(fused_rows),
         "batch": {
             "queries": len(batch_rows),
             "hit_at_1": sum(1 for row in batch_rows if row["rank"] == 1),
@@ -393,23 +684,25 @@ def cleanup(store: VectorStoreBase) -> None:
 def print_comparison(results: list[dict[str, Any]]) -> None:
     print("\n# mem0 provider comparison")
     print(
-        "\n| Provider | Records | Insert ms | Semantic H@1 | Semantic MRR | Semantic P95 ms | Keyword | Keyword H@1 | Keyword MRR | Keyword P95 ms | Batch ms | Scope guard |"
+        "\n| Provider | Records | Insert ms | Semantic H@1 | Semantic MRR | Keyword | Keyword H@1 | Keyword MRR | Fused H@1 | Fused MRR | Semantic P95 ms | Keyword P95 ms | Batch ms | Scope guard |"
     )
-    print("|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---|")
+    print("|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---|")
     for result in results:
         print(
             "| {provider} | {records} | {insert_ms} | {semantic_h1} | {semantic_mrr} | "
-            "{semantic_p95} | {keyword_supported} | {keyword_h1} | {keyword_mrr} | "
-            "{keyword_p95} | {batch_ms} | {scope_guard} |".format(
+            "{keyword_supported} | {keyword_h1} | {keyword_mrr} | {fused_h1} | {fused_mrr} | "
+            "{semantic_p95} | {keyword_p95} | {batch_ms} | {scope_guard} |".format(
                 provider=result["provider"],
                 records=result["records"],
                 insert_ms=result["insert_ms"],
                 semantic_h1=result["semantic"]["hit_at_1"],
                 semantic_mrr=result["semantic"]["mrr"],
-                semantic_p95=result["semantic"]["p95_ms"],
                 keyword_supported="yes" if result["keyword_supported"] else "no",
                 keyword_h1=result["keyword"]["hit_at_1"],
                 keyword_mrr=result["keyword"]["mrr"],
+                fused_h1=result["fused"]["hit_at_1"],
+                fused_mrr=result["fused"]["mrr"],
+                semantic_p95=result["semantic"]["p95_ms"],
                 keyword_p95=result["keyword"]["p95_ms"],
                 batch_ms=result["batch"]["total_ms"],
                 scope_guard="yes" if result["scope_guard_enforced"] else "no",
@@ -417,13 +710,40 @@ def print_comparison(results: list[dict[str, Any]]) -> None:
         )
 
 
+def print_query_details(results: list[dict[str, Any]]) -> None:
+    for result in results:
+        print(f"\n## {result['provider']} query details")
+        print("| Query | Expected | Semantic rank/top | Keyword rank/top | Fused rank/top |")
+        print("|---|---|---|---|---|")
+        keyword_by_name = {row["name"]: row for row in result["keyword"]["details"]}
+        fused_by_name = {row["name"]: row for row in result["fused"]["details"]}
+        for semantic_row in result["semantic"]["details"]:
+            keyword_row = keyword_by_name[semantic_row["name"]]
+            fused_row = fused_by_name[semantic_row["name"]]
+            print(
+                "| {query} | {expected} | {semantic_rank}: {semantic_top} | "
+                "{keyword_rank}: {keyword_top} | {fused_rank}: {fused_top} |".format(
+                    query=semantic_row["name"],
+                    expected=semantic_row["expected_key"],
+                    semantic_rank=semantic_row["rank"],
+                    semantic_top=", ".join(semantic_row["top_keys"]),
+                    keyword_rank=keyword_row["rank"],
+                    keyword_top=", ".join(keyword_row["top_keys"]),
+                    fused_rank=fused_row["rank"],
+                    fused_top=", ".join(fused_row["top_keys"]),
+                )
+            )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--provider", choices=["both", "gaussdb", "pgvector"], default="both")
-    parser.add_argument("--scale", type=int, default=4, help="Repeat the base six cases N times")
+    parser.add_argument("--scenario", choices=["simple", "complex"], default="complex")
+    parser.add_argument("--scale", type=int, default=4, help="Repeat the scenario base cases N times")
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--collection-prefix", default="mem0_ab_eval")
     parser.add_argument("--keep", action="store_true", help="Keep benchmark collections for inspection")
+    parser.add_argument("--details", action="store_true", help="Print per-query expected/top-key details")
     parser.add_argument("--json", action="store_true", help="Print full JSON result")
     return parser.parse_args()
 
@@ -431,8 +751,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     suffix = uuid.uuid4().hex[:8]
-    records = build_dataset(scale=args.scale)
-    queries = build_queries(records)
+    records, queries = build_workload(args.scenario, scale=args.scale)
 
     providers: list[tuple[str, VectorStoreBase]] = []
     if args.provider in {"both", "gaussdb"}:
@@ -447,6 +766,8 @@ def main() -> int:
             results.append(evaluate_provider(name, store, records, queries, top_k=args.top_k))
 
         print_comparison(results)
+        if args.details:
+            print_query_details(results)
         if args.json:
             print("\n# full json")
             print(json.dumps(results, ensure_ascii=False, indent=2))
