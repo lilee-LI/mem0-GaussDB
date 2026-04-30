@@ -64,6 +64,7 @@ mem0 是面向 AI 应用的长期记忆层。它负责把用户对话、业务�
   - `keyword_search`
   - `search_batch`
 - 支持 GaussDB 集中式 A 模式 Ustore 表。
+- 支持 GaussDB 分布式兼容建表模式，用于在分布式库上验证 mem0 provider 基础链路。
 - 支持 `FLOATVECTOR`、`gsdiskann`、`gsivfflat`。
 - 支持 BM25 索引和 BM25 score 查询。
 - 支持 metadata filters 和商用默认 scope 隔离。
@@ -76,6 +77,7 @@ mem0 是面向 AI 应用的长期记忆层。它负责把用户对话、业务�
 - 不改变 mem0 上层 `Memory` API 的公共接口。
 - 不实现 graph store。当前 mem0 该路径下主要通过 vector store 和 entity collection 支撑 entity memory。
 - 不默认引入 Astore 影子表。Ustore + vector + BM25 是本期主路径。
+- 不在本期承诺分布式性能最优模型。当前分布式适配以 `id` hash 分布保证兼容；scope-hash、跨 DN 全局 top-k 优化和数据倾斜治理属于后续优化范围。
 - 不承诺 provider-level `get(vector_id)` 的租户过滤，因为 mem0 标准接口没有 `filters` 参数；强隔离 ID 查询需要上层 API 或 Memory 层补充。
 
 ## 4. 现状分析
@@ -398,4 +400,3 @@ mem0 全仓测试说明：
 - 深度说明与对比文档：`docs/gaussdb-mem0-integration-deep-dive.md`
 - 本需求分析文档：`docs/gaussdb-mem0-requirements-analysis.md`
 - 技术设计文档：`docs/gaussdb-mem0-technical-design.md`
-

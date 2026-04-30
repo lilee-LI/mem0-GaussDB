@@ -10,7 +10,7 @@
 
 - 接入 mem0 标准 `VectorStoreBase` 必选接口：`create_col`、`insert`、`search`、`delete`、`update`、`get`、`list_cols`、`delete_col`、`col_info`、`list`、`reset`。
 - 接入 mem0 可选增强接口：`keyword_search` 和 `search_batch`。在当前 mem0 25 个 vector store provider 中，只有 `qdrant` 和 `gaussdb` 同时 override 了 `keyword_search` 与 `search_batch`。
-- 针对 GaussDB 商用形态额外补齐：集中式、A 兼容模式、Ustore、`FLOATVECTOR`、`gsdiskann`/`gsivfflat`、原生 BM25、租户 scope 强制隔离、能力探测、事务 savepoint 保护、schema meta、backfill、连接池、重试、观测指标和 live P0/P1/P2 验证。
+- 针对 GaussDB 商用形态额外补齐：集中式、分布式兼容模式、A 兼容模式、Ustore、`FLOATVECTOR`、`gsdiskann`/`gsivfflat`、原生 BM25、租户 scope 强制隔离、能力探测、事务 savepoint 保护、schema meta、backfill、连接池、重试、观测指标和 live P0/P1/P2 验证。
 - 适配深度对标 `pgvector`，但在以下方面已经超过当前 mem0 `pgvector.py`：原生 batch search、scope guard 防绕过、JSONB 失败 fallback、TEXT payload + redundant scope columns 兼容模式、BM25 建索引事务保护、schema version 元数据、live 能力矩阵测试。
 
 如果用“mem0 现有 provider 适配成熟度”来衡量，GaussDB 当前属于高适配度，功能面已经接近或超过 `pgvector`，并在商用可交付性上更重。
@@ -689,6 +689,7 @@ GaussDB 适配增加了现有多数 provider 没有的商用辅助能力：
 | 主表字段 | `id`、`vector`、`payload`、`memory`、`text_lemmatized`、时间戳、`schema_version`、可选 scope 冗余列。 | mem0 不只需要向量，还需要 payload、关键词字段、scope 隔离、迁移标识。 | `pgvector` 只有 `id/vector/payload`，关键词直接从 payload 取；`azure_mysql` 用 JSON payload + generated `text_lemmatized`；ES/OpenSearch mapping 中拆 `vector/metadata`。 | GaussDB 表结构更面向 mem0 检索链路。 |
 | schema meta | 额外创建 `{collection}_schema_meta`。 | `col_info()` 和后续 migration 需要知道真实 schema version，不能硬编码。 | 多数 provider 没有 schema meta；云服务通常由 index metadata 承担。 | GaussDB 为后续升级预留空间。 |
 | Ustore | 主表和 meta 表都 `WITH (storage_type=ustore)`。 | 用户目标是集中式、A 模式、Ustore；BM25 已验证可在 Ustore 返回 score。 | PostgreSQL/MySQL/ES/Qdrant 没有 Ustore 概念。 | GaussDB 特有适配点。 |
+| 分布式兼容 | `deployment_mode="distributed"` 时追加 `DISTRIBUTE BY HASH ("id")`，schema meta 表追加 `DISTRIBUTE BY HASH ("collection_name")`。 | mem0 标准 provider 接口以 `id` 为主键和 DML 锚点，先保证分布式库能建表、写入和查询。 | 大多数 mem0 provider 不暴露集中式/分布式形态；服务型 provider 由后端隐藏分片。 | GaussDB 需要显式适配 SQL 分布式 DDL，但当前定位是兼容模式，不是 scope-hash 性能最优模式。 |
 
 为什么不单独拆 BM25 影子表：
 

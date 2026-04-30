@@ -721,17 +721,41 @@ result = memory.search(
 )
 ```
 
-## 18. 已知限制与后续演进
+## 18. 分布式兼容模式
+
+当前 provider 增加了显式部署形态配置：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `deployment_mode` | `centralized` | `centralized` 或 `distributed`。 |
+| `distribution_mode` | `auto` | `auto` 在集中式下解析为 `none`，在分布式下解析为 `hash`。 |
+
+当 `deployment_mode="distributed"` 且 `distribution_mode="auto/hash"` 时，建表 DDL 会追加分布式子句：
+
+```sql
+CREATE TABLE <collection> (...) WITH (storage_type=ustore)
+DISTRIBUTE BY HASH ("id");
+
+CREATE TABLE <collection>_schema_meta (...) WITH (storage_type=ustore)
+DISTRIBUTE BY HASH ("collection_name");
+```
+
+选择 `id` 作为主表分布键的原因是：当前 mem0 标准 provider 接口里 `get/update/delete/upsert` 都以 `id` 为稳定主键，`DISTRIBUTE BY HASH ("id")` 能保持主键约束和 DML 语义简单，避免为了分布键改写 mem0 公共接口。
+
+这个实现定位是“分布式兼容模式”，不是最终“分布式性能优化模式”。它可以验证分布式库上的建表、写入、向量检索、BM25、filter 和 collection 生命周期；但对于大规模多租户检索，`user_id/agent_id/run_id + vector top-k` 查询仍可能跨 DN 扫描。后续如果要做商用性能优化，应引入 `scope_hash` 或 scope 映射表，并同步改造主键、upsert、get/update/delete、批量检索和迁移方案。
+
+## 19. 已知限制与后续演进
 
 | 限制 | 当前处理 | 后续方向 |
 |---|---|---|
 | `get(id)` 无 filters | 文档明确 provider-level 无法 scope。 | Memory/API 层增加 scoped get。 |
 | 完整 migration framework 尚未实现 | 提供 v1 dry-run/backfill helper。 | 增加 schema inspector、可执行 plan、rollback plan。 |
 | BM25 多语言质量需要业务语料校验 | 默认使用 GaussDB 参数 + 质量回放。 | 建立中文、英文、中英混合 benchmark。 |
+| 分布式当前为兼容模式 | `DISTRIBUTE BY HASH ("id")`，不改变 mem0 标准接口。 | 评估 `scope_hash` 分布、全局 top-k 代价和数据倾斜。 |
 | 全仓测试依赖大量可选 SDK | GaussDB 测试单独可跑。 | CI matrix 按 provider extras 拆分。 |
 | 大规模性能数据仍依赖目标环境 | 提供 benchmark 报告入口。 | 在商用规格环境建立 P95 门禁。 |
 
-## 19. 设计结论
+## 20. 设计结论
 
 GaussDB provider 当前设计可以作为 mem0 的生产级 SQL/vector provider：
 
@@ -748,4 +772,3 @@ GaussDB provider 当前设计可以作为 mem0 的生产级 SQL/vector provider�
 - 更明确的 scoped `get` 上层契约。
 - 更多真实业务语料质量回放。
 - 大规模性能和稳定性门禁。
-

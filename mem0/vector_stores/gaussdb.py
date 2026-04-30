@@ -76,6 +76,8 @@ class CapabilityReport:
     payload_storage_mode: str = "jsonb"
     filter_storage_mode: str = "json_expression"
     metadata_column_mode: str = "jsonb"
+    deployment_mode: str = "centralized"
+    distribution_mode: str = "none"
 
 
 class GaussDB(VectorStoreBase):
@@ -110,6 +112,8 @@ class GaussDB(VectorStoreBase):
         client_encoding: Optional[str] = "UTF8",
         table_storage: str = "ustore",
         compatibility_mode: str = "A",
+        deployment_mode: str = "centralized",
+        distribution_mode: str = "auto",
         gaussdb_version_baseline: str = "506",
         id_column_type: str = "uuid",
         vector_index_type: str = "gsdiskann",
@@ -162,6 +166,10 @@ class GaussDB(VectorStoreBase):
         self.client_encoding = client_encoding
         self.table_storage = self._validate_choice(table_storage.lower(), "table_storage", {"ustore"})
         self.compatibility_mode = self._validate_choice(compatibility_mode.upper(), "compatibility_mode", {"A"})
+        self.deployment_mode = self._validate_choice(
+            str(deployment_mode).lower(), "deployment_mode", {"centralized", "distributed"}
+        )
+        self.distribution_mode = self._resolve_distribution_mode(distribution_mode)
         self.gaussdb_version_baseline = gaussdb_version_baseline
         self.profile = self._validate_choice(str(profile).lower(), "profile", {"commercial", "compatibility"})
         self.id_column_type = self._validate_choice(id_column_type.lower(), "id_column_type", {"uuid", "varchar"})
@@ -208,6 +216,8 @@ class GaussDB(VectorStoreBase):
             payload_storage_mode=self.payload_storage_mode,
             filter_storage_mode=self.filter_storage_mode,
             metadata_column_mode=self.metadata_column_mode,
+            deployment_mode=self.deployment_mode,
+            distribution_mode=self.distribution_mode,
         )
         self.metrics: Dict[str, int] = {}
 
@@ -297,6 +307,19 @@ class GaussDB(VectorStoreBase):
         mode = GaussDB._validate_choice(bm25_mode.lower(), "bm25_mode", {"auto", "required", "disabled"})
         enabled, fail_fast = _BM25_MODE_MAP[mode]
         return enabled, fail_fast, mode
+
+    def _resolve_distribution_mode(self, distribution_mode: str) -> str:
+        distribution_mode = "auto" if distribution_mode is None else distribution_mode
+        mode = self._validate_choice(
+            str(distribution_mode).lower(),
+            "distribution_mode",
+            {"auto", "none", "hash"},
+        )
+        if mode == "auto":
+            return "hash" if self.deployment_mode == "distributed" else "none"
+        if self.deployment_mode == "centralized" and mode != "none":
+            raise ValueError("distribution_mode can only be enabled when deployment_mode='distributed'")
+        return mode
 
     @staticmethod
     def _validate_choice(value: str, field_name: str, choices: set[str]) -> str:
@@ -476,6 +499,20 @@ class GaussDB(VectorStoreBase):
     def _payload_column_sql(self) -> str:
         return "TEXT" if self.payload_storage_mode == "text" else "JSONB"
 
+    def _create_table_suffix_sql(self, distribution_key: str) -> str:
+        suffix = f"WITH (storage_type={self.table_storage})"
+        distribution_clause = self._distribution_clause_sql(distribution_key)
+        if distribution_clause:
+            suffix = f"{suffix}\n                    {distribution_clause}"
+        return suffix
+
+    def _distribution_clause_sql(self, distribution_key: str) -> str:
+        if self.distribution_mode == "none":
+            return ""
+        if self.distribution_mode == "hash":
+            return f"DISTRIBUTE BY HASH ({self._quote_identifier(distribution_key)})"
+        raise ValueError(f"Unsupported distribution_mode: {self.distribution_mode}")
+
     def _payload_value(self, payload: dict):
         if self.payload_storage_mode == "text" or Json is None:
             return json.dumps(payload, ensure_ascii=False)
@@ -501,6 +538,8 @@ class GaussDB(VectorStoreBase):
             payload_storage_mode=self.payload_storage_mode,
             filter_storage_mode=self.filter_storage_mode,
             metadata_column_mode=self.metadata_column_mode,
+            deployment_mode=self.deployment_mode,
+            distribution_mode=self.distribution_mode,
         )
 
         def probe():
@@ -529,7 +568,7 @@ class GaussDB(VectorStoreBase):
                         vector FLOATVECTOR({self.embedding_model_dims}),
                         payload {self._payload_column_sql()},
                         text_lemmatized TEXT
-                    ) WITH (storage_type={self.table_storage})
+                    ) {self._create_table_suffix_sql("id")}
                     """
                 )
                 report.floatvector = True
@@ -652,7 +691,7 @@ class GaussDB(VectorStoreBase):
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         schema_version INTEGER DEFAULT 1
                         {self._redundant_column_sql()}
-                    ) WITH (storage_type={self.table_storage})
+                    ) {self._create_table_suffix_sql("id")}
                     """
                 )
                 self._create_schema_meta(cur)
@@ -673,7 +712,7 @@ class GaussDB(VectorStoreBase):
                 collection_name VARCHAR(128) PRIMARY KEY,
                 schema_version INTEGER NOT NULL,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            ) WITH (storage_type={self.table_storage})
+            ) {self._create_table_suffix_sql("collection_name")}
             """
         )
 
@@ -1079,6 +1118,8 @@ class GaussDB(VectorStoreBase):
                 "metadata_column_mode": self.metadata_column_mode,
                 "payload_storage_mode": self.payload_storage_mode,
                 "filter_storage_mode": self.filter_storage_mode,
+                "deployment_mode": self.deployment_mode,
+                "distribution_mode": self.distribution_mode,
                 "vector_index_type": self.vector_index_type,
                 "vector_metric": self.vector_metric,
                 "bm25_mode": self.bm25_mode,
@@ -1146,10 +1187,13 @@ class GaussDB(VectorStoreBase):
             "metadata_mode": self.metadata_mode,
             "payload_storage_mode": self.payload_storage_mode,
             "filter_storage_mode": self.filter_storage_mode,
+            "deployment_mode": self.deployment_mode,
+            "distribution_mode": self.distribution_mode,
             "planned_actions": [
                 "create_schema_meta_table_if_missing",
                 "ensure_text_lemmatized_column",
                 "ensure_scope_columns_when_filter_storage_mode_is_redundant_columns",
+                "ensure_hash_distribution_when_deployment_mode_is_distributed",
                 "ensure_vector_bm25_and_filter_indexes",
             ],
             "mutates_data": False,

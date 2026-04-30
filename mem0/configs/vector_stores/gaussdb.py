@@ -58,6 +58,14 @@ class GaussDBConfig(BaseModel):
     client_encoding: Optional[str] = Field("UTF8", description="Client encoding used by psycopg2 connections")
     table_storage: str = Field("ustore", description="GaussDB table storage type")
     compatibility_mode: str = Field("A", description="GaussDB compatibility mode")
+    deployment_mode: str = Field(
+        "centralized",
+        description="GaussDB deployment mode: centralized or distributed",
+    )
+    distribution_mode: str = Field(
+        "auto",
+        description="Table distribution mode. auto resolves to none for centralized and hash for distributed.",
+    )
     gaussdb_version_baseline: str = Field("506", description="Commercial baseline version family")
     id_column_type: str = Field("uuid", description="id column type: uuid or varchar")
     vector_index_type: str = Field("gsdiskann", description="Vector index type: gsdiskann or gsivfflat")
@@ -217,6 +225,22 @@ class GaussDBConfig(BaseModel):
             raise ValueError("GaussDB mem0 provider currently targets A compatibility mode")
         return normalized
 
+    @field_validator("deployment_mode")
+    @classmethod
+    def validate_deployment_mode(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in {"centralized", "distributed"}:
+            raise ValueError("deployment_mode must be 'centralized' or 'distributed'")
+        return normalized
+
+    @field_validator("distribution_mode")
+    @classmethod
+    def validate_distribution_mode(cls, value: str) -> str:
+        normalized = value.lower()
+        if normalized not in {"auto", "none", "hash"}:
+            raise ValueError("distribution_mode must be 'auto', 'none', or 'hash'")
+        return normalized
+
     @field_validator("id_column_type")
     @classmethod
     def validate_id_column_type(cls, value: str) -> str:
@@ -308,6 +332,8 @@ class GaussDBConfig(BaseModel):
     def validate_storage_mode_combination(self) -> "GaussDBConfig":
         if self.payload_storage_mode == "text" and self.filter_storage_mode == "json_expression":
             raise ValueError("filter_storage_mode='json_expression' requires payload_storage_mode='jsonb'")
+        if self.deployment_mode == "centralized" and self.distribution_mode == "hash":
+            raise ValueError("distribution_mode='hash' requires deployment_mode='distributed'")
         return self
 
     model_config = ConfigDict(arbitrary_types_allowed=True)

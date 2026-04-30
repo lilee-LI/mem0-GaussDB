@@ -8,6 +8,7 @@ Environment variables:
   GaussDB:
     GAUSSDB_HOST, GAUSSDB_PORT, GAUSSDB_DATABASE, GAUSSDB_USER, GAUSSDB_PASSWORD
     or the GAUSSDB_TEST_* variants used by live tests.
+    Optional: GAUSSDB_EVAL_DEPLOYMENT_MODE=distributed, GAUSSDB_EVAL_DISTRIBUTION_MODE=auto.
 
   pgvector:
     PGVECTOR_HOST, PGVECTOR_PORT, PGVECTOR_DATABASE, PGVECTOR_USER, PGVECTOR_PASSWORD
@@ -653,6 +654,8 @@ def make_gaussdb(collection_name: str) -> GaussDB:
         profile=_env("GAUSSDB_EVAL_PROFILE", default="commercial"),
         metadata_mode=_env("GAUSSDB_EVAL_METADATA_MODE", default="auto"),
         bm25_mode=_env("GAUSSDB_EVAL_BM25_MODE", default="auto"),
+        deployment_mode=_env("GAUSSDB_EVAL_DEPLOYMENT_MODE", default="centralized"),
+        distribution_mode=_env("GAUSSDB_EVAL_DISTRIBUTION_MODE", default="auto"),
         vector_index_type=_env("GAUSSDB_EVAL_VECTOR_INDEX", default="gsdiskann"),
         vector_metric="cosine",
         require_scoped_filters=True,

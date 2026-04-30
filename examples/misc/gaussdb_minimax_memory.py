@@ -6,6 +6,7 @@ Do not hard-code database passwords or LLM API keys in this file.
 Required environment variables:
   GaussDB:
     GAUSSDB_HOST, GAUSSDB_PORT, GAUSSDB_DATABASE, GAUSSDB_USER, GAUSSDB_PASSWORD
+    Optional: GAUSSDB_DEPLOYMENT_MODE=distributed, GAUSSDB_DISTRIBUTION_MODE=auto
 
   MiniMax LLM:
     MINIMAX_API_KEY
@@ -107,6 +108,8 @@ def build_memory(args: argparse.Namespace) -> Memory:
                 "profile": env("GAUSSDB_PROFILE", default="commercial"),
                 "metadata_mode": env("GAUSSDB_METADATA_MODE", default="auto"),
                 "bm25_mode": env("GAUSSDB_BM25_MODE", default="auto"),
+                "deployment_mode": env("GAUSSDB_DEPLOYMENT_MODE", default="centralized"),
+                "distribution_mode": env("GAUSSDB_DISTRIBUTION_MODE", default="auto"),
                 "vector_index_type": env("GAUSSDB_VECTOR_INDEX", default="gsdiskann"),
                 "vector_metric": env("GAUSSDB_VECTOR_METRIC", default="cosine"),
                 "require_scoped_filters": not args.allow_unscoped,

@@ -7,9 +7,13 @@ from mem0.vector_stores.gaussdb import GaussDB
 
 
 def _gaussdb_env_config(collection_name: str):
+    deployment_config = {
+        "deployment_mode": os.getenv("GAUSSDB_TEST_DEPLOYMENT_MODE", "centralized"),
+        "distribution_mode": os.getenv("GAUSSDB_TEST_DISTRIBUTION_MODE", "auto"),
+    }
     dsn = os.getenv("GAUSSDB_TEST_DSN")
     if dsn:
-        return {"connection_string": dsn, "collection_name": collection_name}
+        return {"connection_string": dsn, "collection_name": collection_name, **deployment_config}
 
     required = {
         "host": os.getenv("GAUSSDB_TEST_HOST"),
@@ -28,6 +32,7 @@ def _gaussdb_env_config(collection_name: str):
             "collection_name": collection_name,
             "sslmode": os.getenv("GAUSSDB_TEST_SSLMODE"),
             "sslrootcert": os.getenv("GAUSSDB_TEST_SSLROOTCERT"),
+            **deployment_config,
         }
     return None
 

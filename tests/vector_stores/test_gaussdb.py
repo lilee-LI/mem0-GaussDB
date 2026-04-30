@@ -42,6 +42,8 @@ def test_gaussdb_config_defaults_and_alias():
     assert cfg.database == "mem0db"
     assert cfg.table_storage == "ustore"
     assert cfg.compatibility_mode == "A"
+    assert cfg.deployment_mode == "centralized"
+    assert cfg.distribution_mode == "auto"
     assert cfg.gaussdb_version_baseline == "506"
     assert cfg.vector_index_type == "gsdiskann"
     assert cfg.vector_metric == "cosine"
@@ -122,6 +124,29 @@ def test_gaussdb_config_accepts_split_metadata_storage_modes():
 
     assert cfg.payload_storage_mode == "text"
     assert cfg.filter_storage_mode == "redundant_columns"
+
+
+def test_gaussdb_config_accepts_distributed_deployment_mode():
+    cfg = GaussDBConfig(
+        connection_pool=object(),
+        deployment_mode="distributed",
+        auto_create=False,
+        enable_capability_probe=False,
+    )
+
+    assert cfg.deployment_mode == "distributed"
+    assert cfg.distribution_mode == "auto"
+
+
+def test_gaussdb_config_rejects_hash_distribution_for_centralized():
+    with pytest.raises(ValidationError, match="deployment_mode='distributed'"):
+        GaussDBConfig(
+            connection_pool=object(),
+            deployment_mode="centralized",
+            distribution_mode="hash",
+            auto_create=False,
+            enable_capability_probe=False,
+        )
 
 
 def test_allowed_filter_keys_must_include_all_scope_keys():
@@ -235,6 +260,18 @@ def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
     mock_conn.commit.assert_called()
 
 
+def test_distributed_create_col_generates_hash_distribution_clauses():
+    db, _, _, mock_cursor = make_gaussdb(deployment_mode="distributed", require_scoped_filters=False)
+
+    db.create_col()
+
+    sql = executed_sql(mock_cursor)
+    assert db.deployment_mode == "distributed"
+    assert db.distribution_mode == "hash"
+    assert 'DISTRIBUTE BY HASH ("id")' in sql
+    assert 'DISTRIBUTE BY HASH ("collection_name")' in sql
+
+
 def test_text_payload_mode_uses_redundant_scope_filters():
     db, _, _, mock_cursor = make_gaussdb(metadata_column_mode="text")
     mock_cursor.fetchall.return_value = []
@@ -263,6 +300,16 @@ def test_capability_probe_sets_vector_index_maintenance_work_mem():
     assert "INSERT INTO" in sql
     assert "text_lemmatized ### %s AS score" in sql
     mock_cursor.execute.assert_any_call("SET LOCAL maintenance_work_mem = %s", ("128MB",))
+
+
+def test_capability_probe_uses_distributed_probe_table_suffix():
+    db, _, _, mock_cursor = make_gaussdb(deployment_mode="distributed", require_scoped_filters=False)
+    mock_cursor.fetchone.return_value = ("on",)
+
+    db._probe_capabilities()
+
+    sql = executed_sql(mock_cursor)
+    assert 'DISTRIBUTE BY HASH ("id")' in sql
 
 
 def test_capability_probe_falls_back_to_text_payload_and_redundant_filters_on_jsonb_failure():
@@ -686,6 +733,8 @@ def test_col_info_reads_schema_version_from_metadata_table():
     assert 'FROM "test_collection_schema_meta"' in sql
     assert info["count"] == 3
     assert info["schema_version"] == 7
+    assert info["deployment_mode"] == "centralized"
+    assert info["distribution_mode"] == "none"
     assert info["indexes"] == ["test_collection_vector_idx", "test_collection_bm25_idx"]
 
 
@@ -717,4 +766,7 @@ def test_migration_dry_run_and_backfill_report():
     report = db.backfill_derived_fields(dry_run=True)
 
     assert plan["mutates_data"] is False
+    assert plan["deployment_mode"] == "centralized"
+    assert plan["distribution_mode"] == "none"
+    assert "ensure_hash_distribution_when_deployment_mode_is_distributed" in plan["planned_actions"]
     assert report == {"dry_run": True, "estimated_rows": 7}

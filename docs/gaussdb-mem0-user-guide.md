@@ -39,7 +39,7 @@ memory = Memory.from_config({
 
 已适配能力：
 
-- 建表：Ustore 表，`FLOATVECTOR` 向量列，payload，`memory`，`text_lemmatized`，schema meta。
+- 建表：Ustore 表，`FLOATVECTOR` 向量列，payload，`memory`，`text_lemmatized`，schema meta；支持集中式默认建表，也支持分布式兼容建表。
 - 向量检索：支持 `cosine` 和 `l2`，默认 `cosine`。
 - 向量索引：支持 `gsdiskann` 和 `gsivfflat`，默认商业 profile 使用 `gsdiskann`。
 - 关键词检索：支持 GaussDB BM25，`keyword_search()` 使用 `text_lemmatized ### query`。
@@ -48,6 +48,7 @@ memory = Memory.from_config({
 - metadata 兼容：支持 JSONB payload，也支持 TEXT payload + 冗余 scope 列 fallback。
 - 批量写入：使用 CTE set-based update/insert，不依赖 PostgreSQL `ON CONFLICT`。
 - 批量检索：使用 A 模式兼容的 window function 实现，不使用 `LATERAL`。
+- 分布式兼容：`deployment_mode="distributed"` 时，主表按 `id` hash 分布，schema meta 表按 `collection_name` hash 分布。
 - 可观测：慢查询日志、fallback 计数、`col_info()`。
 
 ## 3. 准备环境
@@ -83,6 +84,15 @@ $env:GAUSSDB_DATABASE='<your-database>'
 $env:GAUSSDB_USER='<your-user>'
 $env:GAUSSDB_PASSWORD='<your-password>'
 ```
+
+如果验证 GaussDB 分布式库，再加：
+
+```powershell
+$env:GAUSSDB_DEPLOYMENT_MODE='distributed'
+$env:GAUSSDB_DISTRIBUTION_MODE='auto'
+```
+
+`auto` 在集中式下等价于不追加分布式子句，在分布式下等价于 `hash`。当前分布式适配是兼容模式：主表 `DISTRIBUTE BY HASH ("id")`，schema meta 表 `DISTRIBUTE BY HASH ("collection_name")`。它优先保证 mem0 标准接口能在分布式库上创建和运行，不把 `user_id/agent_id/run_id` 做分布键；如果目标是大规模多租户性能优化，需要后续引入 `scope_hash` 或映射表设计。
 
 MiniMax：
 
@@ -185,6 +195,8 @@ config = {
             "profile": "commercial",
             "metadata_mode": "auto",
             "bm25_mode": "auto",
+            "deployment_mode": "centralized",
+            "distribution_mode": "auto",
             "require_scoped_filters": True,
         },
     },
@@ -236,7 +248,25 @@ filters = {
 
 ## 8. 常见问题
 
-### 8.1 MiniMax smoke test 成功，但 `memory.add result` 为空
+### 8.1 分布式库怎么配置
+
+直接在 GaussDB vector store config 中增加：
+
+```python
+"deployment_mode": "distributed",
+"distribution_mode": "auto",
+```
+
+创建出来的表会追加：
+
+```sql
+WITH (storage_type=ustore)
+DISTRIBUTE BY HASH ("id")
+```
+
+这个方案适合先验证分布式库的语法兼容和 mem0 基础链路。它不是最终性能最优模型，因为 mem0 的主要查询通常是 `user_id/agent_id/run_id + vector top-k`，而不是只按 `id` 查询。生产级分布式优化建议继续评估 `scope_hash` 分布、批量检索全局 top-k 代价、BM25 分布式 ranking 一致性和数据倾斜。
+
+### 8.2 MiniMax smoke test 成功，但 `memory.add result` 为空
 
 这通常是 LLM 没抽取出 memory。先看 MiniMax 返回是否是合法 JSON。也可以用：
 
@@ -246,7 +276,7 @@ python examples\misc\gaussdb_minimax_memory.py --no-infer --reset
 
 `--no-infer` 会跳过 LLM 抽取，把原始 message 直接写入 GaussDB，用于确认 DB 和 embedding 链路。
 
-### 8.2 embedding 维度不匹配
+### 8.3 embedding 维度不匹配
 
 GaussDB collection 的 `embedding_model_dims` 必须和 embedding 模型输出维度一致。换 embedding 模型后，建议换 collection 或执行：
 
@@ -254,11 +284,11 @@ GaussDB collection 的 `embedding_model_dims` 必须和 embedding 模型输出�
 python examples\misc\gaussdb_minimax_memory.py --reset --embedding-dims <dims>
 ```
 
-### 8.3 search 报 scope 相关错误
+### 8.4 search 报 scope 相关错误
 
 确认 search 时传了 `filters={"user_id": "..."}`，或者脚本没有误加 `--allow-unscoped`。
 
-### 8.4 BM25 不可用
+### 8.5 BM25 不可用
 
 如果 `col_info()` 里 `bm25_enabled=false`，说明当前库 BM25 建索引或 score probe 没通过。你仍然可以用向量召回；若要强制 BM25 必须可用：
 
@@ -267,7 +297,7 @@ $env:GAUSSDB_BM25_MODE='required'
 python examples\misc\gaussdb_minimax_memory.py --reset
 ```
 
-### 8.5 MiniMax endpoint
+### 8.6 MiniMax endpoint
 
 当前 provider 支持：
 
@@ -277,7 +307,7 @@ python examples\misc\gaussdb_minimax_memory.py --reset
 
 默认是 `https://api.minimax.io/v1`。
 
-### 8.6 MiniMax 返回空内容或只有解释文本
+### 8.7 MiniMax 返回空内容或只有解释文本
 
 优先确认：
 

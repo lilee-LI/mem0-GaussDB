@@ -34,6 +34,8 @@ Optional switches:
     GAUSSDB_TEST_ENABLE_PROBE        Defaults to false for faster collection setup.
     GAUSSDB_TEST_RUN_BM25            Set to true to require and verify BM25.
     GAUSSDB_TEST_RUN_INDEX_MATRIX    Set to true to run the full index/metric matrix.
+    GAUSSDB_TEST_DEPLOYMENT_MODE     centralized or distributed. Defaults to centralized.
+    GAUSSDB_TEST_DISTRIBUTION_MODE   auto, none, or hash. Defaults to auto.
 """
 
 import os
@@ -101,6 +103,8 @@ def _gaussdb_env_config(collection_name: str, **overrides):
             "id_column_type": "uuid",
             "vector_index_type": os.getenv("GAUSSDB_TEST_VECTOR_INDEX", "gsivfflat"),
             "vector_index_maintenance_work_mem": os.getenv("GAUSSDB_TEST_MAINTENANCE_MEM", "128MB"),
+            "deployment_mode": os.getenv("GAUSSDB_TEST_DEPLOYMENT_MODE", "centralized"),
+            "distribution_mode": os.getenv("GAUSSDB_TEST_DISTRIBUTION_MODE", "auto"),
             "bm25_mode": "disabled",
             "enable_capability_probe": _env_bool("GAUSSDB_TEST_ENABLE_PROBE", default=False),
             "require_scoped_filters": True,
