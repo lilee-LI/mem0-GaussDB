@@ -401,7 +401,7 @@ def test_capability_probe_bm25_score_failure_uses_savepoint_fallback():
     assert db.metrics["gaussdb_fallback_count"] == 1
 
 
-def test_insert_uses_upsert_and_vector_cast():
+def test_insert_uses_merge_into_and_vector_cast():
     db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
 
     db.insert(
@@ -414,18 +414,17 @@ def test_insert_uses_upsert_and_vector_cast():
     )
 
     sql = executed_sql(mock_cursor)
-    insert_args = mock_cursor.execute.call_args_list[-1].args[1]
-    assert "UPDATE" in sql
-    assert "INSERT INTO" in sql
-    assert "WITH incoming" in sql
-    assert "FROM incoming" in sql
-    assert mock_cursor.execute.call_count == 2
+    merge_args = mock_cursor.execute.call_args_list[-1].args[1]
+    assert "MERGE INTO" in sql
+    assert "WHEN MATCHED THEN" in sql
+    assert "WHEN NOT MATCHED THEN" in sql
+    assert mock_cursor.execute.call_count == 1
     assert "%s::FLOATVECTOR" in sql
-    assert insert_args[1] == "[0.1,0.2,0.3]"
-    assert insert_args[3] == "hello"
+    assert merge_args[1] == "[0.1,0.2,0.3]"
+    assert merge_args[3] == "hello"
 
 
-def test_insert_many_rows_uses_two_set_based_statements():
+def test_insert_many_rows_uses_single_merge_statement():
     db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
 
     db.insert(
@@ -443,12 +442,11 @@ def test_insert_many_rows_uses_two_set_based_statements():
     )
 
     calls = mock_cursor.execute.call_args_list
-    assert len(calls) == 2
-    assert all("WITH incoming" in str(call.args[0]) for call in calls)
-    assert "UPDATE" in str(calls[0].args[0])
-    assert "INSERT INTO" in str(calls[1].args[0])
+    assert len(calls) == 1
+    assert "MERGE INTO" in str(calls[0].args[0])
+    assert "WHEN MATCHED THEN" in str(calls[0].args[0])
+    assert "WHEN NOT MATCHED THEN" in str(calls[0].args[0])
     assert len(calls[0].args[1]) == 18
-    assert len(calls[1].args[1]) == 18
 
 
 def test_search_uses_cosine_operator_filters_and_normalized_score():

@@ -806,44 +806,33 @@ class GaussDB(VectorStoreBase):
         columns = ["id", "vector", "payload", "memory", "text_lemmatized", "schema_version"]
         if self.filter_storage_mode == "redundant_columns":
             columns.extend(self._redundant_scope_columns)
-        column_sql = ", ".join(self._quote_identifier(column) for column in columns)
         update_columns = [column for column in columns if column != "id"]
-        update_sql = ", ".join(
-            f"{self._quote_identifier(column)} = incoming.{self._quote_identifier(column)}" for column in update_columns
+        update_set_sql = ", ".join(
+            f"{self._quote_identifier(column)} = src.{self._quote_identifier(column)}" for column in update_columns
         )
-        update_sql += ", updated_at = CURRENT_TIMESTAMP"
+        update_set_sql += ", updated_at = CURRENT_TIMESTAMP"
+        insert_columns_sql = ", ".join(self._quote_identifier(column) for column in columns)
+        insert_columns_sql += ", updated_at"
+        insert_values_sql = ", ".join(f"src.{self._quote_identifier(column)}" for column in columns)
+        insert_values_sql += ", CURRENT_TIMESTAMP"
         values_sql = ", ".join([self._incoming_values_sql(columns)] * len(rows))
-        incoming_columns_sql = ", ".join(self._quote_identifier(column) for column in columns)
-        incoming_select_sql = ", ".join(f"incoming.{self._quote_identifier(column)}" for column in columns)
+        src_columns_sql = ", ".join(self._quote_identifier(column) for column in columns)
         flat_params = tuple(value for row in rows for value in row)
 
         def op():
             with self._get_cursor(commit=True) as cur:
+                # MERGE INTO: GaussDB A-mode (Oracle compatible) atomic upsert.
+                # Avoids the race condition of separate UPDATE + INSERT WHERE NOT EXISTS.
                 cur.execute(
                     f"""
-                    WITH incoming ({incoming_columns_sql}) AS (
-                        VALUES {values_sql}
-                    )
-                    UPDATE {self.table_name} AS target
-                    SET {update_sql}
-                    FROM incoming
-                    WHERE target.id = incoming.id
-                    """,
-                    flat_params,
-                )
-                cur.execute(
-                    f"""
-                    WITH incoming ({incoming_columns_sql}) AS (
-                        VALUES {values_sql}
-                    )
-                    INSERT INTO {self.table_name} ({column_sql})
-                    SELECT {incoming_select_sql}
-                    FROM incoming
-                    WHERE NOT EXISTS (
-                        SELECT 1
-                        FROM {self.table_name} AS target
-                        WHERE target.id = incoming.id
-                    )
+                    MERGE INTO {self.table_name} AS target
+                    USING (VALUES {values_sql}) AS src ({src_columns_sql})
+                    ON (target.id = src.id)
+                    WHEN MATCHED THEN
+                        UPDATE SET {update_set_sql}
+                    WHEN NOT MATCHED THEN
+                        INSERT ({insert_columns_sql})
+                        VALUES ({insert_values_sql})
                     """,
                     flat_params,
                 )
