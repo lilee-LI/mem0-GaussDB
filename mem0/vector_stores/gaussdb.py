@@ -189,6 +189,15 @@ class GaussDB(VectorStoreBase):
         self.vector_metric = self._validate_choice(vector_metric.lower(), "vector_metric", {"cosine", "l2"})
         self.gsdiskann_subgraph_count = gsdiskann_subgraph_count
         self.vector_index_maintenance_work_mem = vector_index_maintenance_work_mem
+        if self.deployment_mode == "distributed" and self.embedding_model_dims > 1024:
+            raise ValueError(
+                f"GaussDB distributed mode only supports embedding dimensions <= 1024, "
+                f"but embedding_model_dims={self.embedding_model_dims}. "
+                f"Solutions: (1) Use an embedding model with <= 1024 dimensions "
+                f"(e.g. BGE-M3, Cohere embed-v3, text-embedding-3-small with dims=1024); "
+                f"(2) Set embedder embedding_dims=1024 (OpenAI text-embedding-3 supports MRL truncation); "
+                f"(3) Switch to deployment_mode='centralized' which supports up to 4096 dimensions."
+            )
         if self.embedding_model_dims > 1024:
             if self.vector_index_type != "gsdiskann":
                 raise ValueError(
