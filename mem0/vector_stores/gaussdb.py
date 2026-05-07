@@ -118,6 +118,7 @@ class GaussDB(VectorStoreBase):
         id_column_type: str = "uuid",
         vector_index_type: str = "gsdiskann",
         vector_metric: str = "cosine",
+        gsdiskann_subgraph_count: int = 1,
         vector_index_maintenance_work_mem: Optional[str] = "128MB",
         bm25_enabled: bool = True,
         bm25_fail_fast: bool = False,
@@ -139,6 +140,7 @@ class GaussDB(VectorStoreBase):
         retry_backoff_seconds: float = 0.1,
         auto_create: bool = True,
         profile: str = "commercial",
+        max_embedding_dims: int = 4096,
     ):
         connection_string = (
             connection_string or dsn or url or _first_env("GAUSSDB_CONNECTION_STRING", "GAUSSDB_DSN", "GAUSSDB_URL")
@@ -154,6 +156,14 @@ class GaussDB(VectorStoreBase):
         self.database = database
         self.collection_name = self._validate_identifier(collection_name, "collection_name")
         self.embedding_model_dims = self._validate_positive_int(embedding_model_dims, "embedding_model_dims")
+        self.max_embedding_dims = self._validate_positive_int(max_embedding_dims, "max_embedding_dims")
+        if self.embedding_model_dims > self.max_embedding_dims:
+            raise ValueError(
+                f"GaussDB vector dimension limit: embedding_model_dims={self.embedding_model_dims} "
+                f"exceeds max_embedding_dims={self.max_embedding_dims}. "
+                f"Set your embedder's embedding_dims<={self.max_embedding_dims} "
+                f"or increase max_embedding_dims if your server supports higher dimensions."
+            )
         self.user = user
         self.password = password
         self.host = host
@@ -177,7 +187,21 @@ class GaussDB(VectorStoreBase):
             vector_index_type.lower(), "vector_index_type", {"gsdiskann", "gsivfflat"}
         )
         self.vector_metric = self._validate_choice(vector_metric.lower(), "vector_metric", {"cosine", "l2"})
+        self.gsdiskann_subgraph_count = gsdiskann_subgraph_count
         self.vector_index_maintenance_work_mem = vector_index_maintenance_work_mem
+        if self.embedding_model_dims > 1024:
+            if self.vector_index_type != "gsdiskann":
+                raise ValueError(
+                    f"embedding_model_dims={self.embedding_model_dims} exceeds 1024; "
+                    f"only GsDiskANN supports >1024 dimensions. "
+                    f"Set vector_index_type='gsdiskann' or reduce embedding_model_dims<=1024."
+                )
+            if self.gsdiskann_subgraph_count <= 0:
+                raise ValueError(
+                    f"embedding_model_dims={self.embedding_model_dims} exceeds 1024; "
+                    f"GsDiskANN requires subgraph_count>0 (with enable_vector_copy=false) "
+                    f"for high-dimensional indexes."
+                )
         self.bm25_enabled, self.bm25_fail_fast, self.bm25_mode = self._resolve_bm25_mode(
             bm25_mode=bm25_mode,
             bm25_enabled=bm25_enabled,
@@ -514,9 +538,13 @@ class GaussDB(VectorStoreBase):
         raise ValueError(f"Unsupported distribution_mode: {self.distribution_mode}")
 
     def _payload_value(self, payload: dict):
-        if self.payload_storage_mode == "text" or Json is None:
-            return json.dumps(payload, ensure_ascii=False)
-        return Json(payload)
+        # Always serialize as a plain JSON string. Avoid psycopg2's Json adapter
+        # because its getquoted() uses latin-1 encoding internally, which fails
+        # for non-ASCII characters. The SQL cast (::JSONB or ::TEXT) in the query
+        # handles the type conversion on the server side, and client_encoding=UTF8
+        # ensures the raw UTF-8 bytes are transmitted correctly even when
+        # server_encoding is SQL_ASCII.
+        return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
     def _decode_payload(payload: Any) -> dict:
@@ -577,11 +605,13 @@ class GaussDB(VectorStoreBase):
 
                 index_name = self._quote_identifier(self._index_name(f"probe_{uuid.uuid4().hex[:8]}", "vector_idx"))
                 self._set_vector_index_maintenance_work_mem(cur)
+                with_clause = self._vector_index_with_clause()
                 cur.execute(
                     f"""
                     CREATE INDEX {index_name}
                     ON {probe_table}
                     USING {self.vector_index_type} (vector {self._vector_index_metric})
+                    {with_clause}
                     """
                 )
                 report.vector_index = True
@@ -647,7 +677,15 @@ class GaussDB(VectorStoreBase):
                         report.filter_storage_mode = self.filter_storage_mode
                         report.metadata_column_mode = self.metadata_column_mode
         except Exception as exc:
-            if self.payload_storage_mode == "jsonb" and "jsonb" in str(exc).lower():
+            err_msg = str(exc).lower()
+            if "max dimension" in err_msg or ("exceeds" in err_msg and "dimension" in err_msg):
+                raise RuntimeError(
+                    f"GaussDB vector dimension limit exceeded: embedding_model_dims="
+                    f"{self.embedding_model_dims}. The server rejected the dimension. "
+                    f"Centralized + GsDiskANN supports up to 4096; gsivfflat may have lower limits. "
+                    f"Use an embedding model with fewer dimensions, or check your index type and deployment mode."
+                ) from exc
+            elif self.payload_storage_mode == "jsonb" and "jsonb" in err_msg:
                 logger.warning("JSONB probe failed; falling back to TEXT payload and redundant scope columns: %s", exc)
                 self.payload_storage_mode = "text"
                 self.filter_storage_mode = "redundant_columns"
@@ -737,17 +775,28 @@ class GaussDB(VectorStoreBase):
     def _create_vector_index(self, cur, table: str):
         index_name = self._quote_identifier(self._index_name(self.collection_name, "vector_idx"))
         self._set_vector_index_maintenance_work_mem(cur)
+        with_clause = self._vector_index_with_clause()
         cur.execute(
             f"""
             CREATE INDEX IF NOT EXISTS {index_name}
             ON {table}
             USING {self.vector_index_type} (vector {self._vector_index_metric})
+            {with_clause}
             """
         )
 
+    def _vector_index_with_clause(self) -> str:
+        """Build WITH clause for vector index. High-dim GsDiskANN needs enable_vector_copy=false + subgraph_count>0."""
+        if self.vector_index_type == "gsdiskann" and self.embedding_model_dims > 1024:
+            return f"WITH (enable_vector_copy=false, subgraph_count={self.gsdiskann_subgraph_count})"
+        return ""
+
     def _set_vector_index_maintenance_work_mem(self, cur):
-        if self.vector_index_maintenance_work_mem:
-            cur.execute("SET LOCAL maintenance_work_mem = %s", (self.vector_index_maintenance_work_mem,))
+        mem = self.vector_index_maintenance_work_mem
+        if self.embedding_model_dims > 1024 and mem == "128MB":
+            mem = "2GB"
+        if mem:
+            cur.execute("SET LOCAL maintenance_work_mem = %s", (mem,))
 
     def _create_bm25_index(self, cur, table: str, index_name: Optional[str] = None):
         index_name = index_name or self._quote_identifier(self._index_name(self.collection_name, "bm25_idx"))

@@ -43,6 +43,11 @@ class GaussDBConfig(BaseModel):
     dbname: Optional[str] = Field(None, description="Alias for database")
     collection_name: str = Field("mem0", description="Name of the collection table")
     embedding_model_dims: int = Field(1536, description="Dimensions of the embedding model")
+    max_embedding_dims: int = Field(
+        4096,
+        description="Maximum embedding dimensions supported by the GaussDB instance (centralized + GsDiskANN supports up to 4096). "
+        "Lower this if your deployment has a stricter limit.",
+    )
     user: Optional[str] = Field(None, description="Database user")
     password: Optional[str] = Field(None, description="Database password")
     host: Optional[str] = Field(None, description="Database host")
@@ -70,6 +75,11 @@ class GaussDBConfig(BaseModel):
     id_column_type: str = Field("uuid", description="id column type: uuid or varchar")
     vector_index_type: str = Field("gsdiskann", description="Vector index type: gsdiskann or gsivfflat")
     vector_metric: str = Field("cosine", description="Vector metric: cosine or l2")
+    gsdiskann_subgraph_count: int = Field(
+        1,
+        description="GsDiskANN subgraph_count parameter (valid range: 0-32). Must be >0 when embedding_model_dims>1024 "
+        "(required to disable vector_copy for high-dimensional indexes).",
+    )
     vector_index_maintenance_work_mem: Optional[str] = Field(
         "128MB", description="Session-local maintenance_work_mem used while building vector indexes"
     )
@@ -330,6 +340,28 @@ class GaussDBConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_storage_mode_combination(self) -> "GaussDBConfig":
+        if self.embedding_model_dims > self.max_embedding_dims:
+            raise ValueError(
+                f"GaussDB vector dimension limit: embedding_model_dims={self.embedding_model_dims} "
+                f"exceeds max_embedding_dims={self.max_embedding_dims}. "
+                f"Solutions: (1) Set embedder config embedding_dims<={self.max_embedding_dims} "
+                f"(OpenAI text-embedding-3 supports MRL truncation with minimal precision loss); "
+                f"(2) Use a model within the limit (BGE-M3, Cohere embed-v3, Jina v2); "
+                f"(3) Lower max_embedding_dims if your deployment has stricter limits (e.g. gsivfflat)."
+            )
+        if self.embedding_model_dims > 1024:
+            if self.vector_index_type != "gsdiskann":
+                raise ValueError(
+                    f"embedding_model_dims={self.embedding_model_dims} exceeds 1024; "
+                    f"only GsDiskANN supports >1024 dimensions. "
+                    f"Set vector_index_type='gsdiskann' or reduce embedding_model_dims<=1024."
+                )
+            if self.gsdiskann_subgraph_count <= 0:
+                raise ValueError(
+                    f"embedding_model_dims={self.embedding_model_dims} exceeds 1024; "
+                    f"GsDiskANN requires subgraph_count>0 (with enable_vector_copy=false) "
+                    f"for high-dimensional indexes. Set gsdiskann_subgraph_count to a positive value."
+                )
         if self.payload_storage_mode == "text" and self.filter_storage_mode == "json_expression":
             raise ValueError("filter_storage_mode='json_expression' requires payload_storage_mode='jsonb'")
         if self.deployment_mode == "centralized" and self.distribution_mode == "hash":
