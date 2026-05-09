@@ -1006,6 +1006,10 @@ class GaussDB(VectorStoreBase):
     def search_batch(self, queries: list, vectors_list: list, top_k: int = 1, filters: Optional[dict] = None):
         if not vectors_list:
             return []
+        if len(queries) != len(vectors_list):
+            raise ValueError(
+                f"search_batch: queries ({len(queries)}) and vectors_list ({len(vectors_list)}) length mismatch"
+            )
         where_clause, filter_params = self._build_where_clause(filters, require_scope=True)
         values_sql = ", ".join(f"({idx}, %s::FLOATVECTOR)" for idx in range(len(vectors_list)))
         vector_params = [self._vector_literal(vector) for vector in vectors_list]
@@ -1432,6 +1436,21 @@ class GaussDB(VectorStoreBase):
             f"Filter key {key!r} is not available in filter_storage_mode={self.filter_storage_mode!r}; "
             "use redundant_columns for scoped filters or json_expression for payload filters."
         )
+
+    def close(self):
+        """Explicitly release the connection pool."""
+        if getattr(self, "connection_pool", None) is not None:
+            try:
+                self.connection_pool.closeall()
+            except Exception:
+                pass
+            self.connection_pool = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
     def __del__(self):
         try:
