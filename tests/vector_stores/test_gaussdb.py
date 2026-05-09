@@ -63,6 +63,7 @@ def test_gaussdb_config_maps_high_level_modes():
         connection_pool=object(),
         profile="compatibility",
         bm25_mode="required",
+        embedding_model_dims=512,
         auto_create=False,
         enable_capability_probe=False,
     )
@@ -130,6 +131,7 @@ def test_gaussdb_config_accepts_distributed_deployment_mode():
     cfg = GaussDBConfig(
         connection_pool=object(),
         deployment_mode="distributed",
+        embedding_model_dims=512,
         auto_create=False,
         enable_capability_probe=False,
     )
