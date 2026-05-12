@@ -770,3 +770,268 @@ def test_migration_dry_run_and_backfill_report():
     assert plan["distribution_mode"] == "none"
     assert "ensure_hash_distribution_when_deployment_mode_is_distributed" in plan["planned_actions"]
     assert report == {"dry_run": True, "estimated_rows": 7}
+
+
+# ============================================================
+# Group 1: close() and context manager
+# ============================================================
+
+
+def test_close_calls_closeall_and_nullifies_pool():
+    """close() should call pool.closeall() and set pool to None."""
+    db, mock_pool, _, _ = make_gaussdb()
+
+    db.close()
+
+    mock_pool.closeall.assert_called_once()
+    assert db.connection_pool is None
+
+
+def test_close_swallows_exception_from_closeall():
+    """close() should not raise even if closeall() throws."""
+    db, mock_pool, _, _ = make_gaussdb()
+    mock_pool.closeall.side_effect = RuntimeError("pool error")
+
+    db.close()  # should not raise
+
+    assert db.connection_pool is None
+
+
+def test_close_is_idempotent_when_pool_already_none():
+    """Calling close() twice should not raise."""
+    db, _, _, _ = make_gaussdb()
+
+    db.close()
+    db.close()  # should not raise
+
+
+def test_context_manager_calls_close_on_normal_exit():
+    """__exit__ should call close() on normal exit."""
+    db, mock_pool, _, _ = make_gaussdb()
+
+    with db:
+        pass
+
+    mock_pool.closeall.assert_called_once()
+    assert db.connection_pool is None
+
+
+def test_context_manager_calls_close_on_exception():
+    """__exit__ should call close() even when exception occurs."""
+    db, mock_pool, _, _ = make_gaussdb()
+
+    with pytest.raises(ValueError):
+        with db:
+            raise ValueError("boom")
+
+    mock_pool.closeall.assert_called_once()
+    assert db.connection_pool is None
+
+
+# ============================================================
+# Group 2: Retry logic
+# ============================================================
+
+
+def test_retryable_error_triggers_retry_and_succeeds():
+    """A transient 'connection' error should retry and succeed on 2nd attempt."""
+    db, _, _, mock_cursor = make_gaussdb(
+        require_scoped_filters=False, retry_attempts=2, retry_backoff_seconds=0.0
+    )
+    call_count = {"n": 0}
+
+    def side_effect(sql, *args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1 and "DELETE" in str(sql):
+            raise Exception("connection reset by peer")
+        return None
+
+    mock_cursor.execute.side_effect = side_effect
+
+    db.delete("id1")
+
+    assert call_count["n"] >= 2
+
+
+def test_non_retryable_error_raises_immediately():
+    """A non-retryable error (e.g., 'syntax error') should not retry."""
+    db, _, _, mock_cursor = make_gaussdb(
+        require_scoped_filters=False, retry_attempts=2, retry_backoff_seconds=0.0
+    )
+    mock_cursor.execute.side_effect = Exception("syntax error at position 42")
+
+    with pytest.raises(Exception, match="syntax error"):
+        db.delete("id1")
+
+    # Should only have been called once (no retry)
+    assert mock_cursor.execute.call_count == 1
+
+
+def test_retry_exhaustion_raises_last_error():
+    """After all retry attempts fail, the last exception is raised."""
+    db, _, _, mock_cursor = make_gaussdb(
+        require_scoped_filters=False, retry_attempts=2, retry_backoff_seconds=0.0
+    )
+    mock_cursor.execute.side_effect = Exception("connection timeout")
+
+    with pytest.raises(Exception, match="connection timeout"):
+        db.delete("id1")
+
+
+def test_is_retryable_classifies_known_fragments():
+    """_is_retryable correctly identifies retryable error messages."""
+    assert GaussDB._is_retryable(Exception("connection reset")) is True
+    assert GaussDB._is_retryable(Exception("timeout expired")) is True
+    assert GaussDB._is_retryable(Exception("deadlock detected")) is True
+    assert GaussDB._is_retryable(Exception("lock wait timeout")) is True
+    assert GaussDB._is_retryable(Exception("could not serialize access")) is True
+    assert GaussDB._is_retryable(Exception("server closed the connection")) is True
+    assert GaussDB._is_retryable(Exception("terminating connection")) is True
+    assert GaussDB._is_retryable(Exception("syntax error")) is False
+    assert GaussDB._is_retryable(Exception("unique violation")) is False
+
+
+# ============================================================
+# Group 3: LIKE escape
+# ============================================================
+
+
+def test_contains_filter_escapes_percent_wildcard():
+    """Value containing '%' should be escaped in LIKE pattern."""
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchall.return_value = []
+
+    db.list(filters={"user_id": {"contains": "100%"}})
+
+    sql = executed_sql(mock_cursor)
+    # The percent should be escaped
+    assert "LIKE %s ESCAPE" in sql
+    # Check the parameter passed
+    call_args = mock_cursor.execute.call_args
+    params = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("params", [])
+    assert any("%100\\%%" in str(p) for p in params)
+
+
+def test_contains_filter_escapes_underscore_wildcard():
+    """Value containing '_' should be escaped in LIKE pattern."""
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchall.return_value = []
+
+    db.list(filters={"user_id": {"contains": "a_b"}})
+
+    call_args = mock_cursor.execute.call_args
+    params = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("params", [])
+    assert any("%a\\_b%" in str(p) for p in params)
+
+
+def test_icontains_filter_escapes_backslash():
+    """Value containing '\\' should be double-escaped."""
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchall.return_value = []
+
+    db.list(filters={"user_id": {"icontains": "a\\b"}})
+
+    sql = executed_sql(mock_cursor)
+    assert "LOWER" in sql
+    assert "ESCAPE" in sql
+    call_args = mock_cursor.execute.call_args
+    params = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("params", [])
+    assert any("%a\\\\b%" in str(p) for p in params)
+
+
+# ============================================================
+# Group 4: BM25 graceful degradation
+# ============================================================
+
+
+def test_bm25_index_failure_disables_bm25_when_not_fail_fast():
+    """BM25 index creation failure should set bm25_enabled=False."""
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False, bm25_fail_fast=False)
+    mock_cursor.execute.side_effect = [None, Exception("bm25 unsupported"), None, None]
+
+    db._create_bm25_index(mock_cursor, '"test_collection"')
+
+    assert db.bm25_enabled is False
+    assert db.metrics.get("gaussdb_fallback_count", 0) == 1
+
+
+def test_bm25_index_failure_raises_when_fail_fast():
+    """BM25 index creation failure should raise when bm25_fail_fast=True."""
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False, bm25_fail_fast=True)
+    mock_cursor.execute.side_effect = [None, Exception("bm25 unsupported"), None, None]
+
+    with pytest.raises(Exception, match="bm25 unsupported"):
+        db._create_bm25_index(mock_cursor, '"test_collection"')
+
+
+# ============================================================
+# Group 5: Connection pool safety
+# ============================================================
+
+
+def test_get_cursor_returns_conn_to_pool_on_encoding_failure():
+    """Connection must be returned to pool even if set_client_encoding fails."""
+    db, mock_pool, mock_conn, _ = make_gaussdb(client_encoding="UTF8")
+    mock_conn.set_client_encoding.side_effect = RuntimeError("encoding error")
+
+    with pytest.raises(RuntimeError, match="encoding error"):
+        with db._get_cursor() as cur:
+            pass
+
+    mock_pool.putconn.assert_called_once_with(mock_conn)
+
+
+def test_get_cursor_returns_conn_to_pool_on_cursor_exception():
+    """Connection must be returned to pool when cursor operation raises."""
+    db, mock_pool, mock_conn, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.execute.side_effect = RuntimeError("query failed")
+
+    with pytest.raises(RuntimeError, match="query failed"):
+        with db._get_cursor() as cur:
+            cur.execute("SELECT 1")
+
+    mock_pool.putconn.assert_called_once_with(mock_conn)
+
+
+# ============================================================
+# Group 6: insert parameter validation
+# ============================================================
+
+
+def test_insert_raises_on_mismatched_vectors_payloads_ids_length():
+    """insert() should raise ValueError when input lengths don't match."""
+    db, _, _, _ = make_gaussdb(require_scoped_filters=False)
+
+    with pytest.raises(ValueError, match="same length"):
+        db.insert(vectors=[[0.1, 0.2, 0.3]], payloads=[{"a": 1}, {"b": 2}])
+
+    with pytest.raises(ValueError, match="same length"):
+        db.insert(vectors=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], ids=["id1"])
+
+
+# ============================================================
+# Group 7: _upsert_schema_meta uses MERGE INTO
+# ============================================================
+
+
+def test_upsert_schema_meta_uses_merge_into():
+    """_upsert_schema_meta should use MERGE INTO for atomic upsert."""
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    db._upsert_schema_meta(mock_cursor, "test_collection", 3)
+
+    sql = executed_sql(mock_cursor)
+    assert "MERGE INTO" in sql
+    assert "WHEN MATCHED THEN" in sql
+    assert "WHEN NOT MATCHED THEN" in sql
+
+
+def test_upsert_schema_meta_passes_correct_params():
+    """MERGE INTO should receive (collection_name, schema_version) params."""
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+
+    db._upsert_schema_meta(mock_cursor, "my_collection", 5)
+
+    call_args = mock_cursor.execute.call_args
+    params = call_args[0][1]
+    assert params == ("my_collection", 5)

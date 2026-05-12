@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from contextlib import contextmanager
@@ -253,6 +254,7 @@ class GaussDB(VectorStoreBase):
             distribution_mode=self.distribution_mode,
         )
         self.metrics: Dict[str, int] = {}
+        self._metrics_lock = threading.Lock()
 
         self.table_name = self._quote_identifier(self.collection_name)
         self.schema_meta_table_name = self._quote_identifier(f"{self.collection_name}_schema_meta")
@@ -396,6 +398,11 @@ class GaussDB(VectorStoreBase):
             raise ValueError(f"Unsupported filter key: {key!r}")
         return key
 
+    @staticmethod
+    def _escape_like(value: str) -> str:
+        """Escape LIKE metacharacters so they match literally."""
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
     def _create_connection_pool(self):
         if ThreadedConnectionPool is None:
             raise ImportError(
@@ -461,22 +468,24 @@ class GaussDB(VectorStoreBase):
     @contextmanager
     def _get_cursor(self, commit: bool = False):
         conn = self.connection_pool.getconn()
-        if self.client_encoding:
-            conn.set_client_encoding(self.client_encoding)
-        cur = conn.cursor()
         try:
-            yield cur
-            if commit:
-                conn.commit()
-            else:
+            if self.client_encoding:
+                conn.set_client_encoding(self.client_encoding)
+            cur = conn.cursor()
+            try:
+                yield cur
+                if commit:
+                    conn.commit()
+                else:
+                    conn.rollback()
+            except Exception:
                 conn.rollback()
-        except Exception:
-            conn.rollback()
-            self._increment_metric("gaussdb_error_count")
-            logger.exception("GaussDB operation failed; transaction rolled back")
-            raise
+                self._increment_metric("gaussdb_error_count")
+                logger.exception("GaussDB operation failed; transaction rolled back")
+                raise
+            finally:
+                cur.close()
         finally:
-            cur.close()
             self.connection_pool.putconn(conn)
 
     def _run_with_retry(self, operation: str, func):
@@ -516,7 +525,8 @@ class GaussDB(VectorStoreBase):
 
     def _increment_metric(self, key: str):
         if self.enable_observability:
-            self.metrics[key] = self.metrics.get(key, 0) + 1
+            with self._metrics_lock:
+                self.metrics[key] = self.metrics.get(key, 0) + 1
 
     @property
     def _vector_operator(self) -> str:
@@ -650,7 +660,7 @@ class GaussDB(VectorStoreBase):
                                 f"""
                                 SELECT text_lemmatized ### %s AS score
                                 FROM {probe_table}
-                                WHERE (text_lemmatized ### %s) >= 0
+                                WHERE (text_lemmatized ### %s) > 0
                                 ORDER BY score DESC
                                 LIMIT 1
                                 """,
@@ -766,20 +776,17 @@ class GaussDB(VectorStoreBase):
     def _upsert_schema_meta(self, cur, collection_name: str, schema_version: int):
         cur.execute(
             f"""
-            UPDATE {self.schema_meta_table_name}
-            SET schema_version = %s, updated_at = CURRENT_TIMESTAMP
-            WHERE collection_name = %s
+            MERGE INTO {self.schema_meta_table_name} AS target
+            USING (VALUES (%s, %s)) AS src (collection_name, schema_version)
+            ON (target.collection_name = src.collection_name)
+            WHEN MATCHED THEN
+                UPDATE SET schema_version = src.schema_version, updated_at = CURRENT_TIMESTAMP
+            WHEN NOT MATCHED THEN
+                INSERT (collection_name, schema_version, updated_at)
+                VALUES (src.collection_name, src.schema_version, CURRENT_TIMESTAMP)
             """,
-            (schema_version, collection_name),
+            (collection_name, schema_version),
         )
-        if cur.rowcount == 0:
-            cur.execute(
-                f"""
-                INSERT INTO {self.schema_meta_table_name} (collection_name, schema_version, updated_at)
-                VALUES (%s, %s, CURRENT_TIMESTAMP)
-                """,
-                (collection_name, schema_version),
-            )
 
     def _create_vector_index(self, cur, table: str):
         index_name = self._quote_identifier(self._index_name(self.collection_name, "vector_idx"))
@@ -1413,8 +1420,12 @@ class GaussDB(VectorStoreBase):
         if "contains" in value or "icontains" in value:
             op = "icontains" if "icontains" in value else "contains"
             field_sql, params = self._field_sql(key)
-            expression = f"LOWER({field_sql}) LIKE LOWER(%s)" if op == "icontains" else f"{field_sql} LIKE %s"
-            return expression, [*params, f"%{value[op]}%"]
+            escaped = self._escape_like(value[op])
+            if op == "icontains":
+                expression = f"LOWER({field_sql}) LIKE LOWER(%s) ESCAPE '\\'"
+            else:
+                expression = f"{field_sql} LIKE %s ESCAPE '\\'"
+            return expression, [*params, f"%{escaped}%"]
         raise ValueError(f"Unsupported filter operator(s) for field {key!r}: {sorted(ops)}")
 
     def _field_in_expression(self, key: str, values: Iterable[Any], negate: bool) -> Tuple[str, List[Any]]:
