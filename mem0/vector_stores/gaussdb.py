@@ -219,6 +219,11 @@ class GaussDB(VectorStoreBase):
             bm25_enabled=bm25_enabled,
             bm25_fail_fast=bm25_fail_fast,
         )
+        if self.deployment_mode == "distributed" and self.bm25_enabled:
+            if self.bm25_fail_fast:
+                raise ValueError("bm25_mode='required' is incompatible with deployment_mode='distributed'")
+            logger.info("BM25 disabled: not supported in distributed deployment mode")
+            self.bm25_enabled = False
         self.bm25_ranking_metric = int(bm25_ranking_metric)
         self.bm25_ncandidates = self._validate_positive_int(bm25_ncandidates, "bm25_ncandidates")
         self.bm25_dictionary = bm25_dictionary

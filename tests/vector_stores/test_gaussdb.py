@@ -964,6 +964,18 @@ def test_bm25_index_failure_raises_when_fail_fast():
         db._create_bm25_index(mock_cursor, '"test_collection"')
 
 
+def test_distributed_mode_disables_bm25_automatically():
+    """BM25 should be auto-disabled in distributed deployment mode."""
+    db, _, _, _ = make_gaussdb(deployment_mode="distributed", bm25_mode="auto")
+    assert db.bm25_enabled is False
+
+
+def test_distributed_mode_bm25_required_raises():
+    """bm25_mode='required' with distributed deployment should raise ValueError."""
+    with pytest.raises(ValueError, match="incompatible with deployment_mode='distributed'"):
+        make_gaussdb(deployment_mode="distributed", bm25_mode="required")
+
+
 # ============================================================
 # Group 5: Connection pool safety
 # ============================================================
