@@ -111,6 +111,7 @@ class GaussDB(VectorStoreBase):
         sslmode: Optional[str] = None,
         sslrootcert: Optional[str] = None,
         client_encoding: Optional[str] = "UTF8",
+        schema: str = "public",
         table_storage: str = "ustore",
         compatibility_mode: str = "A",
         deployment_mode: str = "centralized",
@@ -175,6 +176,7 @@ class GaussDB(VectorStoreBase):
         self.sslmode = sslmode
         self.sslrootcert = sslrootcert
         self.client_encoding = client_encoding
+        self.schema = self._validate_identifier(schema, "schema")
         self.table_storage = self._validate_choice(table_storage.lower(), "table_storage", {"ustore"})
         self.compatibility_mode = self._validate_choice(compatibility_mode.upper(), "compatibility_mode", {"A"})
         self.deployment_mode = self._validate_choice(
@@ -256,8 +258,9 @@ class GaussDB(VectorStoreBase):
         self.metrics: Dict[str, int] = {}
         self._metrics_lock = threading.Lock()
 
-        self.table_name = self._quote_identifier(self.collection_name)
-        self.schema_meta_table_name = self._quote_identifier(f"{self.collection_name}_schema_meta")
+        self._schema_prefix = f'"{self.schema}".'
+        self.table_name = f'{self._schema_prefix}{self._quote_identifier(self.collection_name)}'
+        self.schema_meta_table_name = f'{self._schema_prefix}{self._quote_identifier(f"{self.collection_name}_schema_meta")}'
 
         if self.maxconn < self.minconn:
             raise ValueError("maxconn must be greater than or equal to minconn")
@@ -605,7 +608,7 @@ class GaussDB(VectorStoreBase):
 
         self._run_with_retry("capability_probe", probe)
 
-        probe_table = self._quote_identifier(f"mem0_gdb_probe_{uuid.uuid4().hex[:8]}")
+        probe_table = f'{self._schema_prefix}{self._quote_identifier(f"mem0_gdb_probe_{uuid.uuid4().hex[:8]}")}'
         try:
             with self._get_cursor(commit=True) as cur:
                 cur.execute(
@@ -729,13 +732,14 @@ class GaussDB(VectorStoreBase):
             self.capabilities = report
 
     def create_col(self, name: str = None, vector_size: int = None, distance: str = None) -> None:
-        table = self._quote_identifier(name or self.collection_name)
+        table = f'{self._schema_prefix}{self._quote_identifier(name or self.collection_name)}'
         dims = vector_size or self.embedding_model_dims
         if distance:
             self.vector_metric = self._validate_choice(distance.lower(), "distance", {"cosine", "l2"})
 
         def op():
             with self._get_cursor(commit=True) as cur:
+                cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
                 cur.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS {table} (
@@ -1130,8 +1134,9 @@ class GaussDB(VectorStoreBase):
                     """
                     SELECT table_name
                     FROM information_schema.tables
-                    WHERE table_schema = 'public'
-                    """
+                    WHERE table_schema = %s
+                    """,
+                    (self.schema,),
                 )
                 rows = cur.fetchall()
             return [
@@ -1160,14 +1165,15 @@ class GaussDB(VectorStoreBase):
                     """
                     SELECT indexname
                     FROM pg_indexes
-                    WHERE schemaname = 'public' AND tablename = %s
+                    WHERE schemaname = %s AND tablename = %s
                     ORDER BY indexname
                     """,
-                    (self.collection_name,),
+                    (self.schema, self.collection_name),
                 )
                 indexes = [row[0] for row in cur.fetchall()]
             return {
                 "name": self.collection_name,
+                "schema": self.schema,
                 "count": row_count,
                 "dimension": self.embedding_model_dims,
                 "schema_version": schema_version,
@@ -1193,10 +1199,10 @@ class GaussDB(VectorStoreBase):
             SELECT EXISTS (
                 SELECT 1
                 FROM information_schema.tables
-                WHERE table_schema = 'public' AND table_name = %s
+                WHERE table_schema = %s AND table_name = %s
             )
             """,
-            (f"{self.collection_name}_schema_meta",),
+            (self.schema, f"{self.collection_name}_schema_meta"),
         )
         if not cur.fetchone()[0]:
             return 1

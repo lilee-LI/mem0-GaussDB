@@ -634,7 +634,7 @@ def test_update_vector_and_payload_updates_timestamp():
     db.update("id1", vector=[0.1, 0.2, 0.3], payload={"data": "new", "text_lemmatized": "new"})
 
     sql = executed_sql(mock_cursor)
-    assert 'UPDATE "test_collection"' in sql
+    assert 'UPDATE "public"."test_collection"' in sql
     assert "vector = %s::FLOATVECTOR" in sql
     assert "payload = %s" in sql
     assert "updated_at = CURRENT_TIMESTAMP" in sql
@@ -706,7 +706,7 @@ def test_delete_is_idempotent_sql_path():
     db.delete("id1")
 
     sql = executed_sql(mock_cursor)
-    assert 'DELETE FROM "test_collection" WHERE id = %s' in sql
+    assert 'DELETE FROM "public"."test_collection" WHERE id = %s' in sql
     mock_conn.commit.assert_called()
 
 
@@ -730,7 +730,7 @@ def test_col_info_reads_schema_version_from_metadata_table():
 
     sql = executed_sql(mock_cursor)
     assert "information_schema.tables" in sql
-    assert 'FROM "test_collection_schema_meta"' in sql
+    assert 'FROM "public"."test_collection_schema_meta"' in sql
     assert info["count"] == 3
     assert info["schema_version"] == 7
     assert info["deployment_mode"] == "centralized"
