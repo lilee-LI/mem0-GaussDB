@@ -731,6 +731,15 @@ class GaussDB(VectorStoreBase):
                 logger.debug("Failed to clean up GaussDB probe table %s", probe_table, exc_info=True)
             self.capabilities = report
 
+    def _ensure_schema(self, cur) -> None:
+        """Create the target schema if it does not already exist (GaussDB lacks IF NOT EXISTS for CREATE SCHEMA)."""
+        cur.execute(
+            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = %s",
+            (self.schema,),
+        )
+        if cur.fetchone()[0] == 0:
+            cur.execute(f'CREATE SCHEMA "{self.schema}"')
+
     def create_col(self, name: str = None, vector_size: int = None, distance: str = None) -> None:
         table = f'{self._schema_prefix}{self._quote_identifier(name or self.collection_name)}'
         dims = vector_size or self.embedding_model_dims
@@ -739,7 +748,7 @@ class GaussDB(VectorStoreBase):
 
         def op():
             with self._get_cursor(commit=True) as cur:
-                cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{self.schema}"')
+                self._ensure_schema(cur)
                 cur.execute(
                     f"""
                     CREATE TABLE IF NOT EXISTS {table} (
