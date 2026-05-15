@@ -96,14 +96,8 @@ def _gaussdb_env_config(collection_name: str, **overrides) -> Optional[Dict[str,
         {
             "collection_name": collection_name,
             "embedding_model_dims": EMBEDDING_DIMS,
-            "id_column_type": "uuid",
             "vector_index_type": os.getenv("GAUSSDB_TEST_VECTOR_INDEX", "gsivfflat"),
-            "vector_index_maintenance_work_mem": os.getenv("GAUSSDB_TEST_MAINTENANCE_MEM", "128MB"),
             "deployment_mode": os.getenv("GAUSSDB_TEST_DEPLOYMENT_MODE", "centralized"),
-            "distribution_mode": os.getenv("GAUSSDB_TEST_DISTRIBUTION_MODE", "auto"),
-            "bm25_mode": os.getenv("GAUSSDB_TEST_BM25_MODE", "auto"),
-            "enable_capability_probe": _env_bool("GAUSSDB_TEST_ENABLE_PROBE", default=False),
-            "require_scoped_filters": True,
             "auto_create": True,
         }
     )
@@ -330,15 +324,10 @@ def gaussdb_p1_db():
 
 @pytest.fixture
 def gaussdb_p1_db_json_expression():
-    """Fixture providing a GaussDB instance with json_expression filter mode."""
+    """Fixture providing a GaussDB instance with json_expression filter mode (now the only mode)."""
     if not gaussdb_available():
         pytest.skip(_SKIP_REASON)
-    db = _new_db(
-        prefix="mem0_p1_json",
-        filter_storage_mode="json_expression",
-        payload_storage_mode="jsonb",
-        require_scoped_filters=False,
-    )
+    db = _new_db(prefix="mem0_p1_json")
     yield db
     try:
         db.delete_col()
@@ -348,14 +337,10 @@ def gaussdb_p1_db_json_expression():
 
 @pytest.fixture
 def gaussdb_p1_db_redundant():
-    """Fixture providing a GaussDB instance with redundant_columns filter mode."""
+    """Fixture providing a GaussDB instance (redundant_columns mode removed, uses json_expression)."""
     if not gaussdb_available():
         pytest.skip(_SKIP_REASON)
-    db = _new_db(
-        prefix="mem0_p1_red",
-        filter_storage_mode="redundant_columns",
-        payload_storage_mode="jsonb",
-    )
+    db = _new_db(prefix="mem0_p1_red")
     yield db
     try:
         db.delete_col()
@@ -398,8 +383,6 @@ def gaussdb_bm25_db():
         pytest.skip("Set GAUSSDB_TEST_RUN_BM25=true to run BM25 tests")
     db = _new_db(
         prefix="mem0_bm25",
-        bm25_mode="required",
-        enable_capability_probe=True,
     )
     yield db
     try:

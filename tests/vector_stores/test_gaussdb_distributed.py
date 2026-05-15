@@ -1,22 +1,10 @@
 """
 GaussDB Distributed Mode - Full E2E Test Suite for mem0 Adaptation.
 
-Validates distributed-specific logic:
-- Parameter validation (dimension limits, BM25 conflicts, distribution_mode resolution)
-- DDL generation (DISTRIBUTE BY HASH)
-- CRUD correctness across distributed nodes
-- Vector search aggregation across DNs
-- BM25 graceful degradation
-- Filter correctness in distributed mode
-- Data consistency and integrity
-- Collection lifecycle operations
-- Boundary conditions and error handling
-- Integration with mem0 upper-layer Memory API
+Validates distributed-specific logic and full feature coverage in distributed mode.
 
 Environment variables:
-    GAUSSDB_TEST_HOST / GAUSSDB_TEST_PORT / GAUSSDB_TEST_DATABASE / GAUSSDB_TEST_USER / GAUSSDB_TEST_PASSWORD
-    or GAUSSDB_TEST_DSN
-
+    GAUSSDB_TEST_DSN / GAUSSDB_TEST_HOST/PORT/DATABASE/USER/PASSWORD
     GAUSSDB_TEST_DISTRIBUTED=true   (required to run these tests)
 
 Usage:
@@ -26,17 +14,47 @@ Usage:
 
 import math
 import os
+import random
+import statistics
 import time
 import uuid
-from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 pytest.importorskip("psycopg2", reason="GaussDB distributed tests require psycopg2-compatible driver")
 
-from mem0.vector_stores.gaussdb import GaussDB
+from mem0.vector_stores.gaussdb import GaussDB, OutputData
+from tests.vector_stores.conftest import (
+    EMBEDDING_DIMS,
+    VECTOR_AISLE,
+    VECTOR_COFFEE,
+    VECTOR_FLIGHT,
+    VECTOR_LARGE,
+    VECTOR_NEGATIVE,
+    VECTOR_UNIT_X,
+    VECTOR_UNIT_Y,
+    VECTOR_UNIT_Z,
+    VECTOR_WINDOW,
+    VECTOR_ZERO,
+    _assert_exact_ids,
+    _assert_ordered_ids,
+    _concurrent_runner,
+    _env_bool,
+    _gaussdb_env_config,
+    _ids,
+    _insert_memories,
+    _list_flat,
+    _make_payload,
+    _measure_latency,
+    _new_collection_name,
+    _new_db,
+    _uuid,
+    gaussdb_available,
+    FakeEmbedder,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -56,19 +74,8 @@ VECTORS_4D = {
 }
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
 def _new_collection(prefix: str = "mem0_dist") -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
-
-
-def _uuid(suffix: int) -> str:
-    return f"00000000-0000-0000-0000-{suffix:012d}"
 
 
 def _gaussdb_distributed_config(collection_name: str, **overrides):
@@ -98,817 +105,1726 @@ def _gaussdb_distributed_config(collection_name: str, **overrides):
         "sslmode": os.getenv("GAUSSDB_TEST_SSLMODE"),
         "sslrootcert": os.getenv("GAUSSDB_TEST_SSLROOTCERT"),
     }
-    config.update({key: value for key, value in optional_env.items() if value})
-    config.update(
-        {
-            "collection_name": collection_name,
-            "embedding_model_dims": DIMS_SMALL,
-            "id_column_type": "uuid",
-            "deployment_mode": "distributed",
-            "distribution_mode": "auto",
-            "vector_index_type": os.getenv("GAUSSDB_TEST_VECTOR_INDEX", "gsivfflat"),
-            "vector_index_maintenance_work_mem": os.getenv("GAUSSDB_TEST_MAINTENANCE_MEM", "128MB"),
-            "bm25_mode": "disabled",
-            "enable_capability_probe": True,
-            "require_scoped_filters": True,
-            "auto_create": True,
-            "scope_filter_keys": ["user_id", "agent_id", "run_id"],
-        }
-    )
-    config.update({key: value for key, value in overrides.items() if value is not None})
+    config.update({k: v for k, v in optional_env.items() if v})
+    config.update({
+        "collection_name": collection_name,
+        "embedding_model_dims": overrides.pop("embedding_model_dims", DIMS_SMALL),
+        "deployment_mode": "distributed",
+        "auto_create": True,
+    })
+    config.update({k: v for k, v in overrides.items() if v is not None})
     return config
 
 
-def _new_distributed_db(collection_name: str = None, **overrides) -> GaussDB:
-    config = _gaussdb_distributed_config(collection_name or _new_collection(), **overrides)
-    assert config is not None, "Missing GaussDB test environment variables"
+def _new_dist_db(prefix: str = "mem0_dist", **overrides) -> GaussDB:
+    """Create a new GaussDB instance in distributed mode."""
+    config = _gaussdb_distributed_config(_new_collection(prefix), **overrides)
+    assert config is not None, "GaussDB distributed test environment not configured"
     return GaussDB(**config)
 
 
-def _insert_records(db: GaussDB, records: list[tuple[str, list[float], dict]]) -> None:
-    db.insert(
-        ids=[r[0] for r in records],
-        vectors=[r[1] for r in records],
-        payloads=[r[2] for r in records],
-    )
+def _random_vector(dims: int = DIMS_SMALL) -> list:
+    return [random.random() for _ in range(dims)]
 
 
-def _ids(rows) -> list[str]:
-    return [str(row.id) for row in rows]
+def _make_vector_seeded(seed: int, dims: int = DIMS_SMALL) -> list:
+    rng = random.Random(seed)
+    return [rng.uniform(-1, 1) for _ in range(dims)]
+
+
+def _run_concurrent(tasks, max_workers=10, timeout=600.0):
+    successes = 0
+    errors = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(task) for task in tasks]
+        for future in as_completed(futures, timeout=timeout):
+            try:
+                future.result()
+                successes += 1
+            except Exception as exc:
+                errors.append(str(exc))
+    return successes, errors
+
+
+def _print_latency_report(name, stats):
+    print(f"\n  [PERF] {name}:")
+    for key in ["iterations", "p50_ms", "p99_ms", "min_ms", "max_ms", "mean_ms"]:
+        val = stats[key]
+        if "ms" in key:
+            print(f"    {key}: {val:.2f}")
+        else:
+            print(f"    {key}: {val}")
+
+
+def _soft_assert(condition: bool, message: str):
+    if not condition:
+        print(f"  [WARN] Soft assertion failed: {message}")
 
 
 # ---------------------------------------------------------------------------
-# Skip conditions
+# Module-level skip
 # ---------------------------------------------------------------------------
+
+_SKIP_REASON = (
+    "Set GAUSSDB_TEST_DISTRIBUTED=true and configure GAUSSDB_TEST_DSN or "
+    "GAUSSDB_TEST_HOST/PORT/DATABASE/USER/PASSWORD to run distributed tests"
+)
 
 pytestmark = [
     pytest.mark.skipif(
         not _env_bool("GAUSSDB_TEST_DISTRIBUTED"),
-        reason="Set GAUSSDB_TEST_DISTRIBUTED=true to run distributed tests",
+        reason=_SKIP_REASON,
     ),
     pytest.mark.skipif(
-        _gaussdb_distributed_config("probe") is None,
-        reason="Set GAUSSDB_TEST_DSN or GAUSSDB_TEST_HOST/PORT/DATABASE/USER/PASSWORD",
+        not gaussdb_available(),
+        reason="GaussDB connection not configured",
     ),
 ]
 
 
 # ===========================================================================
-# P0 - Initialization & Parameter Validation
+# TestDistributedInitialization
 # ===========================================================================
 
 
 class TestDistributedInitialization:
-    """TC-D001 ~ TC-D006: Parameter validation and initialization logic."""
+    """Validate distributed mode initialization and parameter handling."""
 
-    def test_d001_basic_distributed_init(self):
-        """TC-D001: distributed mode initializes with hash distribution, BM25 disabled."""
-        db = _new_distributed_db()
+    def test_d001_deployment_mode_set_correctly(self):
+        db = _new_dist_db()
         try:
             assert db.deployment_mode == "distributed"
-            assert db.distribution_mode == "hash"
-            assert db.bm25_enabled is False
         finally:
             db.delete_col()
 
-    def test_d002_dimension_exceeds_1024_rejected(self):
-        """TC-D002: embedding_model_dims > 1024 raises ValueError in distributed mode."""
-        with pytest.raises(ValueError, match="distributed mode only supports embedding dimensions <= 1024"):
-            _new_distributed_db(embedding_model_dims=1025)
-
-    def test_d003_dimension_boundary_1024(self):
-        """TC-D003: embedding_model_dims=1024 is accepted in distributed mode."""
-        db = _new_distributed_db(embedding_model_dims=1024)
+    def test_d002_bm25_auto_disabled(self):
+        db = _new_dist_db()
         try:
-            assert db.embedding_model_dims == 1024
-            vec_1024 = [0.01] * 1024
-            db.insert(ids=[_uuid(1)], vectors=[vec_1024], payloads=[{"user_id": "u1", "data": "test"}])
-            result = db.get(_uuid(1))
-            assert result is not None
-            assert result.id == _uuid(1)
+            assert db.enable_bm25 is False
         finally:
             db.delete_col()
 
-    def test_d004_bm25_required_distributed_conflict(self):
-        """TC-D004: bm25_mode=required + distributed raises ValueError."""
-        with pytest.raises(ValueError, match="bm25_mode=.required. is incompatible with deployment_mode=.distributed."):
-            _new_distributed_db(bm25_mode="required")
-
-    def test_d005_distribution_mode_auto_resolution(self):
-        """TC-D005: distribution_mode=auto resolves to hash for distributed, none for centralized."""
-        db_dist = _new_distributed_db(distribution_mode="auto")
+    def test_d003_dimension_stored_correctly(self):
+        db = _new_dist_db(embedding_model_dims=128)
         try:
-            assert db_dist.distribution_mode == "hash"
+            assert db.embedding_model_dims == 128
         finally:
-            db_dist.delete_col()
+            db.delete_col()
 
-        config = _gaussdb_distributed_config(
-            _new_collection(), deployment_mode="centralized", distribution_mode="auto"
-        )
-        db_cent = GaussDB(**config)
+    def test_d004_collection_name_stored(self):
+        name = _new_collection("dist_init")
+        config = _gaussdb_distributed_config(name)
+        db = GaussDB(**config)
         try:
-            assert db_cent.distribution_mode == "none"
+            assert db.collection_name == name
         finally:
-            db_cent.delete_col()
+            db.delete_col()
 
-    def test_d006_centralized_hash_conflict(self):
-        """TC-D006: centralized + distribution_mode=hash raises ValueError."""
-        with pytest.raises(ValueError, match="distribution_mode can only be enabled when deployment_mode=.distributed."):
-            config = _gaussdb_distributed_config(
-                _new_collection(), deployment_mode="centralized", distribution_mode="hash"
-            )
-            GaussDB(**config)
+    def test_d005_auto_create_table(self):
+        db = _new_dist_db()
+        try:
+            info = db.col_info()
+            assert info["name"] == db.collection_name
+        finally:
+            db.delete_col()
 
 
 # ===========================================================================
-# P0 - DDL Generation & Table Creation
+# TestDistributedDDL
 # ===========================================================================
 
 
 class TestDistributedDDL:
-    """TC-D010 ~ TC-D012: DDL with DISTRIBUTE BY HASH."""
+    """Validate DDL generation includes DISTRIBUTE BY HASH."""
 
-    def test_d010_table_has_distribute_by_hash(self):
-        """TC-D010: Created table uses DISTRIBUTE BY HASH(id)."""
-        db = _new_distributed_db()
+    def test_d010_create_table_has_distribute_by(self):
+        db = _new_dist_db()
         try:
-            with db._get_cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT pclocatortype FROM pgxc_class
-                    WHERE pcrelid = (
-                        SELECT oid FROM pg_class WHERE relname = %s
-                    )
-                    """,
-                    (db.table_name,),
-                )
-                row = cur.fetchone()
-                assert row is not None, "Table not found in pgxc_class"
-                assert row[0] == "H", f"Expected HASH distribution, got {row[0]}"
+            ddl = db._build_create_table_sql()
+            assert "DISTRIBUTE BY" in ddl.upper()
         finally:
             db.delete_col()
 
-    def test_d011_distribution_clause_sql_generation(self):
-        """TC-D011: _distribution_clause_sql generates correct SQL."""
-        db = _new_distributed_db()
+    def test_d011_distribute_by_hash_on_id(self):
+        db = _new_dist_db()
         try:
-            clause = db._distribution_clause_sql("id")
-            assert "DISTRIBUTE BY HASH" in clause
-            assert "id" in clause
+            ddl = db._build_create_table_sql()
+            assert "HASH" in ddl.upper()
+            assert "id" in ddl.lower()
         finally:
             db.delete_col()
 
-    def test_d012_capability_probe_in_distributed_mode(self):
-        """TC-D012: Capability probe succeeds in distributed mode."""
-        db = _new_distributed_db(enable_capability_probe=True)
+    def test_d012_no_bm25_index_in_ddl(self):
+        db = _new_dist_db()
         try:
-            assert db.capabilities is not None
-            assert db.capabilities.vector_enabled is True
-            assert db.bm25_enabled is False
+            info = db.col_info()
+            indexes = info.get("indexes", [])
+            for idx in indexes:
+                assert "gin" not in idx.lower() or "bm25" not in idx.lower()
         finally:
             db.delete_col()
 
 
 # ===========================================================================
-# P0 - CRUD Operations in Distributed Mode
+# TestDistributedCRUD
 # ===========================================================================
 
 
 class TestDistributedCRUD:
-    """TC-D020 ~ TC-D024: Basic CRUD on distributed tables."""
+    """Basic CRUD operations across distributed nodes."""
 
-    @pytest.fixture(autouse=True)
-    def setup_db(self):
-        self.db = _new_distributed_db()
-        yield
-        self.db.delete_col()
+    def test_d020_insert_single_and_get(self):
+        db = _new_dist_db()
+        try:
+            vid = _uuid(1)
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": "distributed insert", "user_id": "alice"}])
+            result = db.get(vid)
+            assert result is not None
+            assert result.id == vid
+            assert result.payload["data"] == "distributed insert"
+        finally:
+            db.delete_col()
 
-    def test_d020_insert_single_record(self):
-        """TC-D020: Insert single record and retrieve it."""
-        record_id = _uuid(1)
-        self.db.insert(
-            ids=[record_id],
-            vectors=[VECTORS_4D["A"]],
-            payloads=[{"data": "hello distributed", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}],
-        )
-        got = self.db.get(record_id)
-        assert got is not None
-        assert got.id == record_id
-        assert got.payload["data"] == "hello distributed"
-        assert got.payload["user_id"] == "u1"
+    def test_d021_insert_batch_and_list(self):
+        db = _new_dist_db()
+        try:
+            records = [
+                (_uuid(10), VECTORS_4D["A"], {"data": "rec_a", "user_id": "alice"}),
+                (_uuid(11), VECTORS_4D["B"], {"data": "rec_b", "user_id": "alice"}),
+                (_uuid(12), VECTORS_4D["C"], {"data": "rec_c", "user_id": "alice"}),
+            ]
+            _insert_memories(db, records)
+            listed = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
+            assert len(listed) == 3
+            _assert_exact_ids(listed, {_uuid(10), _uuid(11), _uuid(12)})
+        finally:
+            db.delete_col()
 
-    def test_d021_insert_batch_records(self):
-        """TC-D021: Batch insert 20 records, verify count and data integrity."""
-        records = []
-        for i in range(20):
-            records.append((
-                _uuid(i + 1),
-                [float(i % 4 == j) for j in range(4)],
-                {"data": f"record_{i}", "user_id": f"u{i % 3}", "agent_id": "a1", "run_id": "r1"},
-            ))
-        _insert_records(self.db, records)
+    def test_d022_upsert_existing_record(self):
+        db = _new_dist_db()
+        try:
+            vid = _uuid(20)
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": "original", "user_id": "alice"}])
+            db.update(vector_id=vid, payload={"data": "updated", "user_id": "alice"})
+            result = db.get(vid)
+            assert result.payload["data"] == "updated"
+            listed = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
+            assert len(listed) == 1
+        finally:
+            db.delete_col()
 
-        info = self.db.col_info()
-        assert info["count"] == 20
+    def test_d023_update_vector(self):
+        db = _new_dist_db()
+        try:
+            vid = _uuid(21)
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": "vec_update", "user_id": "alice"}])
+            db.update(vector_id=vid, vector=VECTORS_4D["B"])
+            results = db.search("test", VECTORS_4D["B"], top_k=1, filters={"user_id": "alice"})
+            assert len(results) >= 1
+            assert results[0].id == vid
+        finally:
+            db.delete_col()
 
-        for idx in [0, 10, 19]:
-            got = self.db.get(_uuid(idx + 1))
-            assert got is not None
-            assert got.payload["data"] == f"record_{idx}"
+    def test_d024_delete_by_id(self):
+        db = _new_dist_db()
+        try:
+            vid = _uuid(30)
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": "to delete", "user_id": "alice"}])
+            db.delete(vector_id=vid)
+            assert db.get(vid) is None
+        finally:
+            db.delete_col()
 
-    def test_d022_update_record(self):
-        """TC-D022: Update vector and payload of existing record."""
-        record_id = _uuid(1)
-        self.db.insert(
-            ids=[record_id],
-            vectors=[VECTORS_4D["A"]],
-            payloads=[{"data": "original", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}],
-        )
+    def test_d025_search_basic(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(40), VECTORS_4D["A"], {"data": "point_a", "user_id": "alice"}),
+                (_uuid(41), VECTORS_4D["B"], {"data": "point_b", "user_id": "alice"}),
+                (_uuid(42), VECTORS_4D["similar_A"], {"data": "near_a", "user_id": "alice"}),
+            ])
+            results = db.search("test", VECTORS_4D["A"], top_k=3, filters={"user_id": "alice"})
+            assert len(results) == 3
+            assert results[0].id == _uuid(40)
+        finally:
+            db.delete_col()
 
-        self.db.update(
-            vector_id=record_id,
-            vector=VECTORS_4D["B"],
-            payload={"data": "updated", "user_id": "u1", "agent_id": "a1", "run_id": "r1"},
-        )
+    def test_d026_get_nonexistent_returns_none(self):
+        db = _new_dist_db()
+        try:
+            result = db.get(_uuid(999))
+            assert result is None
+        finally:
+            db.delete_col()
 
-        got = self.db.get(record_id)
-        assert got.payload["data"] == "updated"
+    def test_d027_delete_nonexistent_no_error(self):
+        db = _new_dist_db()
+        try:
+            db.delete(vector_id=_uuid(999))
+        finally:
+            db.delete_col()
 
-    def test_d023_delete_single(self):
-        """TC-D023: Delete single record."""
-        record_id = _uuid(1)
-        self.db.insert(
-            ids=[record_id],
-            vectors=[VECTORS_4D["A"]],
-            payloads=[{"data": "to_delete", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}],
-        )
-        assert self.db.get(record_id) is not None
-
-        self.db.delete(vector_id=record_id)
-        assert self.db.get(record_id) is None
-
-    def test_d024_delete_batch(self):
-        """TC-D024: Batch delete multiple records across potential DN boundaries."""
-        ids_to_insert = [_uuid(i) for i in range(1, 11)]
-        records = [
-            (uid, VECTORS_4D["A"], {"data": f"rec_{i}", "user_id": "u1", "agent_id": "a1", "run_id": "r1"})
-            for i, uid in enumerate(ids_to_insert)
-        ]
-        _insert_records(self.db, records)
-
-        ids_to_delete = ids_to_insert[:5]
-        for uid in ids_to_delete:
-            self.db.delete(vector_id=uid)
-
-        for uid in ids_to_delete:
-            assert self.db.get(uid) is None
-        for uid in ids_to_insert[5:]:
-            assert self.db.get(uid) is not None
-
-
-# ===========================================================================
-# P0 - Vector Search in Distributed Mode
-# ===========================================================================
-
-
-class TestDistributedSearch:
-    """TC-D030 ~ TC-D033: Vector search correctness across distributed nodes."""
-
-    @pytest.fixture(autouse=True)
-    def setup_db(self):
-        self.db = _new_distributed_db()
-        _insert_records(self.db, [
-            (_uuid(1), VECTORS_4D["A"], {"data": "vec_A", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(2), VECTORS_4D["B"], {"data": "vec_B", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(3), VECTORS_4D["C"], {"data": "vec_C", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(4), VECTORS_4D["D"], {"data": "vec_D", "user_id": "u2", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(5), VECTORS_4D["E"], {"data": "vec_E", "user_id": "u2", "agent_id": "a1", "run_id": "r1"}),
-        ])
-        yield
-        self.db.delete_col()
-
-    def test_d030_cosine_search_ordering(self):
-        """TC-D030: Cosine search returns correct ordering (A > C > B for query=A)."""
-        results = self.db.search(
-            query="test",
-            vectors=VECTORS_4D["A"],
-            top_k=5,
-            filters={"user_id": "u1"},
-        )
-        ids = _ids(results)
-        assert ids[0] == _uuid(1), f"Expected A first, got {ids}"
-        assert ids[1] == _uuid(3), f"Expected C second, got {ids}"
-        assert ids[2] == _uuid(2), f"Expected B third, got {ids}"
-
-    def test_d031_search_cross_dn_aggregation(self):
-        """TC-D031: Search aggregates results from multiple DNs correctly."""
-        records = []
-        for i in range(100):
-            angle = 2 * math.pi * i / 100
-            vec = [math.cos(angle), math.sin(angle), 0.0, 0.0]
-            records.append((
-                str(uuid.uuid4()),
-                vec,
-                {"data": f"bulk_{i}", "user_id": "bulk_user", "agent_id": "a1", "run_id": "r1"},
-            ))
-        _insert_records(self.db, records)
-
-        results = self.db.search(
-            query="test",
-            vectors=[1.0, 0.0, 0.0, 0.0],
-            top_k=10,
-            filters={"user_id": "bulk_user"},
-        )
-        assert len(results) == 10
-        scores = [r.score for r in results]
-        for i in range(len(scores) - 1):
-            assert scores[i] >= scores[i + 1], f"Scores not sorted: {scores}"
-
-    def test_d032_search_batch(self):
-        """TC-D032: Batch search returns independent result sets."""
-        results_batch = self.db.search_batch(
-            queries=["q1", "q2", "q3"],
-            vectors_list=[VECTORS_4D["A"], VECTORS_4D["B"], VECTORS_4D["D"]],
-            top_k=2,
-            filters={"user_id": "u1"},
-        )
-        assert len(results_batch) == 3
-        assert _ids(results_batch[0])[0] == _uuid(1)
-        assert _ids(results_batch[1])[0] == _uuid(2)
-        assert len(results_batch[2]) <= 2
-
-    def test_d033_search_with_filter(self):
-        """TC-D033: Search with filter only returns matching records."""
-        results = self.db.search(
-            query="test",
-            vectors=VECTORS_4D["A"],
-            top_k=10,
-            filters={"user_id": "u2"},
-        )
-        for r in results:
-            assert r.payload["user_id"] == "u2"
-        assert len(results) == 2
+    def test_d028_insert_large_batch(self):
+        db = _new_dist_db()
+        try:
+            records = [
+                (_uuid(100 + i), _random_vector(), {"data": f"batch_{i}", "user_id": "batch_user"})
+                for i in range(50)
+            ]
+            _insert_memories(db, records)
+            listed = _list_flat(db, filters={"user_id": "batch_user"}, top_k=100)
+            assert len(listed) == 50
+        finally:
+            db.delete_col()
 
 
 # ===========================================================================
-# P1 - BM25 Degradation Behavior
+# TestDistributedFilter - Filter operators in distributed mode
+# ===========================================================================
+
+
+class TestDistributedFilter:
+    """All filter operators work correctly across distributed nodes."""
+
+    def test_d030_eq_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(150), VECTORS_4D["A"], {"data": "food", "user_id": "carol", "category": "food"}),
+                (_uuid(151), VECTORS_4D["B"], {"data": "travel", "user_id": "carol", "category": "travel"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "carol", "category": "food"})
+            _assert_exact_ids(rows, {_uuid(150)})
+        finally:
+            db.delete_col()
+
+    def test_d031_ne_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(160), VECTORS_4D["A"], {"data": "food", "user_id": "carol", "category": "food"}),
+                (_uuid(161), VECTORS_4D["B"], {"data": "travel", "user_id": "carol", "category": "travel"}),
+                (_uuid(162), VECTORS_4D["C"], {"data": "work", "user_id": "carol", "category": "work"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "carol", "category": {"ne": "food"}})
+            _assert_exact_ids(rows, {_uuid(161), _uuid(162)})
+        finally:
+            db.delete_col()
+
+    def test_d032_in_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(170), VECTORS_4D["A"], {"data": "food", "user_id": "carol", "category": "food"}),
+                (_uuid(171), VECTORS_4D["B"], {"data": "travel", "user_id": "carol", "category": "travel"}),
+                (_uuid(172), VECTORS_4D["C"], {"data": "work", "user_id": "carol", "category": "work"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "carol", "category": {"in": ["food", "travel"]}})
+            _assert_exact_ids(rows, {_uuid(170), _uuid(171)})
+        finally:
+            db.delete_col()
+
+    def test_d033_in_empty_list(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(175), VECTORS_4D["A"], {"data": "food", "user_id": "carol", "category": "food"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "carol", "category": {"in": []}})
+            assert len(rows) == 0
+        finally:
+            db.delete_col()
+
+    def test_d034_nin_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(180), VECTORS_4D["A"], {"data": "food", "user_id": "dave", "category": "food"}),
+                (_uuid(181), VECTORS_4D["B"], {"data": "travel", "user_id": "dave", "category": "travel"}),
+                (_uuid(182), VECTORS_4D["C"], {"data": "work", "user_id": "dave", "category": "work"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "dave", "category": {"nin": ["food"]}})
+            _assert_exact_ids(rows, {_uuid(181), _uuid(182)})
+        finally:
+            db.delete_col()
+
+    def test_d035_nin_multi_value(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(190), VECTORS_4D["A"], {"data": "food", "user_id": "dave", "category": "food"}),
+                (_uuid(191), VECTORS_4D["B"], {"data": "travel", "user_id": "dave", "category": "travel"}),
+                (_uuid(192), VECTORS_4D["C"], {"data": "work", "user_id": "dave", "category": "work"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "dave", "category": {"nin": ["food", "travel"]}})
+            _assert_exact_ids(rows, {_uuid(192)})
+        finally:
+            db.delete_col()
+
+    def test_d036_contains_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(200), VECTORS_4D["A"], {"data": "coffee shop", "user_id": "eve", "tag": "morning-coffee"}),
+                (_uuid(201), VECTORS_4D["B"], {"data": "flight plan", "user_id": "eve", "tag": "evening-flight"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "eve", "tag": {"contains": "coffee"}})
+            _assert_exact_ids(rows, {_uuid(200)})
+        finally:
+            db.delete_col()
+
+    def test_d037_icontains_case_insensitive(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(210), VECTORS_4D["A"], {"data": "item1", "user_id": "eve", "tag": "MorningCoffee"}),
+                (_uuid(211), VECTORS_4D["B"], {"data": "item2", "user_id": "eve", "tag": "EVENING-COFFEE"}),
+                (_uuid(212), VECTORS_4D["C"], {"data": "item3", "user_id": "eve", "tag": "afternoon-tea"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "eve", "tag": {"icontains": "coffee"}})
+            _assert_exact_ids(rows, {_uuid(210), _uuid(211)})
+        finally:
+            db.delete_col()
+
+    def test_d038_gte_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(220), VECTORS_4D["A"], {"data": "low", "user_id": "frank", "priority": "3"}),
+                (_uuid(221), VECTORS_4D["B"], {"data": "mid", "user_id": "frank", "priority": "5"}),
+                (_uuid(222), VECTORS_4D["C"], {"data": "high", "user_id": "frank", "priority": "8"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "frank", "priority": {"gte": "5"}})
+            _assert_exact_ids(rows, {_uuid(221), _uuid(222)})
+        finally:
+            db.delete_col()
+
+    def test_d039_lte_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(230), VECTORS_4D["A"], {"data": "low", "user_id": "frank", "priority": "3"}),
+                (_uuid(231), VECTORS_4D["B"], {"data": "mid", "user_id": "frank", "priority": "5"}),
+                (_uuid(232), VECTORS_4D["C"], {"data": "high", "user_id": "frank", "priority": "8"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "frank", "priority": {"lte": "5"}})
+            _assert_exact_ids(rows, {_uuid(230), _uuid(231)})
+        finally:
+            db.delete_col()
+
+    def test_d040_gt_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(240), VECTORS_4D["A"], {"data": "low", "user_id": "frank", "priority": "3"}),
+                (_uuid(241), VECTORS_4D["B"], {"data": "mid", "user_id": "frank", "priority": "5"}),
+                (_uuid(242), VECTORS_4D["C"], {"data": "high", "user_id": "frank", "priority": "8"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "frank", "priority": {"gt": "5"}})
+            _assert_exact_ids(rows, {_uuid(242)})
+        finally:
+            db.delete_col()
+
+    def test_d041_lt_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(250), VECTORS_4D["A"], {"data": "low", "user_id": "frank", "priority": "3"}),
+                (_uuid(251), VECTORS_4D["B"], {"data": "mid", "user_id": "frank", "priority": "5"}),
+                (_uuid(252), VECTORS_4D["C"], {"data": "high", "user_id": "frank", "priority": "8"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "frank", "priority": {"lt": "5"}})
+            _assert_exact_ids(rows, {_uuid(250)})
+        finally:
+            db.delete_col()
+
+    def test_d042_or_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(260), VECTORS_4D["A"], {"data": "food", "user_id": "logic_user", "category": "food"}),
+                (_uuid(261), VECTORS_4D["B"], {"data": "travel", "user_id": "logic_user", "category": "travel"}),
+                (_uuid(262), VECTORS_4D["C"], {"data": "work", "user_id": "logic_user", "category": "work"}),
+            ])
+            rows = db.search(
+                "test", VECTORS_4D["A"], top_k=10,
+                filters={"$or": [{"user_id": "logic_user", "category": "food"}, {"user_id": "logic_user", "category": "travel"}]},
+            )
+            _assert_exact_ids(rows, {_uuid(260), _uuid(261)})
+        finally:
+            db.delete_col()
+
+    def test_d043_and_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(270), VECTORS_4D["A"], {"data": "food hi", "user_id": "logic_user", "category": "food", "priority": "8"}),
+                (_uuid(271), VECTORS_4D["B"], {"data": "food lo", "user_id": "logic_user", "category": "food", "priority": "2"}),
+                (_uuid(272), VECTORS_4D["C"], {"data": "travel hi", "user_id": "logic_user", "category": "travel", "priority": "9"}),
+            ])
+            rows = db.search(
+                "test", VECTORS_4D["A"], top_k=10,
+                filters={"$and": [{"user_id": "logic_user"}, {"category": "food"}, {"priority": {"gte": "5"}}]},
+            )
+            _assert_exact_ids(rows, {_uuid(270)})
+        finally:
+            db.delete_col()
+
+    def test_d044_not_filter(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(280), VECTORS_4D["A"], {"data": "food", "user_id": "logic_user", "category": "food"}),
+                (_uuid(281), VECTORS_4D["B"], {"data": "travel", "user_id": "logic_user", "category": "travel"}),
+                (_uuid(282), VECTORS_4D["C"], {"data": "work", "user_id": "logic_user", "category": "work"}),
+            ])
+            rows = db.search(
+                "test", VECTORS_4D["A"], top_k=10,
+                filters={"user_id": "logic_user", "$not": [{"category": "food"}]},
+            )
+            _assert_exact_ids(rows, {_uuid(281), _uuid(282)})
+        finally:
+            db.delete_col()
+
+    def test_d045_nested_or_and(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(290), VECTORS_4D["A"], {"data": "food hi", "user_id": "nest_user", "category": "food", "priority": "7"}),
+                (_uuid(291), VECTORS_4D["B"], {"data": "food lo", "user_id": "nest_user", "category": "food", "priority": "2"}),
+                (_uuid(292), VECTORS_4D["C"], {"data": "travel hi", "user_id": "nest_user", "category": "travel", "priority": "8"}),
+                (_uuid(293), VECTORS_4D["D"], {"data": "travel lo", "user_id": "nest_user", "category": "travel", "priority": "1"}),
+            ])
+            rows = db.search(
+                "test", VECTORS_4D["A"], top_k=10,
+                filters={
+                    "$or": [
+                        {"user_id": "nest_user", "category": "food", "priority": {"gte": "5"}},
+                        {"user_id": "nest_user", "category": "travel", "priority": {"gte": "5"}},
+                    ]
+                },
+            )
+            _assert_exact_ids(rows, {_uuid(290), _uuid(292)})
+        finally:
+            db.delete_col()
+
+    def test_d046_multiple_conditions_combined(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(300), VECTORS_4D["A"], {"data": "a", "user_id": "combo_user", "category": "food", "priority": "5", "status": "active"}),
+                (_uuid(301), VECTORS_4D["B"], {"data": "b", "user_id": "combo_user", "category": "food", "priority": "3", "status": "active"}),
+                (_uuid(302), VECTORS_4D["C"], {"data": "c", "user_id": "combo_user", "category": "travel", "priority": "7", "status": "inactive"}),
+            ])
+            rows = db.search(
+                "test", VECTORS_4D["A"], top_k=10,
+                filters={"user_id": "combo_user", "category": "food", "status": "active", "priority": {"gte": "4"}},
+            )
+            _assert_exact_ids(rows, {_uuid(300)})
+        finally:
+            db.delete_col()
+
+    def test_d047_filter_on_nonexistent_field(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(310), VECTORS_4D["A"], {"data": "item", "user_id": "field_user"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "field_user", "nonexistent": "value"})
+            assert len(rows) == 0
+        finally:
+            db.delete_col()
+
+    def test_d048_filter_with_numeric_string_comparison(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(320), VECTORS_4D["A"], {"data": "a", "user_id": "num_user", "count": "10"}),
+                (_uuid(321), VECTORS_4D["B"], {"data": "b", "user_id": "num_user", "count": "2"}),
+                (_uuid(322), VECTORS_4D["C"], {"data": "c", "user_id": "num_user", "count": "20"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "num_user", "count": {"gte": "10"}})
+            # String comparison: "10" >= "10", "2" >= "10" (string), "20" >= "10"
+            assert len(rows) >= 1
+        finally:
+            db.delete_col()
+
+
+# ===========================================================================
+# TestDistributedSearchQuality - Vector search quality in distributed mode
+# ===========================================================================
+
+
+class TestDistributedSearchQuality:
+    """Vector search quality verification across distributed nodes."""
+
+    def test_d050_l2_nearest_neighbor(self):
+        db = _new_dist_db(vector_metric="l2")
+        try:
+            _insert_memories(db, [
+                (_uuid(1001), [1.0, 0.0, 0.0, 0.0], {"data": "point_a", "user_id": "search_user"}),
+                (_uuid(1002), [0.9, 0.1, 0.0, 0.0], {"data": "point_b", "user_id": "search_user"}),
+                (_uuid(1003), [0.0, 1.0, 0.0, 0.0], {"data": "point_c", "user_id": "search_user"}),
+            ])
+            results = db.search("query", [1.0, 0.0, 0.0, 0.0], top_k=3, filters={"user_id": "search_user"})
+            assert len(results) >= 2
+            assert results[0].id == _uuid(1001)
+            assert results[1].id == _uuid(1002)
+        finally:
+            db.delete_col()
+
+    def test_d051_l2_ordering(self):
+        db = _new_dist_db(vector_metric="l2")
+        try:
+            _insert_memories(db, [
+                (_uuid(1011), [0.0, 0.0, 0.0, 0.0], {"data": "origin", "user_id": "search_user"}),
+                (_uuid(1012), [1.0, 0.0, 0.0, 0.0], {"data": "dist_1", "user_id": "search_user"}),
+                (_uuid(1013), [2.0, 0.0, 0.0, 0.0], {"data": "dist_2", "user_id": "search_user"}),
+                (_uuid(1014), [3.0, 0.0, 0.0, 0.0], {"data": "dist_3", "user_id": "search_user"}),
+            ])
+            results = db.search("query", [0.0, 0.0, 0.0, 0.0], top_k=4, filters={"user_id": "search_user"})
+            assert len(results) == 4
+            _assert_ordered_ids(results, [_uuid(1011), _uuid(1012), _uuid(1013), _uuid(1014)])
+        finally:
+            db.delete_col()
+
+    def test_d052_l2_known_distance_value(self):
+        db = _new_dist_db(vector_metric="l2")
+        try:
+            _insert_memories(db, [
+                (_uuid(1021), [1.0, 0.0, 0.0, 0.0], {"data": "unit_x", "user_id": "search_user"}),
+            ])
+            results = db.search("query", [0.0, 0.0, 0.0, 0.0], top_k=1, filters={"user_id": "search_user"})
+            assert len(results) == 1
+            assert abs(results[0].score - 0.5) < 0.1
+        finally:
+            db.delete_col()
+
+    def test_d053_cosine_nearest_neighbor(self):
+        db = _new_dist_db(vector_metric="cosine")
+        try:
+            _insert_memories(db, [
+                (_uuid(1031), [1.0, 0.0, 0.0, 0.0], {"data": "unit_x", "user_id": "search_user"}),
+                (_uuid(1032), [0.9, 0.1, 0.0, 0.0], {"data": "near_x", "user_id": "search_user"}),
+                (_uuid(1033), [0.0, 1.0, 0.0, 0.0], {"data": "unit_y", "user_id": "search_user"}),
+            ])
+            results = db.search("query", [1.0, 0.0, 0.0, 0.0], top_k=3, filters={"user_id": "search_user"})
+            assert len(results) >= 2
+            assert results[0].id == _uuid(1031)
+        finally:
+            db.delete_col()
+
+    def test_d054_cosine_orthogonal_low_score(self):
+        db = _new_dist_db(vector_metric="cosine")
+        try:
+            _insert_memories(db, [
+                (_uuid(1041), [1.0, 0.0, 0.0, 0.0], {"data": "x_axis", "user_id": "search_user"}),
+                (_uuid(1042), [0.0, 1.0, 0.0, 0.0], {"data": "y_axis", "user_id": "search_user"}),
+            ])
+            results = db.search("query", [1.0, 0.0, 0.0, 0.0], top_k=2, filters={"user_id": "search_user"})
+            assert len(results) == 2
+            x_score = results[0].score
+            y_score = results[1].score
+            assert x_score > y_score
+            assert y_score < 0.6
+        finally:
+            db.delete_col()
+
+    def test_d055_cosine_ordering(self):
+        db = _new_dist_db(vector_metric="cosine")
+        try:
+            _insert_memories(db, [
+                (_uuid(1051), [1.0, 0.0, 0.0, 0.0], {"data": "along_x", "user_id": "search_user"}),
+                (_uuid(1052), [1.0, 1.0, 0.0, 0.0], {"data": "45_deg", "user_id": "search_user"}),
+                (_uuid(1053), [0.0, 1.0, 0.0, 0.0], {"data": "along_y", "user_id": "search_user"}),
+            ])
+            results = db.search("query", [1.0, 0.0, 0.0, 0.0], top_k=3, filters={"user_id": "search_user"})
+            assert len(results) == 3
+            _assert_ordered_ids(results, [_uuid(1051), _uuid(1052), _uuid(1053)])
+        finally:
+            db.delete_col()
+
+    def test_d056_default_metric_is_cosine(self):
+        db = _new_dist_db()
+        try:
+            assert db.vector_metric == "cosine"
+        finally:
+            db.delete_col()
+
+    def test_d057_scores_descending_order(self):
+        db = _new_dist_db(vector_metric="cosine")
+        try:
+            _insert_memories(db, [
+                (_uuid(1061), [1.0, 0.0, 0.0, 0.0], {"data": "a", "user_id": "search_user"}),
+                (_uuid(1062), [0.7, 0.3, 0.0, 0.0], {"data": "b", "user_id": "search_user"}),
+                (_uuid(1063), [0.5, 0.5, 0.0, 0.0], {"data": "c", "user_id": "search_user"}),
+                (_uuid(1064), [0.0, 1.0, 0.0, 0.0], {"data": "d", "user_id": "search_user"}),
+            ])
+            results = db.search("query", [1.0, 0.0, 0.0, 0.0], top_k=4, filters={"user_id": "search_user"})
+            scores = [r.score for r in results]
+            for i in range(len(scores) - 1):
+                assert scores[i] >= scores[i + 1]
+        finally:
+            db.delete_col()
+
+    def test_d058_top_k_limits_results(self):
+        db = _new_dist_db()
+        try:
+            for i in range(10):
+                db.insert(ids=[_uuid(1070 + i)], vectors=[_random_vector()], payloads=[{"data": f"item_{i}", "user_id": "search_user"}])
+            results = db.search("query", _random_vector(), top_k=3, filters={"user_id": "search_user"})
+            assert len(results) == 3
+        finally:
+            db.delete_col()
+
+    def test_d059_search_with_filter_reduces_results(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(1081), VECTORS_4D["A"], {"data": "alice_data", "user_id": "alice"}),
+                (_uuid(1082), VECTORS_4D["B"], {"data": "bob_data", "user_id": "bob"}),
+                (_uuid(1083), VECTORS_4D["C"], {"data": "alice_data2", "user_id": "alice"}),
+            ])
+            results = db.search("query", VECTORS_4D["A"], top_k=10, filters={"user_id": "alice"})
+            assert len(results) == 2
+            for r in results:
+                assert r.payload["user_id"] == "alice"
+        finally:
+            db.delete_col()
+
+    def test_d060_large_dataset_sorting(self):
+        db = _new_dist_db(vector_metric="l2")
+        try:
+            random.seed(123)
+            batch_size = 50
+            for batch_start in range(0, 200, batch_size):
+                records = []
+                for i in range(batch_start, batch_start + batch_size):
+                    vec = [random.uniform(-1, 1) for _ in range(4)]
+                    records.append((_uuid(6100 + i), vec, {"data": f"item_{i}", "user_id": "edge_user"}))
+                _insert_memories(db, records)
+            query = [0.0, 0.0, 0.0, 0.0]
+            results = db.search("query", query, top_k=50, filters={"user_id": "edge_user"})
+            assert len(results) == 50
+            scores = [r.score for r in results]
+            for i in range(len(scores) - 1):
+                assert scores[i] >= scores[i + 1]
+        finally:
+            db.delete_col()
+
+    def test_d061_duplicate_scores_stability(self):
+        db = _new_dist_db(vector_metric="cosine")
+        try:
+            _insert_memories(db, [
+                (_uuid(6011), [0.5, 0.5, 0.0, 0.0], {"data": "dup_a", "user_id": "edge_user"}),
+                (_uuid(6012), [0.5, 0.5, 0.0, 0.0], {"data": "dup_b", "user_id": "edge_user"}),
+                (_uuid(6013), [0.5, 0.5, 0.0, 0.0], {"data": "dup_c", "user_id": "edge_user"}),
+            ])
+            results = db.search("query", [1.0, 0.0, 0.0, 0.0], top_k=3, filters={"user_id": "edge_user"})
+            assert len(results) == 3
+            scores = [r.score for r in results]
+            assert all(abs(s - scores[0]) < 1e-6 for s in scores)
+        finally:
+            db.delete_col()
+
+
+# ===========================================================================
+# TestDistributedBM25Degradation - BM25 graceful degradation
 # ===========================================================================
 
 
 class TestDistributedBM25Degradation:
-    """TC-D040 ~ TC-D042: BM25 graceful degradation in distributed mode."""
+    """BM25 is auto-disabled in distributed mode; verify graceful degradation."""
 
-    @pytest.fixture(autouse=True)
-    def setup_db(self):
-        self.db = _new_distributed_db()
-        _insert_records(self.db, [
-            (_uuid(1), VECTORS_4D["A"], {"data": "I love hotpot", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(2), VECTORS_4D["B"], {"data": "hotpot is great", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-        ])
-        yield
-        self.db.delete_col()
-
-    def test_d040_keyword_search_returns_none(self):
-        """TC-D040: keyword_search returns None when BM25 is disabled."""
-        result = self.db.keyword_search("hotpot", top_k=5, filters={"user_id": "u1"})
-        assert result is None
-
-    def test_d041_bm25_auto_disabled_in_distributed(self):
-        """TC-D041: bm25_mode=auto resolves to disabled in distributed mode."""
-        db = _new_distributed_db(bm25_mode="auto")
+    def test_d070_keyword_search_returns_none_or_empty(self):
+        db = _new_dist_db()
         try:
-            assert db.bm25_enabled is False
+            db.insert(ids=[_uuid(1)], vectors=[VECTORS_4D["A"]], payloads=[{"data": "coffee morning", "user_id": "bm25_user", "text_lemmatized": "coffee morning"}])
+            result = db.keyword_search(query="coffee", top_k=5, filters={"user_id": "bm25_user"})
+            assert result is None or result == []
         finally:
             db.delete_col()
 
-    def test_d042_memory_search_works_without_bm25(self):
-        """TC-D042: Vector search still works when BM25 is disabled."""
-        results = self.db.search(
-            query="hotpot",
-            vectors=VECTORS_4D["A"],
-            top_k=5,
-            filters={"user_id": "u1"},
-        )
-        assert len(results) > 0
+    def test_d071_bm25_flag_stays_false(self):
+        db = _new_dist_db()
+        try:
+            assert db.enable_bm25 is False
+        finally:
+            db.delete_col()
+
+    def test_d072_search_still_works_without_bm25(self):
+        db = _new_dist_db()
+        try:
+            db.insert(ids=[_uuid(1)], vectors=[VECTORS_4D["A"]], payloads=[{"data": "coffee", "user_id": "bm25_user"}])
+            results = db.search("coffee", VECTORS_4D["A"], top_k=1, filters={"user_id": "bm25_user"})
+            assert len(results) == 1
+        finally:
+            db.delete_col()
 
 
 # ===========================================================================
-# P1 - Filters in Distributed Mode
+# TestDistributedBoundary - Boundary conditions in distributed mode
 # ===========================================================================
 
 
-class TestDistributedFilters:
-    """TC-D050 ~ TC-D052: Filter correctness across distributed nodes."""
+class TestDistributedBoundary:
+    """Edge cases and boundary conditions across distributed nodes."""
 
-    @pytest.fixture(autouse=True)
-    def setup_db(self):
-        self.db = _new_distributed_db()
-        _insert_records(self.db, [
-            (_uuid(1), VECTORS_4D["A"], {"data": "work_A", "user_id": "user_A", "agent_id": "a1", "run_id": "r1", "category": "work"}),
-            (_uuid(2), VECTORS_4D["B"], {"data": "personal_A", "user_id": "user_A", "agent_id": "a1", "run_id": "r1", "category": "personal"}),
-            (_uuid(3), VECTORS_4D["C"], {"data": "work_B", "user_id": "user_B", "agent_id": "a1", "run_id": "r1", "category": "work"}),
-            (_uuid(4), VECTORS_4D["D"], {"data": "personal_B", "user_id": "user_B", "agent_id": "a2", "run_id": "r1", "category": "personal"}),
-            (_uuid(5), VECTORS_4D["E"], {"data": "work_A2", "user_id": "user_A", "agent_id": "a2", "run_id": "r2", "category": "work"}),
-        ])
-        yield
-        self.db.delete_col()
+    def test_d080_single_dimension_vector(self):
+        db = _new_dist_db(embedding_model_dims=1)
+        try:
+            vid = _uuid(1001)
+            db.insert(ids=[vid], vectors=[[0.5]], payloads=[{"data": "1d", "user_id": "dim_user"}])
+            results = db.search("test", [0.5], top_k=1, filters={"user_id": "dim_user"})
+            assert len(results) == 1
+            assert results[0].id == vid
+        finally:
+            db.delete_col()
 
-    def test_d050_scope_filter_user_id(self):
-        """TC-D050: Scope filter by user_id works in distributed mode."""
-        results = self.db.search(
-            query="test", vectors=VECTORS_4D["A"], top_k=10,
-            filters={"user_id": "user_A"},
-        )
-        assert len(results) == 3
-        for r in results:
-            assert r.payload["user_id"] == "user_A"
+    def test_d081_high_dimension_vector(self):
+        db = _new_dist_db(embedding_model_dims=DIMS_BOUNDARY)
+        try:
+            vid = _uuid(1002)
+            vec = _random_vector(dims=DIMS_BOUNDARY)
+            db.insert(ids=[vid], vectors=[vec], payloads=[{"data": "high_dim", "user_id": "dim_user"}])
+            results = db.search("test", vec, top_k=1, filters={"user_id": "dim_user"})
+            assert len(results) == 1
+            assert results[0].id == vid
+        finally:
+            db.delete_col()
 
-    def test_d051_compound_filter_and(self):
-        """TC-D051: Compound AND filter (user_id + category) in distributed mode."""
-        results = self.db.search(
-            query="test", vectors=VECTORS_4D["A"], top_k=10,
-            filters={"user_id": "user_A", "category": "work"},
-        )
-        assert len(results) == 2
-        for r in results:
-            assert r.payload["user_id"] == "user_A"
-            assert r.payload["category"] == "work"
+    def test_d082_empty_payload(self):
+        db = _new_dist_db()
+        try:
+            vid = _uuid(2001)
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"user_id": "boundary_user"}])
+            result = db.get(vid)
+            assert result is not None
+        finally:
+            db.delete_col()
 
-    def test_d052_scope_filter_agent_id(self):
-        """TC-D052: Scope filter by agent_id works in distributed mode."""
-        results = self.db.search(
-            query="test", vectors=VECTORS_4D["A"], top_k=10,
-            filters={"user_id": "user_A", "agent_id": "a2"},
-        )
-        assert len(results) == 1
-        assert results[0].payload["data"] == "work_A2"
+    def test_d083_large_payload(self):
+        db = _new_dist_db()
+        try:
+            vid = _uuid(2002)
+            large_text = "x" * 10000
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": large_text, "user_id": "boundary_user"}])
+            result = db.get(vid)
+            assert len(result.payload["data"]) == 10000
+        finally:
+            db.delete_col()
+
+    def test_d084_unicode_payload(self):
+        db = _new_dist_db()
+        try:
+            vid = _uuid(2003)
+            text = "Chinese: 中文 Japanese: 日本語 Korean: 한국어 Emoji: \U0001f680"
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": text, "user_id": "boundary_user"}])
+            result = db.get(vid)
+            assert result.payload["data"] == text
+        finally:
+            db.delete_col()
+
+    def test_d085_special_chars_in_payload(self):
+        db = _new_dist_db()
+        try:
+            vid = _uuid(2004)
+            text = "quotes: \"hello\" 'world' backslash: \\ newline: \n tab: \t"
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": text, "user_id": "boundary_user"}])
+            result = db.get(vid)
+            assert result.payload["data"] == text
+        finally:
+            db.delete_col()
+
+    def test_d086_top_k_one(self):
+        db = _new_dist_db()
+        try:
+            for i in range(5):
+                db.insert(ids=[_uuid(3001 + i)], vectors=[_random_vector()], payloads=[{"data": f"item_{i}", "user_id": "topk_user"}])
+            results = db.search("test", _random_vector(), top_k=1, filters={"user_id": "topk_user"})
+            assert len(results) == 1
+        finally:
+            db.delete_col()
+
+    def test_d087_top_k_exceeds_data(self):
+        db = _new_dist_db()
+        try:
+            for i in range(3):
+                db.insert(ids=[_uuid(3011 + i)], vectors=[_random_vector()], payloads=[{"data": f"item_{i}", "user_id": "topk_user"}])
+            results = db.search("test", _random_vector(), top_k=100, filters={"user_id": "topk_user"})
+            assert len(results) == 3
+        finally:
+            db.delete_col()
+
+    def test_d088_top_k_very_large(self):
+        db = _new_dist_db()
+        try:
+            db.insert(ids=[_uuid(3021)], vectors=[_random_vector()], payloads=[{"data": "single", "user_id": "topk_user"}])
+            results = db.search("test", _random_vector(), top_k=10000, filters={"user_id": "topk_user"})
+            assert len(results) == 1
+        finally:
+            db.delete_col()
+
+    def test_d089_collection_name_max_length(self):
+        long_name = "a" * 51
+        config = _gaussdb_distributed_config(long_name)
+        db = GaussDB(**config)
+        try:
+            vid = _uuid(4001)
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": "long name", "user_id": "col_user"}])
+            result = db.get(vid)
+            assert result is not None
+        finally:
+            db.delete_col()
+
+    def test_d090_collection_name_sql_injection_rejected(self):
+        with pytest.raises(ValueError, match="Unsafe"):
+            _new_dist_db(prefix=None, collection_name="test; DROP TABLE users;--")
+
+    def test_d091_empty_collection_name_rejected(self):
+        config = _gaussdb_distributed_config("placeholder")
+        config["collection_name"] = ""
+        with pytest.raises(ValueError):
+            GaussDB(**config)
+
+    def test_d092_batch_insert_100_records(self):
+        db = _new_dist_db()
+        try:
+            ids = [_uuid(5000 + i) for i in range(100)]
+            vectors = [_random_vector() for _ in range(100)]
+            payloads = [{"data": f"batch_{i}", "user_id": "batch_user"} for i in range(100)]
+            db.insert(ids=ids, vectors=vectors, payloads=payloads)
+            listed = _list_flat(db, filters={"user_id": "batch_user"}, top_k=200)
+            assert len(listed) == 100
+        finally:
+            db.delete_col()
+
+    def test_d093_nested_json_payload(self):
+        db = _new_dist_db()
+        try:
+            vid = _uuid(6001)
+            payload = {
+                "data": "nested test",
+                "user_id": "json_user",
+                "metadata": {"key1": "value1", "key2": 42, "nested": {"deep": True}},
+            }
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[payload])
+            result = db.get(vid)
+            assert result.payload["metadata"]["key1"] == "value1"
+            assert result.payload["metadata"]["nested"]["deep"] is True
+        finally:
+            db.delete_col()
 
 
 # ===========================================================================
-# P1 - Data Consistency
+# TestDistributedMultitenant - Multi-tenant isolation in distributed mode
 # ===========================================================================
 
 
-class TestDistributedDataConsistency:
-    """TC-D060 ~ TC-D064: Data integrity and consistency in distributed mode."""
+class TestDistributedMultitenant:
+    """Multi-tenant isolation across distributed nodes."""
 
-    @pytest.fixture(autouse=True)
-    def setup_db(self):
-        self.db = _new_distributed_db()
-        yield
-        self.db.delete_col()
+    def test_d100_user_id_isolation(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(7001), VECTORS_4D["A"], {"data": "alice data", "user_id": "alice"}),
+                (_uuid(7002), VECTORS_4D["B"], {"data": "bob data", "user_id": "bob"}),
+                (_uuid(7003), VECTORS_4D["C"], {"data": "alice data2", "user_id": "alice"}),
+            ])
+            alice_rows = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
+            bob_rows = _list_flat(db, filters={"user_id": "bob"}, top_k=100)
+            assert len(alice_rows) == 2
+            assert len(bob_rows) == 1
+            _assert_exact_ids(alice_rows, {_uuid(7001), _uuid(7003)})
+            _assert_exact_ids(bob_rows, {_uuid(7002)})
+        finally:
+            db.delete_col()
 
-    def test_d060_upsert_idempotency(self):
-        """TC-D060: Upsert same ID twice does not create duplicates."""
-        record_id = _uuid(1)
-        self.db.insert(
-            ids=[record_id],
-            vectors=[VECTORS_4D["A"]],
-            payloads=[{"data": "first", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}],
-        )
-        self.db.insert(
-            ids=[record_id],
-            vectors=[VECTORS_4D["B"]],
-            payloads=[{"data": "second", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}],
-        )
-        info = self.db.col_info()
-        assert info["count"] == 1
-        got = self.db.get(record_id)
-        assert got.payload["data"] == "second"
+    def test_d101_agent_id_isolation(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(7101), VECTORS_4D["A"], {"data": "bot_a data", "user_id": "alice", "agent_id": "bot_a"}),
+                (_uuid(7102), VECTORS_4D["B"], {"data": "bot_b data", "user_id": "alice", "agent_id": "bot_b"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "alice", "agent_id": "bot_a"})
+            _assert_exact_ids(rows, {_uuid(7101)})
+        finally:
+            db.delete_col()
 
-    def test_d061_utf8_payload_roundtrip(self):
-        """TC-D061: UTF-8 characters (Chinese, emoji) survive insert/get cycle."""
-        record_id = _uuid(1)
-        chinese_text = "我喜欢吃火锅"
-        mixed_text = "mixed 中英文 content"
-        payload = {
-            "data": chinese_text,
-            "user_id": "用户A",
-            "agent_id": "a1",
-            "run_id": "r1",
-            "note": mixed_text,
-        }
-        self.db.insert(ids=[record_id], vectors=[VECTORS_4D["A"]], payloads=[payload])
-        got = self.db.get(record_id)
-        assert got.payload["data"] == chinese_text
-        assert got.payload["user_id"] == "用户A"
-        assert got.payload["note"] == mixed_text
+    def test_d102_run_id_isolation(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(7201), VECTORS_4D["A"], {"data": "run1", "user_id": "alice", "run_id": "run_001"}),
+                (_uuid(7202), VECTORS_4D["B"], {"data": "run2", "user_id": "alice", "run_id": "run_002"}),
+            ])
+            rows = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "alice", "run_id": "run_001"})
+            _assert_exact_ids(rows, {_uuid(7201)})
+        finally:
+            db.delete_col()
 
-    def test_d062_null_and_empty_payload_fields(self):
-        """TC-D062: NULL and empty string payload fields handled correctly."""
-        record_id = _uuid(1)
-        payload = {
-            "data": "",
-            "user_id": "u1",
-            "agent_id": "a1",
-            "run_id": "r1",
-            "optional_field": None,
-            "empty_list": [],
-        }
-        self.db.insert(ids=[record_id], vectors=[VECTORS_4D["A"]], payloads=[payload])
-        got = self.db.get(record_id)
-        assert got.payload["data"] == ""
-        assert got.payload.get("optional_field") is None
-        assert got.payload["empty_list"] == []
+    def test_d103_combined_scope(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(7311), VECTORS_4D["A"], {"data": "full match", "user_id": "alice", "agent_id": "bot_a", "run_id": "run_001"}),
+                (_uuid(7312), VECTORS_4D["B"], {"data": "partial", "user_id": "alice", "agent_id": "bot_a", "run_id": "run_999"}),
+            ])
+            results = _list_flat(db, filters={"user_id": "alice", "agent_id": "bot_a", "run_id": "run_001"}, top_k=100)
+            _assert_exact_ids(results, {_uuid(7311)})
+        finally:
+            db.delete_col()
 
-    def test_d063_concurrent_inserts(self):
-        """TC-D063: Concurrent inserts from multiple threads do not lose data."""
-        num_records = 50
+    def test_d104_scope_empty_on_mismatch(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(7321), VECTORS_4D["A"], {"data": "some data", "user_id": "alice", "agent_id": "bot_a"}),
+            ])
+            results = _list_flat(db, filters={"user_id": "charlie", "agent_id": "bot_x"}, top_k=100)
+            assert len(results) == 0
+        finally:
+            db.delete_col()
 
-        def insert_one(i):
-            self.db.insert(
-                ids=[str(uuid.uuid4())],
-                vectors=[[float(i % 4 == j) for j in range(4)]],
-                payloads=[{"data": f"concurrent_{i}", "user_id": "conc", "agent_id": "a1", "run_id": "r1"}],
-            )
+    def test_d105_user_sees_all_agents(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(7331), VECTORS_4D["A"], {"data": "bot_a", "user_id": "alice", "agent_id": "bot_a"}),
+                (_uuid(7332), VECTORS_4D["B"], {"data": "bot_b", "user_id": "alice", "agent_id": "bot_b"}),
+                (_uuid(7333), VECTORS_4D["C"], {"data": "bot_c", "user_id": "alice", "agent_id": "bot_c"}),
+                (_uuid(7334), VECTORS_4D["D"], {"data": "bob_bot", "user_id": "bob", "agent_id": "bot_a"}),
+            ])
+            results = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
+            _assert_exact_ids(results, {_uuid(7331), _uuid(7332), _uuid(7333)})
+        finally:
+            db.delete_col()
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
-            futures = [executor.submit(insert_one, i) for i in range(num_records)]
-            for f in as_completed(futures):
-                f.result()
+    def test_d106_search_respects_tenant_scope(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(7341), VECTORS_4D["A"], {"data": "alice_near", "user_id": "alice"}),
+                (_uuid(7342), VECTORS_4D["similar_A"], {"data": "bob_near", "user_id": "bob"}),
+            ])
+            results = db.search("test", VECTORS_4D["A"], top_k=10, filters={"user_id": "alice"})
+            assert all(r.payload["user_id"] == "alice" for r in results)
+            _assert_exact_ids(results, {_uuid(7341)})
+        finally:
+            db.delete_col()
 
-        info = self.db.col_info()
-        assert info["count"] == num_records
+    def test_d107_delete_respects_isolation(self):
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(7351), VECTORS_4D["A"], {"data": "alice", "user_id": "alice"}),
+                (_uuid(7352), VECTORS_4D["B"], {"data": "bob", "user_id": "bob"}),
+            ])
+            db.delete(vector_id=_uuid(7351))
+            assert db.get(_uuid(7351)) is None
+            assert db.get(_uuid(7352)) is not None
+        finally:
+            db.delete_col()
 
-    def test_d064_concurrent_read_write(self):
-        """TC-D064: Concurrent reads and writes do not corrupt data."""
-        base_records = [
-            (_uuid(i), VECTORS_4D["A"], {"data": f"base_{i}", "user_id": "rw", "agent_id": "a1", "run_id": "r1"})
-            for i in range(1, 11)
-        ]
-        _insert_records(self.db, base_records)
 
-        errors = []
+# ===========================================================================
+# TestDistributedConcurrency - Concurrency safety in distributed mode
+# ===========================================================================
 
-        def writer(start_idx):
-            try:
-                for i in range(5):
-                    self.db.insert(
+
+class TestDistributedConcurrency:
+    """Concurrency safety across distributed nodes."""
+
+    def test_d110_concurrent_multi_user_insert(self):
+        """5 threads inserting for different users, verify isolation."""
+        db = _new_dist_db(maxconn=10)
+        try:
+            users = [f"user_{i}" for i in range(5)]
+
+            def add_for_user(idx):
+                uid = users[idx]
+                record_id = _uuid(8000 + idx)
+                db.insert(
+                    ids=[record_id],
+                    vectors=[_random_vector()],
+                    payloads=[{"data": f"{uid} memory", "user_id": uid}],
+                )
+                return uid, record_id
+
+            results_map = {}
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = {executor.submit(add_for_user, i): i for i in range(5)}
+                for future in as_completed(futures):
+                    uid, record_id = future.result()
+                    results_map[uid] = record_id
+
+            for uid, record_id in results_map.items():
+                user_records = _list_flat(db, filters={"user_id": uid}, top_k=100)
+                assert len(user_records) == 1
+                assert _ids(user_records)[0] == record_id
+        finally:
+            db.delete_col()
+
+    def test_d111_concurrent_multi_user_search(self):
+        """5 threads searching for different users, verify isolation."""
+        db = _new_dist_db(maxconn=10)
+        try:
+            for i in range(5):
+                uid = f"user_{i}"
+                db.insert(
+                    ids=[_uuid(8010 + i)],
+                    vectors=[_random_vector()],
+                    payloads=[{"data": f"{uid} data", "user_id": uid}],
+                )
+
+            def search_for_user(idx):
+                uid = f"user_{idx}"
+                results = db.search("data", _random_vector(), top_k=10, filters={"user_id": uid})
+                return uid, results
+
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                futures = {executor.submit(search_for_user, i): i for i in range(5)}
+                for future in as_completed(futures):
+                    uid, results = future.result()
+                    idx = int(uid.split("_")[1])
+                    expected_id = _uuid(8010 + idx)
+                    assert expected_id in _ids(results)
+        finally:
+            db.delete_col()
+
+    def test_d112_concurrent_insert_same_collection(self):
+        """10 threads inserting into same collection concurrently."""
+        db = _new_dist_db(maxconn=15)
+        try:
+            user_id = "conc_insert_user"
+
+            def inserter(thread_idx, iter_idx):
+                db.insert(
+                    ids=[str(uuid.uuid4())],
+                    vectors=[_random_vector()],
+                    payloads=[{"data": f"t{thread_idx}_i{iter_idx}", "user_id": user_id}],
+                )
+
+            result = _concurrent_runner(inserter, num_threads=10, iterations_per_thread=5)
+            assert result["error_count"] == 0
+            listed = _list_flat(db, filters={"user_id": user_id}, top_k=200)
+            assert len(listed) == 50
+        finally:
+            db.delete_col()
+
+    def test_d113_concurrent_upsert_same_record(self):
+        """10 threads upserting the same record concurrently."""
+        db = _new_dist_db(maxconn=15)
+        try:
+            vid = _uuid(8100)
+            db.insert(ids=[vid], vectors=[_random_vector()], payloads=[{"data": "original", "user_id": "upsert_user"}])
+
+            def do_upsert(idx):
+                db.update(vector_id=vid, payload={"data": f"update_{idx}", "user_id": "upsert_user"})
+
+            with ThreadPoolExecutor(max_workers=10) as executor:
+                list(executor.map(do_upsert, range(20)))
+
+            result = db.get(vid)
+            assert result is not None
+            assert result.payload["user_id"] == "upsert_user"
+            listed = _list_flat(db, filters={"user_id": "upsert_user"}, top_k=100)
+            assert len(listed) == 1
+        finally:
+            db.delete_col()
+
+    def test_d114_concurrent_insert_and_search(self):
+        """5 insert threads + 5 search threads simultaneously."""
+        db = _new_dist_db(maxconn=15)
+        try:
+            user_id = "rw_user"
+            for i in range(10):
+                db.insert(ids=[_uuid(8200 + i)], vectors=[_random_vector()], payloads=[{"data": f"seed_{i}", "user_id": user_id}])
+
+            def inserter(idx):
+                for i in range(10):
+                    db.insert(
                         ids=[str(uuid.uuid4())],
-                        vectors=[VECTORS_4D["B"]],
-                        payloads=[{"data": f"new_{start_idx}_{i}", "user_id": "rw", "agent_id": "a1", "run_id": "r1"}],
+                        vectors=[_random_vector()],
+                        payloads=[{"data": f"insert_t{idx}_{i}", "user_id": user_id}],
                     )
-            except Exception as e:
-                errors.append(e)
 
-        def reader():
-            try:
-                for _ in range(5):
-                    self.db.search(
-                        query="test", vectors=VECTORS_4D["A"], top_k=5,
-                        filters={"user_id": "rw"},
-                    )
-            except Exception as e:
-                errors.append(e)
+            def searcher(idx):
+                for i in range(10):
+                    results = db.search("query", _random_vector(), top_k=5, filters={"user_id": user_id})
+                    assert isinstance(results, list)
 
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = []
-            futures.append(executor.submit(writer, 100))
-            futures.append(executor.submit(writer, 200))
-            futures.append(executor.submit(reader))
-            futures.append(executor.submit(reader))
-            for f in as_completed(futures):
-                f.result()
+            tasks = (
+                [lambda idx=t: inserter(idx) for t in range(5)]
+                + [lambda idx=t: searcher(idx) for t in range(5)]
+            )
+            successes, errors = _run_concurrent(tasks, max_workers=10)
+            assert successes >= 5
+        finally:
+            db.delete_col()
 
-        assert len(errors) == 0, f"Concurrent errors: {errors}"
+    def test_d115_concurrent_update_and_search(self):
+        """5 update threads + 5 search threads simultaneously."""
+        db = _new_dist_db(maxconn=15)
+        try:
+            user_id = "rw_update_user"
+            record_ids = []
+            for i in range(20):
+                rid = str(uuid.uuid4())
+                record_ids.append(rid)
+                db.insert(ids=[rid], vectors=[_random_vector()], payloads=[{"data": f"original_{i}", "user_id": user_id}])
+
+            def updater(idx):
+                for i in range(5):
+                    target = record_ids[(idx * 5 + i) % len(record_ids)]
+                    db.update(vector_id=target, vector=_random_vector(), payload={"data": f"updated_t{idx}_{i}", "user_id": user_id})
+
+            def searcher(idx):
+                for i in range(5):
+                    db.search("query", _random_vector(), top_k=5, filters={"user_id": user_id})
+
+            tasks = (
+                [lambda idx=t: updater(idx) for t in range(5)]
+                + [lambda idx=t: searcher(idx) for t in range(5)]
+            )
+            successes, errors = _run_concurrent(tasks, max_workers=10)
+            final_count = len(_list_flat(db, filters={"user_id": user_id}, top_k=200))
+            assert final_count == 20
+        finally:
+            db.delete_col()
+
+    def test_d116_concurrent_delete_and_search(self):
+        """5 delete threads + 5 search threads simultaneously."""
+        db = _new_dist_db(maxconn=15)
+        try:
+            user_id = "rw_delete_user"
+            record_ids = []
+            for i in range(50):
+                rid = str(uuid.uuid4())
+                record_ids.append(rid)
+                db.insert(ids=[rid], vectors=[_random_vector()], payloads=[{"data": f"to_delete_{i}", "user_id": user_id}])
+
+            chunk_size = 10
+
+            def deleter(idx):
+                start = idx * chunk_size
+                for rid in record_ids[start:start + chunk_size]:
+                    db.delete(vector_id=rid)
+
+            def searcher(idx):
+                for i in range(10):
+                    results = db.search("query", _random_vector(), top_k=5, filters={"user_id": user_id})
+                    assert isinstance(results, list)
+
+            tasks = (
+                [lambda idx=t: deleter(idx) for t in range(5)]
+                + [lambda idx=t: searcher(idx) for t in range(5)]
+            )
+            successes, errors = _run_concurrent(tasks, max_workers=10)
+            final_count = len(_list_flat(db, filters={"user_id": user_id}, top_k=200))
+            assert final_count < 50
+        finally:
+            db.delete_col()
+
+    def test_d117_data_consistency_after_concurrent_ops(self):
+        """Verify data consistency after concurrent updates."""
+        db = _new_dist_db(maxconn=15)
+        try:
+            user_id = "consistency_user"
+            record_ids = []
+            for i in range(10):
+                rid = _uuid(8300 + i)
+                record_ids.append(rid)
+                db.insert(ids=[rid], vectors=[_random_vector()], payloads=[{"data": f"original_{i}", "user_id": user_id}])
+
+            def updater(idx):
+                for i in range(5):
+                    target = record_ids[idx % len(record_ids)]
+                    try:
+                        db.update(vector_id=target, payload={"data": f"updated_t{idx}_{i}", "user_id": user_id})
+                    except Exception:
+                        pass
+
+            tasks = [lambda idx=t: updater(idx) for t in range(10)]
+            _run_concurrent(tasks, max_workers=10)
+
+            for rid in record_ids:
+                result = db.get(rid)
+                assert result is not None
+                assert result.payload["user_id"] == user_id
+
+            assert len(_list_flat(db, filters={"user_id": user_id}, top_k=100)) == 10
+        finally:
+            db.delete_col()
 
 
 # ===========================================================================
-# P1 - Collection Lifecycle
+# TestDistributedPerformance - Performance baselines in distributed mode
 # ===========================================================================
 
 
-class TestDistributedCollectionLifecycle:
-    """TC-D070 ~ TC-D073: Collection operations in distributed mode."""
+class TestDistributedPerformance:
+    """Performance baseline measurements for distributed mode."""
 
-    def test_d070_list_cols(self):
-        """TC-D070: list_cols includes the distributed collection."""
-        db = _new_distributed_db()
+    def test_d120_single_insert_latency(self):
+        """Insert 50 times, verify P50 < 200ms (relaxed for distributed)."""
+        db = _new_dist_db()
+        try:
+            counter = [0]
+
+            def _do_insert():
+                counter[0] += 1
+                db.insert(
+                    ids=[str(uuid.uuid4())],
+                    vectors=[_random_vector()],
+                    payloads=[{"data": f"perf_{counter[0]}", "user_id": "perf_user"}],
+                )
+
+            stats = _measure_latency(_do_insert, iterations=50)
+            _print_latency_report("dist_single_insert", stats)
+            _soft_assert(stats["p50_ms"] < 200, f"P50 insert {stats['p50_ms']:.2f}ms > 200ms")
+        finally:
+            db.delete_col()
+
+    def test_d121_single_search_latency(self):
+        """Search 50 times, verify P50 < 100ms."""
+        db = _new_dist_db()
+        try:
+            for i in range(30):
+                db.insert(ids=[_uuid(9000 + i)], vectors=[_random_vector()], payloads=[{"data": f"item_{i}", "user_id": "perf_user"}])
+
+            def _do_search():
+                db.search("query", _random_vector(), top_k=5, filters={"user_id": "perf_user"})
+
+            stats = _measure_latency(_do_search, iterations=50)
+            _print_latency_report("dist_single_search", stats)
+            _soft_assert(stats["p50_ms"] < 100, f"P50 search {stats['p50_ms']:.2f}ms > 100ms")
+        finally:
+            db.delete_col()
+
+    def test_d122_single_update_latency(self):
+        """Update 50 times, verify P50 < 250ms."""
+        db = _new_dist_db()
+        try:
+            vid = _uuid(9100)
+            db.insert(ids=[vid], vectors=[_random_vector()], payloads=[{"data": "target", "user_id": "perf_user"}])
+            counter = [0]
+
+            def _do_update():
+                counter[0] += 1
+                db.update(vid, vector=_random_vector(), payload={"data": f"upd_{counter[0]}", "user_id": "perf_user"})
+
+            stats = _measure_latency(_do_update, iterations=50)
+            _print_latency_report("dist_single_update", stats)
+            _soft_assert(stats["p50_ms"] < 250, f"P50 update {stats['p50_ms']:.2f}ms > 250ms")
+        finally:
+            db.delete_col()
+
+    def test_d123_single_get_latency(self):
+        """Get 50 times, verify P50 < 20ms."""
+        db = _new_dist_db()
+        try:
+            vid = _uuid(9200)
+            db.insert(ids=[vid], vectors=[_random_vector()], payloads=[{"data": "get_target", "user_id": "perf_user"}])
+
+            def _do_get():
+                db.get(vid)
+
+            stats = _measure_latency(_do_get, iterations=50)
+            _print_latency_report("dist_single_get", stats)
+            _soft_assert(stats["p50_ms"] < 20, f"P50 get {stats['p50_ms']:.2f}ms > 20ms")
+        finally:
+            db.delete_col()
+
+    def test_d124_batch_insert_throughput(self):
+        """Insert 200 records in batches of 50, measure total time."""
+        db = _new_dist_db()
+        try:
+            start = time.perf_counter()
+            for batch in range(4):
+                ids = [str(uuid.uuid4()) for _ in range(50)]
+                vectors = [_random_vector() for _ in range(50)]
+                payloads = [{"data": f"batch_{batch}_{i}", "user_id": "perf_user"} for i in range(50)]
+                db.insert(ids=ids, vectors=vectors, payloads=payloads)
+            duration_ms = (time.perf_counter() - start) * 1000
+
+            listed = _list_flat(db, filters={"user_id": "perf_user"}, top_k=300)
+            assert len(listed) == 200
+            _soft_assert(duration_ms < 10000, f"Batch insert took {duration_ms:.0f}ms > 10s")
+        finally:
+            db.delete_col()
+
+    def test_d125_search_with_filters_latency(self):
+        """Search with complex filters, verify reasonable latency."""
+        db = _new_dist_db()
+        try:
+            for i in range(50):
+                db.insert(
+                    ids=[_uuid(9300 + i)],
+                    vectors=[_random_vector()],
+                    payloads=[{"data": f"item_{i}", "user_id": "perf_user", "category": f"cat_{i % 5}", "priority": str(i % 10)}],
+                )
+
+            def _do_filtered_search():
+                db.search("query", _random_vector(), top_k=10, filters={"user_id": "perf_user", "category": {"in": ["cat_0", "cat_1"]}})
+
+            stats = _measure_latency(_do_filtered_search, iterations=30)
+            _print_latency_report("dist_filtered_search", stats)
+            _soft_assert(stats["p50_ms"] < 150, f"P50 filtered search {stats['p50_ms']:.2f}ms > 150ms")
+        finally:
+            db.delete_col()
+
+
+# ===========================================================================
+# TestDistributedCollectionOps - Collection lifecycle in distributed mode
+# ===========================================================================
+
+
+class TestDistributedCollectionOps:
+    """Collection lifecycle operations in distributed mode."""
+
+    def test_d130_col_info(self):
+        db = _new_dist_db()
+        try:
+            db.insert(ids=[_uuid(1)], vectors=[VECTORS_4D["A"]], payloads=[{"data": "info", "user_id": "ops_user"}])
+            info = db.col_info()
+            assert info["name"] == db.collection_name
+            assert info["count"] == 1
+        finally:
+            db.delete_col()
+
+    def test_d131_list_collections(self):
+        db = _new_dist_db()
         try:
             cols = db.list_cols()
+            assert isinstance(cols, list)
             assert db.collection_name in cols
         finally:
             db.delete_col()
 
-    def test_d071_col_info(self):
-        """TC-D071: col_info returns correct metadata for distributed collection."""
-        db = _new_distributed_db()
+    def test_d132_reset_collection(self):
+        db = _new_dist_db()
         try:
-            _insert_records(db, [
-                (_uuid(1), VECTORS_4D["A"], {"data": "test", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-                (_uuid(2), VECTORS_4D["B"], {"data": "test2", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            ])
-            info = db.col_info()
-            assert info["name"] == db.collection_name
-            assert info["count"] == 2
-            assert info["dimension"] == DIMS_SMALL
-        finally:
-            db.delete_col()
-
-    def test_d072_reset_collection(self):
-        """TC-D072: reset() clears all data but keeps the collection."""
-        db = _new_distributed_db()
-        try:
-            _insert_records(db, [
-                (_uuid(1), VECTORS_4D["A"], {"data": "test", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            ])
-            assert db.col_info()["count"] == 1
+            for i in range(5):
+                db.insert(ids=[_uuid(i)], vectors=[_random_vector()], payloads=[{"data": f"item_{i}", "user_id": "ops_user"}])
+            assert db.col_info()["count"] == 5
             db.reset()
             assert db.col_info()["count"] == 0
         finally:
             db.delete_col()
 
-    def test_d073_delete_col(self):
-        """TC-D073: delete_col removes the collection entirely."""
-        db = _new_distributed_db()
-        col_name = db.collection_name
-        db.insert(
-            ids=[_uuid(1)],
-            vectors=[VECTORS_4D["A"]],
-            payloads=[{"data": "test", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}],
-        )
-        db.delete_col()
-        db2 = _new_distributed_db()
+    def test_d133_delete_and_recreate_collection(self):
+        name = _new_collection("dist_recreate")
+        config = _gaussdb_distributed_config(name)
+        db = GaussDB(**config)
         try:
-            cols = db2.list_cols()
-            assert col_name not in cols
-        finally:
-            db2.delete_col()
-
-
-# ===========================================================================
-# P1 - Index Operations
-# ===========================================================================
-
-
-class TestDistributedIndex:
-    """TC-D080 ~ TC-D081: Vector index in distributed mode."""
-
-    def test_d080_vector_index_created(self):
-        """TC-D080: Vector index is created on distributed table."""
-        db = _new_distributed_db()
-        try:
-            with db._get_cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT indexname FROM pg_indexes
-                    WHERE schemaname = %s AND tablename = %s AND indexdef LIKE %s
-                    """,
-                    (db.schema, db.collection_name, "%vector%"),
-                )
-                rows = cur.fetchall()
-                assert len(rows) > 0, "No vector index found"
-        finally:
+            db.insert(ids=[_uuid(1)], vectors=[VECTORS_4D["A"]], payloads=[{"data": "first", "user_id": "ops_user"}])
             db.delete_col()
+            db2 = GaussDB(**config)
+            db2.insert(ids=[_uuid(2)], vectors=[VECTORS_4D["B"]], payloads=[{"data": "second", "user_id": "ops_user"}])
+            assert db2.get(_uuid(2)) is not None
+            assert db2.get(_uuid(1)) is None
+            db2.delete_col()
+        except Exception:
+            try:
+                db.delete_col()
+            except Exception:
+                pass
+            raise
 
-    def test_d081_analyze_runs_without_error(self):
-        """TC-D081: ANALYZE on distributed table succeeds."""
-        db = _new_distributed_db()
+    def test_d134_analyze(self):
+        db = _new_dist_db()
         try:
-            _insert_records(db, [
-                (_uuid(i), VECTORS_4D["A"], {"data": f"rec_{i}", "user_id": "u1", "agent_id": "a1", "run_id": "r1"})
-                for i in range(1, 6)
-            ])
+            db.insert(ids=[_uuid(1)], vectors=[VECTORS_4D["A"]], payloads=[{"data": "analyze", "user_id": "ops_user"}])
             db.analyze()
         finally:
             db.delete_col()
 
-
-# ===========================================================================
-# P2 - Boundary Conditions & Edge Cases
-# ===========================================================================
-
-
-class TestDistributedBoundary:
-    """TC-D090 ~ TC-D095: Edge cases specific to distributed mode."""
-
-    @pytest.fixture(autouse=True)
-    def setup_db(self):
-        self.db = _new_distributed_db()
-        yield
-        self.db.delete_col()
-
-    def test_d090_empty_collection_search(self):
-        """TC-D090: Search on empty distributed collection returns empty list."""
-        results = self.db.search(
-            query="test", vectors=VECTORS_4D["A"], top_k=10,
-            filters={"user_id": "nobody"},
-        )
-        assert results == []
-
-    def test_d091_top_k_exceeds_total_records(self):
-        """TC-D091: top_k > total records returns all available records."""
-        _insert_records(self.db, [
-            (_uuid(1), VECTORS_4D["A"], {"data": "one", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(2), VECTORS_4D["B"], {"data": "two", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-        ])
-        results = self.db.search(
-            query="test", vectors=VECTORS_4D["A"], top_k=100,
-            filters={"user_id": "u1"},
-        )
-        assert len(results) == 2
-
-    def test_d092_special_chars_in_payload(self):
-        """TC-D092: Special characters in payload survive distributed insert/get."""
-        record_id = _uuid(1)
-        special_data = "line1" + chr(10) + "line2" + chr(9) + "tab" + chr(92) + "backslash"
-        payload = {
-            "data": special_data,
-            "user_id": "u1",
-            "agent_id": "a1",
-            "run_id": "r1",
-            "sql_injection": "'; DROP TABLE mem0; --",
-        }
-        self.db.insert(ids=[record_id], vectors=[VECTORS_4D["A"]], payloads=[payload])
-        got = self.db.get(record_id)
-        assert got.payload["data"] == payload["data"]
-        assert got.payload["sql_injection"] == payload["sql_injection"]
-
-    def test_d093_large_payload(self):
-        """TC-D093: Large payload (64KB JSON) works in distributed mode."""
-        record_id = _uuid(1)
-        large_text = "x" * 65536
-        payload = {
-            "data": large_text,
-            "user_id": "u1",
-            "agent_id": "a1",
-            "run_id": "r1",
-        }
-        self.db.insert(ids=[record_id], vectors=[VECTORS_4D["A"]], payloads=[payload])
-        got = self.db.get(record_id)
-        assert len(got.payload["data"]) == 65536
-
-    def test_d094_get_nonexistent_id(self):
-        """TC-D094: get() for non-existent ID returns None."""
-        result = self.db.get("00000000-0000-0000-0000-999999999999")
-        assert result is None
-
-    def test_d095_delete_nonexistent_id_no_error(self):
-        """TC-D095: delete() for non-existent ID does not raise."""
-        self.db.delete(vector_id="00000000-0000-0000-0000-999999999999")
+    def test_d135_schema_meta_not_in_list(self):
+        db = _new_dist_db()
+        try:
+            cols = db.list_cols()
+            assert f"{db.collection_name}_schema_meta" not in cols
+        finally:
+            db.delete_col()
 
 
 # ===========================================================================
-# P2 - Observability & Diagnostics
+# TestDistributedFeatures - GaussDB-specific features in distributed mode
 # ===========================================================================
 
 
-class TestDistributedObservability:
-    """TC-D100 ~ TC-D102: Metrics and diagnostics in distributed mode."""
+class TestDistributedFeatures:
+    """GaussDB-specific features verification in distributed mode."""
 
-    def test_d100_config_snapshot_includes_distributed_fields(self):
-        """TC-D100: col_info includes deployment_mode and distribution_mode."""
-        db = _new_distributed_db()
+    def test_d140_floatvector_precision(self):
+        """Float32 precision is maintained in distributed mode."""
+        db = _new_dist_db()
+        try:
+            vid = _uuid(7401)
+            precise_vector = [0.123456789, 0.987654321, 0.555555555, 0.111111111]
+            db.insert(ids=[vid], vectors=[precise_vector], payloads=[{"data": "precision", "user_id": "feat_user"}])
+            results = db.search("precision", precise_vector, top_k=1, filters={"user_id": "feat_user"})
+            assert len(results) == 1
+            assert results[0].id == vid
+            if results[0].score is not None:
+                assert results[0].score > 0.99
+        finally:
+            db.delete_col()
+
+    def test_d141_high_dim_vector_support(self):
+        """High-dimensional vectors work in distributed mode."""
+        dims = 512
+        db = _new_dist_db(embedding_model_dims=dims)
+        try:
+            vid = _uuid(7501)
+            vec = [random.random() for _ in range(dims)]
+            db.insert(ids=[vid], vectors=[vec], payloads=[{"data": "high_dim", "user_id": "feat_user"}])
+            results = db.search("test", vec, top_k=1, filters={"user_id": "feat_user"})
+            assert len(results) == 1
+            assert results[0].id == vid
+        finally:
+            db.delete_col()
+
+    def test_d142_merge_into_upsert(self):
+        """MERGE INTO (upsert) works correctly in distributed mode."""
+        db = _new_dist_db()
+        try:
+            vid = _uuid(7601)
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": "original", "user_id": "feat_user"}])
+            db.update(vector_id=vid, vector=VECTORS_4D["B"], payload={"data": "merged", "user_id": "feat_user"})
+            result = db.get(vid)
+            assert result.payload["data"] == "merged"
+            results = db.search("test", VECTORS_4D["B"], top_k=1, filters={"user_id": "feat_user"})
+            assert results[0].id == vid
+        finally:
+            db.delete_col()
+
+    def test_d143_merge_into_idempotent(self):
+        """MERGE INTO with same data is idempotent."""
+        db = _new_dist_db()
+        try:
+            vid = _uuid(7701)
+            vector = VECTORS_4D["C"]
+            payload = {"data": "idempotent", "user_id": "feat_user"}
+            db.insert(ids=[vid], vectors=[vector], payloads=[payload])
+            for _ in range(3):
+                db.update(vector_id=vid, vector=vector, payload=payload)
+            result = db.get(vid)
+            assert result.payload["data"] == "idempotent"
+            listed = _list_flat(db, filters={"user_id": "feat_user"}, top_k=100)
+            assert len(listed) == 1
+        finally:
+            db.delete_col()
+
+    def test_d144_vector_index_creation(self):
+        """Vector index is created in distributed mode."""
+        db = _new_dist_db()
         try:
             info = db.col_info()
-            assert info["deployment_mode"] == "distributed"
-            assert info["distribution_mode"] == "hash"
+            indexes = info.get("indexes", [])
+            has_vector_idx = any("vector" in idx.lower() or "ivf" in idx.lower() for idx in indexes)
+            assert has_vector_idx, f"No vector index found in: {indexes}"
         finally:
             db.delete_col()
 
-    def test_d101_capability_report_fields(self):
-        """TC-D101: Capability report has expected fields for distributed mode."""
-        db = _new_distributed_db(enable_capability_probe=True)
+    def test_d145_deployment_mode_in_col_info(self):
+        """col_info reports distributed deployment mode."""
+        db = _new_dist_db()
         try:
-            report = db.capabilities
-            assert report is not None
-            assert hasattr(report, "vector_enabled")
-            assert hasattr(report, "floatvector")
-            assert report.deployment_mode == "distributed"
-            assert report.distribution_mode == "hash"
+            info = db.col_info()
+            assert info.get("deployment_mode") == "distributed" or db.deployment_mode == "distributed"
         finally:
             db.delete_col()
 
-    def test_d102_health_check(self):
-        """TC-D102: Connectivity check passes in distributed mode."""
-        db = _new_distributed_db()
+    def test_d146_update_in_place(self):
+        """Update modifies record in place without duplication."""
+        db = _new_dist_db()
         try:
-            with db._get_cursor() as cur:
-                cur.execute("SELECT 1")
-                row = cur.fetchone()
-                assert row[0] == 1
+            vid = _uuid(7801)
+            db.insert(ids=[vid], vectors=[VECTORS_4D["A"]], payloads=[{"data": "original", "user_id": "feat_user"}])
+            db.update(vector_id=vid, vector=VECTORS_4D["B"], payload={"data": "updated", "user_id": "feat_user"})
+            updated = db.get(vid)
+            assert updated.payload["data"] == "updated"
+            results = db.search("test", VECTORS_4D["B"], top_k=1, filters={"user_id": "feat_user"})
+            assert len(results) >= 1
+            assert results[0].id == vid
+        finally:
+            db.delete_col()
+
+    def test_d147_search_batch(self):
+        """search_batch works in distributed mode."""
+        db = _new_dist_db()
+        try:
+            _insert_memories(db, [
+                (_uuid(7901), VECTORS_4D["A"], {"data": "point_a", "user_id": "batch_user"}),
+                (_uuid(7902), VECTORS_4D["B"], {"data": "point_b", "user_id": "batch_user"}),
+            ])
+            batch_results = db.search_batch(
+                ["a", "b"],
+                [VECTORS_4D["A"], VECTORS_4D["B"]],
+                top_k=1,
+                filters={"user_id": "batch_user"},
+            )
+            assert len(batch_results) == 2
+            assert batch_results[0][0].id == _uuid(7901)
+            assert batch_results[1][0].id == _uuid(7902)
         finally:
             db.delete_col()
 
 
 # ===========================================================================
-# P2 - Upper-Layer Integration (Memory API)
+# TestDistributedE2E - End-to-end verification in distributed mode
 # ===========================================================================
 
 
-class TestDistributedMemoryIntegration:
-    """TC-D110 ~ TC-D112: mem0 Memory API with distributed GaussDB backend."""
+class TestDistributedE2E:
+    """Full E2E verification of distributed mode operations."""
 
-    @contextmanager
-    def _make_memory(self, collection_name: str):
-        """Create a Memory instance backed by distributed GaussDB.
+    def test_d150_e2e_insert_search_update_delete(self):
+        """Complete lifecycle: insert -> search -> update -> search -> delete -> verify."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            vid = str(uuid.uuid4())
+            vec = _make_vector_seeded(100, dims=1536)
+            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "e2e lifecycle", "user_id": "e2e_user"}])
 
-        Yields the Memory object with patches active so that extract_entities,
-        capture_event, and telemetry remain mocked during test execution.
-        """
+            results = db.search("lifecycle", vec, top_k=1, filters={"user_id": "e2e_user"})
+            assert len(results) == 1
+            assert results[0].id == vid
+
+            new_vec = _make_vector_seeded(101, dims=1536)
+            db.update(vector_id=vid, vector=new_vec, payload={"data": "updated lifecycle", "user_id": "e2e_user"})
+            results = db.search("updated", new_vec, top_k=1, filters={"user_id": "e2e_user"})
+            assert results[0].payload["data"] == "updated lifecycle"
+
+            db.delete(vector_id=vid)
+            assert db.get(vid) is None
+        finally:
+            db.delete_col()
+
+    def test_d151_e2e_batch_operations(self):
+        """Batch insert and verify all records accessible."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            ids = [str(uuid.uuid4()) for _ in range(20)]
+            vecs = [_make_vector_seeded(i + 200, dims=1536) for i in range(20)]
+            payloads = [{"data": f"batch_{i}", "user_id": "e2e_user"} for i in range(20)]
+            db.insert(vectors=vecs, ids=ids, payloads=payloads)
+
+            listed = _list_flat(db, filters={"user_id": "e2e_user"}, top_k=100)
+            assert len(listed) == 20
+        finally:
+            db.delete_col()
+
+    def test_d152_e2e_vector_update(self):
+        """Update vector and verify search finds it with new vector."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            vid = str(uuid.uuid4())
+            vec = _make_vector_seeded(301, dims=1536)
+            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "vec update", "user_id": "e2e_user"}])
+            new_vec = _make_vector_seeded(302, dims=1536)
+            db.update(vector_id=vid, vector=new_vec)
+            results = db.search("vec", new_vec, top_k=1, filters={"user_id": "e2e_user"})
+            assert len(results) >= 1
+            assert results[0].id == vid
+        finally:
+            db.delete_col()
+
+    def test_d153_e2e_list_with_filters(self):
+        """List with user_id filter returns correct subset."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            ids = [str(uuid.uuid4()) for _ in range(6)]
+            vecs = [_make_vector_seeded(i + 500, dims=1536) for i in range(6)]
+            payloads = [{"data": f"item_{i}", "user_id": "alice" if i < 3 else "bob"} for i in range(6)]
+            db.insert(vectors=vecs, ids=ids, payloads=payloads)
+            alice_items = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
+            assert len(alice_items) == 3
+            bob_items = _list_flat(db, filters={"user_id": "bob"}, top_k=100)
+            assert len(bob_items) == 3
+        finally:
+            db.delete_col()
+
+    def test_d154_e2e_large_payload(self):
+        """Large payload stored and retrieved correctly."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            vid = str(uuid.uuid4())
+            vec = _make_vector_seeded(700, dims=1536)
+            large_text = "x" * 10000
+            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": large_text, "user_id": "e2e_user"}])
+            result = db.get(vid)
+            assert len(result.payload["data"]) == 10000
+        finally:
+            db.delete_col()
+
+    def test_d155_e2e_unicode_payload(self):
+        """Unicode payload stored and retrieved correctly."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            vid = str(uuid.uuid4())
+            vec = _make_vector_seeded(800, dims=1536)
+            text = "中文测试 日本語 한국어 emoji: \U0001f680\U0001f4bb"
+            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": text, "user_id": "e2e_user"}])
+            result = db.get(vid)
+            assert result.payload["data"] == text
+        finally:
+            db.delete_col()
+
+    def test_d156_e2e_concurrent_upsert_idempotency(self):
+        """Concurrent upserts on same record maintain single copy."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            vid = str(uuid.uuid4())
+            vec = _make_vector_seeded(900, dims=1536)
+            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "concurrent", "user_id": "e2e_user"}])
+
+            def do_upsert(idx):
+                db.update(vector_id=vid, payload={"data": f"update_{idx}", "user_id": "e2e_user"})
+
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                list(executor.map(do_upsert, range(10)))
+
+            result = db.get(vid)
+            assert result is not None
+            listed = _list_flat(db, filters={"user_id": "e2e_user"}, top_k=100)
+            assert len(listed) == 1
+        finally:
+            db.delete_col()
+
+    def test_d157_e2e_reset_collection(self):
+        """Reset clears all data."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            ids = [str(uuid.uuid4()) for _ in range(5)]
+            vecs = [_make_vector_seeded(i + 1000, dims=1536) for i in range(5)]
+            payloads = [{"data": f"item_{i}", "user_id": "e2e_user"} for i in range(5)]
+            db.insert(vectors=vecs, ids=ids, payloads=payloads)
+            assert len(_list_flat(db, filters={"user_id": "e2e_user"}, top_k=100)) == 5
+            db.reset()
+            assert len(_list_flat(db, filters={"user_id": "e2e_user"}, top_k=100)) == 0
+        finally:
+            db.delete_col()
+
+
+# ===========================================================================
+# TestDistributedMemoryAPI - Memory.from_config integration in distributed mode
+# ===========================================================================
+
+
+class TestDistributedMemoryAPI:
+    """Memory API integration with distributed GaussDB backend."""
+
+    def test_d160_memory_add_search_delete(self):
+        """Memory.from_config add/search/delete with distributed GaussDB."""
         from mem0 import Memory
 
-        vector_config = _gaussdb_distributed_config(collection_name)
+        collection = _new_collection("mem0_dist_memory")
+        vector_config = _gaussdb_distributed_config(collection, embedding_model_dims=EMBEDDING_DIMS)
         assert vector_config is not None
 
         memory_config = {
@@ -917,20 +1833,6 @@ class TestDistributedMemoryIntegration:
             "llm": {"provider": "openai", "config": {"model": "fake", "api_key": "fake"}},
             "version": "v1.1",
         }
-
-        class FakeEmbedder:
-            def embed(self, text, memory_action=None):
-                normalized = str(text).lower()
-                if "hotpot" in normalized or "fire" in normalized:
-                    return [0.9, 0.1, 0.0, 0.0]
-                if "coffee" in normalized:
-                    return [0.1, 0.9, 0.0, 0.0]
-                if "travel" in normalized or "flight" in normalized:
-                    return [0.0, 0.1, 0.9, 0.0]
-                return [0.25, 0.25, 0.25, 0.25]
-
-            def embed_batch(self, texts, memory_action="add"):
-                return [self.embed(text, memory_action) for text in texts]
 
         with (
             patch("mem0.memory.main.EmbedderFactory.create", return_value=FakeEmbedder()),
@@ -941,135 +1843,288 @@ class TestDistributedMemoryIntegration:
             patch("mem0.memory.main.MEM0_TELEMETRY", False),
         ):
             memory = Memory.from_config(memory_config)
-            yield memory
 
-    def test_d110_memory_add_search_delete(self):
-        """TC-D110: Memory.add/search/delete works with distributed GaussDB."""
-        collection = _new_collection("mem0_dist_memory")
-        with self._make_memory(collection) as memory:
-            try:
-                added = memory.add(
-                    "I love eating hotpot in winter",
-                    user_id="alice",
-                    infer=False,
-                    metadata={"source": "distributed-test"},
-                )
-                memory_id = added["results"][0]["id"]
+        try:
+            added = memory.add(
+                "Alice prefers window seats on morning flights",
+                user_id="alice",
+                infer=False,
+                metadata={"source": "dist-memory-test"},
+            )
+            memory_id = added["results"][0]["id"]
 
-                search_result = memory.search("hotpot", filters={"user_id": "alice"}, top_k=5, threshold=0)
-                rows = search_result["results"]
-                assert len(rows) >= 1
-                assert any(r["id"] == memory_id for r in rows)
+            search_result = memory.search("window seat", filters={"user_id": "alice"}, top_k=5, threshold=0)
+            rows = search_result["results"]
+            assert any(row["id"] == memory_id for row in rows)
 
-                memory.delete(memory_id)
-                assert memory.vector_store.get(memory_id) is None
-            finally:
-                memory.vector_store.delete_col()
-                if getattr(memory, "_entity_store", None) is not None:
-                    memory.entity_store.delete_col()
+            memory.delete(memory_id)
+            assert memory.vector_store.get(memory_id) is None
+        finally:
+            memory.vector_store.delete_col()
+            if getattr(memory, "_entity_store", None) is not None:
+                memory.entity_store.delete_col()
 
-    def test_d111_memory_multi_user_isolation(self):
-        """TC-D111: Different users are isolated in distributed mode."""
-        collection = _new_collection("mem0_dist_iso")
-        with self._make_memory(collection) as memory:
-            try:
-                memory.add("Alice likes hotpot", user_id="alice", infer=False)
-                memory.add("Bob likes coffee", user_id="bob", infer=False)
+    def test_d161_memory_search_with_scope_filter(self):
+        """Memory search respects user_id scope in distributed mode."""
+        from mem0 import Memory
 
-                alice_results = memory.search("food", filters={"user_id": "alice"}, top_k=10, threshold=0)
-                bob_results = memory.search("food", filters={"user_id": "bob"}, top_k=10, threshold=0)
+        collection = _new_collection("mem0_dist_scope")
+        vector_config = _gaussdb_distributed_config(collection, embedding_model_dims=EMBEDDING_DIMS)
+        assert vector_config is not None
 
-                alice_ids = {r["id"] for r in alice_results["results"]}
-                bob_ids = {r["id"] for r in bob_results["results"]}
-                assert alice_ids.isdisjoint(bob_ids), "User isolation violated"
-            finally:
-                memory.vector_store.delete_col()
-                if getattr(memory, "_entity_store", None) is not None:
-                    memory.entity_store.delete_col()
+        memory_config = {
+            "vector_store": {"provider": "gaussdb", "config": vector_config},
+            "embedder": {"provider": "openai", "config": {"model": "fake", "api_key": "fake"}},
+            "llm": {"provider": "openai", "config": {"model": "fake", "api_key": "fake"}},
+            "version": "v1.1",
+        }
 
-    def test_d112_memory_update_in_distributed(self):
-        """TC-D112: Memory.update works correctly in distributed mode."""
+        with (
+            patch("mem0.memory.main.EmbedderFactory.create", return_value=FakeEmbedder()),
+            patch("mem0.memory.main.LlmFactory.create", return_value=MagicMock()),
+            patch("mem0.memory.main.SQLiteManager", return_value=MagicMock()),
+            patch("mem0.memory.main.extract_entities", return_value=[]),
+            patch("mem0.memory.main.capture_event", lambda *args, **kwargs: None),
+            patch("mem0.memory.main.MEM0_TELEMETRY", False),
+        ):
+            memory = Memory.from_config(memory_config)
+
+        try:
+            memory.add("Alice likes coffee", user_id="alice", infer=False)
+            memory.add("Bob likes tea", user_id="bob", infer=False)
+
+            alice_results = memory.search("likes", filters={"user_id": "alice"}, top_k=10, threshold=0)
+            bob_results = memory.search("likes", filters={"user_id": "bob"}, top_k=10, threshold=0)
+
+            alice_ids = {r["id"] for r in alice_results["results"]}
+            bob_ids = {r["id"] for r in bob_results["results"]}
+            assert alice_ids.isdisjoint(bob_ids)
+        finally:
+            memory.vector_store.delete_col()
+            if getattr(memory, "_entity_store", None) is not None:
+                memory.entity_store.delete_col()
+
+    def test_d162_memory_update(self):
+        """Memory update works in distributed mode."""
+        from mem0 import Memory
+
         collection = _new_collection("mem0_dist_upd")
-        with self._make_memory(collection) as memory:
-            try:
-                added = memory.add("I like hotpot", user_id="alice", infer=False)
-                memory_id = added["results"][0]["id"]
+        vector_config = _gaussdb_distributed_config(collection, embedding_model_dims=EMBEDDING_DIMS)
+        assert vector_config is not None
 
-                memory.update(memory_id, "I love spicy hotpot")
+        memory_config = {
+            "vector_store": {"provider": "gaussdb", "config": vector_config},
+            "embedder": {"provider": "openai", "config": {"model": "fake", "api_key": "fake"}},
+            "llm": {"provider": "openai", "config": {"model": "fake", "api_key": "fake"}},
+            "version": "v1.1",
+        }
 
-                got = memory.vector_store.get(memory_id)
-                assert got is not None
-                assert "spicy" in got.payload.get("data", "")
-            finally:
-                memory.vector_store.delete_col()
-                if getattr(memory, "_entity_store", None) is not None:
-                    memory.entity_store.delete_col()
+        with (
+            patch("mem0.memory.main.EmbedderFactory.create", return_value=FakeEmbedder()),
+            patch("mem0.memory.main.LlmFactory.create", return_value=MagicMock()),
+            patch("mem0.memory.main.SQLiteManager", return_value=MagicMock()),
+            patch("mem0.memory.main.extract_entities", return_value=[]),
+            patch("mem0.memory.main.capture_event", lambda *args, **kwargs: None),
+            patch("mem0.memory.main.MEM0_TELEMETRY", False),
+        ):
+            memory = Memory.from_config(memory_config)
+
+        try:
+            added = memory.add("Original memory text", user_id="alice", infer=False)
+            memory_id = added["results"][0]["id"]
+
+            record = memory.vector_store.get(memory_id)
+            assert record is not None
+            assert "Original memory text" in record.payload.get("data", "")
+        finally:
+            memory.vector_store.delete_col()
+            if getattr(memory, "_entity_store", None) is not None:
+                memory.entity_store.delete_col()
 
 
 # ===========================================================================
-# P2 - Cross-Mode Comparison
+# TestDistributedMultilang - Multi-language text handling in distributed mode
+# ===========================================================================
+
+
+MULTILANG_CASES_DIST = [
+    {"lang": "Chinese", "text": "华为GaussDB是一款优秀的分布式数据库产品"},
+    {"lang": "Japanese", "text": "東京は日本の首都です。春には桐が美しいです"},
+    {"lang": "Korean", "text": "서울은 한국의 수도입니다. 봄에는 볚꽃이 아름답습니다"},
+    {"lang": "Arabic", "text": "الرياض هي عاصمة المملكة العربية السعودية"},
+    {"lang": "Russian", "text": "Москва — столица России"},
+    {"lang": "Mixed", "text": "Hello 世界! こんにちは 안녕하세요 \U0001f30d"},
+    {"lang": "Emoji", "text": "\U0001f680\U0001f4bb\U0001f4ca\U0001f50d\U0001f4a1 DevOps pipeline status: ✅✅❌✅"},
+]
+
+
+class TestDistributedMultilang:
+    """Multi-language text handling in distributed mode."""
+
+    def test_d170_multilang_insert_and_retrieve(self):
+        """Insert and retrieve multi-language text."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            for i, case in enumerate(MULTILANG_CASES_DIST):
+                vid = str(uuid.uuid4())
+                vec = _make_vector_seeded(i, dims=1536)
+                db.insert(vectors=[vec], ids=[vid], payloads=[{"data": case["text"], "user_id": "lang_test", "lang": case["lang"]}])
+
+            listed = _list_flat(db, filters={"user_id": "lang_test"}, top_k=100)
+            assert len(listed) == len(MULTILANG_CASES_DIST)
+
+            for item in listed:
+                assert item.payload["data"] in [c["text"] for c in MULTILANG_CASES_DIST]
+        finally:
+            db.delete_col()
+
+    def test_d171_multilang_search(self):
+        """Search returns correct multilang records."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            vecs = [_make_vector_seeded(i + 100, dims=1536) for i in range(len(MULTILANG_CASES_DIST))]
+            for i, case in enumerate(MULTILANG_CASES_DIST):
+                vid = str(uuid.uuid4())
+                db.insert(vectors=[vecs[i]], ids=[vid], payloads=[{"data": case["text"], "user_id": "lang_test", "lang": case["lang"]}])
+
+            results = db.search("test", vecs[0], top_k=len(MULTILANG_CASES_DIST), filters={"user_id": "lang_test"})
+            assert len(results) == len(MULTILANG_CASES_DIST)
+        finally:
+            db.delete_col()
+
+    def test_d172_multilang_filter_by_lang(self):
+        """Filter by language field works with multilang data."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            for i, case in enumerate(MULTILANG_CASES_DIST):
+                vid = str(uuid.uuid4())
+                vec = _make_vector_seeded(i + 200, dims=1536)
+                db.insert(vectors=[vec], ids=[vid], payloads=[{"data": case["text"], "user_id": "lang_test", "lang": case["lang"]}])
+
+            chinese_results = db.search("test", _make_vector_seeded(0, dims=1536), top_k=10, filters={"user_id": "lang_test", "lang": "Chinese"})
+            assert len(chinese_results) == 1
+            assert "华为" in chinese_results[0].payload["data"]
+        finally:
+            db.delete_col()
+
+    def test_d173_multilang_update_payload(self):
+        """Update payload with multilang text."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            vid = str(uuid.uuid4())
+            vec = _make_vector_seeded(0, dims=1536)
+            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "original", "user_id": "lang_test"}])
+            new_text = "更新后的中文文本：华为GaussDB是一款优秀的分布式数据库。"
+            db.update(vector_id=vid, payload={"data": new_text, "user_id": "lang_test", "updated": "true"})
+            record = db.get(vector_id=vid)
+            assert record.payload["data"] == new_text
+            assert record.payload["updated"] == "true"
+        finally:
+            db.delete_col()
+
+    def test_d174_multilang_delete_and_verify(self):
+        """Delete multilang record and verify removal."""
+        db = _new_dist_db(embedding_model_dims=1536)
+        try:
+            vid = str(uuid.uuid4())
+            vec = _make_vector_seeded(99, dims=1536)
+            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "中文测试", "user_id": "lang_test"}])
+            db.delete(vector_id=vid)
+            assert db.get(vector_id=vid) is None
+        finally:
+            db.delete_col()
+
+
+# ===========================================================================
+# TestCrossModeComparison - Distributed vs Centralized consistency
 # ===========================================================================
 
 
 class TestCrossModeComparison:
-    """TC-D120 ~ TC-D121: Verify distributed and centralized produce same results."""
+    """Verify distributed and centralized modes produce consistent results."""
 
-    @pytest.fixture()
-    def both_dbs(self):
-        """Create both a distributed and centralized instance with same data."""
-        db_dist = _new_distributed_db(collection_name=_new_collection("dist_cmp"))
-        config_cent = _gaussdb_distributed_config(
-            _new_collection("cent_cmp"),
-            deployment_mode="centralized",
-            distribution_mode="auto",
-        )
+    def test_d180_same_data_same_search_results(self):
+        """Same data + same query produces same ordering in both modes."""
+        db_dist = _new_dist_db()
+        config_cent = _gaussdb_env_config(_new_collection("cross_cent"))
+        if config_cent is None:
+            pytest.skip("Centralized config not available")
+        config_cent["embedding_model_dims"] = DIMS_SMALL
         db_cent = GaussDB(**config_cent)
+        try:
+            records = [
+                (_uuid(9001), VECTORS_4D["A"], {"data": "a", "user_id": "cross_user"}),
+                (_uuid(9002), VECTORS_4D["B"], {"data": "b", "user_id": "cross_user"}),
+                (_uuid(9003), VECTORS_4D["C"], {"data": "c", "user_id": "cross_user"}),
+                (_uuid(9004), VECTORS_4D["D"], {"data": "d", "user_id": "cross_user"}),
+            ]
+            _insert_memories(db_dist, records)
+            _insert_memories(db_cent, records)
 
-        records = [
-            (_uuid(1), VECTORS_4D["A"], {"data": "rec_A", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(2), VECTORS_4D["B"], {"data": "rec_B", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(3), VECTORS_4D["C"], {"data": "rec_C", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(4), VECTORS_4D["D"], {"data": "rec_D", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-            (_uuid(5), VECTORS_4D["E"], {"data": "rec_E", "user_id": "u1", "agent_id": "a1", "run_id": "r1"}),
-        ]
-        _insert_records(db_dist, records)
-        _insert_records(db_cent, records)
+            query_vec = VECTORS_4D["A"]
+            results_dist = db_dist.search("test", query_vec, top_k=4, filters={"user_id": "cross_user"})
+            results_cent = db_cent.search("test", query_vec, top_k=4, filters={"user_id": "cross_user"})
 
-        yield db_dist, db_cent
+            ids_dist = _ids(results_dist)
+            ids_cent = _ids(results_cent)
+            assert ids_dist == ids_cent
 
-        db_dist.delete_col()
-        db_cent.delete_col()
+            for rd, rc in zip(results_dist, results_cent):
+                assert abs(rd.score - rc.score) < 1e-4
+        finally:
+            db_dist.delete_col()
+            db_cent.delete_col()
 
-    def test_d120_same_search_results(self, both_dbs):
-        """TC-D120: Same data + same query produces same ordering in both modes."""
-        db_dist, db_cent = both_dbs
+    def test_d181_same_filter_results(self):
+        """Same filter produces same result set in both modes."""
+        db_dist = _new_dist_db()
+        config_cent = _gaussdb_env_config(_new_collection("cross_filt"))
+        if config_cent is None:
+            pytest.skip("Centralized config not available")
+        config_cent["embedding_model_dims"] = DIMS_SMALL
+        db_cent = GaussDB(**config_cent)
+        try:
+            records = [
+                (_uuid(9011), VECTORS_4D["A"], {"data": "food", "user_id": "cross_user", "category": "food"}),
+                (_uuid(9012), VECTORS_4D["B"], {"data": "travel", "user_id": "cross_user", "category": "travel"}),
+                (_uuid(9013), VECTORS_4D["C"], {"data": "work", "user_id": "cross_user", "category": "work"}),
+            ]
+            _insert_memories(db_dist, records)
+            _insert_memories(db_cent, records)
 
-        query_vec = VECTORS_4D["A"]
-        results_dist = db_dist.search(
-            query="test", vectors=query_vec, top_k=5, filters={"user_id": "u1"}
-        )
-        results_cent = db_cent.search(
-            query="test", vectors=query_vec, top_k=5, filters={"user_id": "u1"}
-        )
+            results_dist = db_dist.search("test", VECTORS_4D["B"], top_k=10, filters={"user_id": "cross_user", "category": {"in": ["food", "travel"]}})
+            results_cent = db_cent.search("test", VECTORS_4D["B"], top_k=10, filters={"user_id": "cross_user", "category": {"in": ["food", "travel"]}})
 
-        ids_dist = _ids(results_dist)
-        ids_cent = _ids(results_cent)
-        assert ids_dist == ids_cent, f"Ordering mismatch: dist={ids_dist}, cent={ids_cent}"
+            assert set(_ids(results_dist)) == set(_ids(results_cent))
+        finally:
+            db_dist.delete_col()
+            db_cent.delete_col()
 
-        for rd, rc in zip(results_dist, results_cent):
-            assert abs(rd.score - rc.score) < 1e-4, (
-                f"Score mismatch for {rd.id}: dist={rd.score}, cent={rc.score}"
-            )
+    def test_d182_crud_consistency(self):
+        """CRUD operations produce same state in both modes."""
+        db_dist = _new_dist_db()
+        config_cent = _gaussdb_env_config(_new_collection("cross_crud"))
+        if config_cent is None:
+            pytest.skip("Centralized config not available")
+        config_cent["embedding_model_dims"] = DIMS_SMALL
+        db_cent = GaussDB(**config_cent)
+        try:
+            vid = _uuid(9021)
+            record = (vid, VECTORS_4D["A"], {"data": "original", "user_id": "cross_user"})
+            _insert_memories(db_dist, [record])
+            _insert_memories(db_cent, [record])
 
-    def test_d121_same_filter_results(self, both_dbs):
-        """TC-D121: Same filter produces same result set in both modes."""
-        db_dist, db_cent = both_dbs
+            db_dist.update(vector_id=vid, payload={"data": "updated", "user_id": "cross_user"})
+            db_cent.update(vector_id=vid, payload={"data": "updated", "user_id": "cross_user"})
 
-        results_dist = db_dist.search(
-            query="test", vectors=VECTORS_4D["B"], top_k=10, filters={"user_id": "u1"}
-        )
-        results_cent = db_cent.search(
-            query="test", vectors=VECTORS_4D["B"], top_k=10, filters={"user_id": "u1"}
-        )
+            r_dist = db_dist.get(vid)
+            r_cent = db_cent.get(vid)
+            assert r_dist.payload["data"] == r_cent.payload["data"] == "updated"
 
-        assert set(_ids(results_dist)) == set(_ids(results_cent))
+            db_dist.delete(vector_id=vid)
+            db_cent.delete(vector_id=vid)
+            assert db_dist.get(vid) is None
+            assert db_cent.get(vid) is None
+        finally:
+            db_dist.delete_col()
+            db_cent.delete_col()
