@@ -390,7 +390,7 @@ class TestReadWriteConcurrency:
 
     def test_concurrent_insert_and_search(self):
         """5 insert threads + 5 search threads running simultaneously."""
-        db = _new_db(prefix="p2_conc")
+        db = _new_db(prefix="p2_conc", maxconn=15)
         try:
             user_id = "rw_insert_search"
             # Pre-insert some data so searches have something to find
@@ -433,7 +433,7 @@ class TestReadWriteConcurrency:
 
     def test_concurrent_update_and_search(self):
         """5 update threads + 5 search threads running simultaneously."""
-        db = _new_db(prefix="p2_conc")
+        db = _new_db(prefix="p2_conc", maxconn=15)
         try:
             user_id = "rw_update_search"
             record_ids = []
@@ -477,7 +477,7 @@ class TestReadWriteConcurrency:
 
     def test_concurrent_delete_and_search(self):
         """5 delete threads + 5 search threads running simultaneously."""
-        db = _new_db(prefix="p2_conc")
+        db = _new_db(prefix="p2_conc", maxconn=15)
         try:
             user_id = "rw_delete_search"
             record_ids = []
@@ -521,7 +521,7 @@ class TestReadWriteConcurrency:
 
     def test_concurrent_insert_and_get(self):
         """5 insert threads + 5 get threads running simultaneously."""
-        db = _new_db(prefix="p2_conc")
+        db = _new_db(prefix="p2_conc", maxconn=15)
         try:
             user_id = "rw_insert_get"
             # Pre-insert known records for get operations
@@ -566,7 +566,7 @@ class TestReadWriteConcurrency:
 
     def test_concurrent_mixed_operations(self):
         """Insert/update/delete/search mixed, 20 threads total."""
-        db = _new_db(prefix="p2_conc")
+        db = _new_db(prefix="p2_conc", maxconn=25)
         try:
             user_id = "rw_mixed"
             # Pre-insert records for update/delete/search
@@ -842,7 +842,7 @@ class TestConcurrentDataConsistency:
 
     def test_concurrent_delete_final_count(self):
         """Insert 100, 10 threads delete 10 each. Final count should be 0."""
-        db = _new_db(prefix="p2_conc")
+        db = _new_db(prefix="p2_conc", maxconn=15)
         try:
             user_id = "consistency_delete"
             record_ids = []
@@ -878,7 +878,7 @@ class TestConcurrentDataConsistency:
 
     def test_concurrent_update_payload_consistency(self):
         """10 threads update different fields of same records. Final state consistent."""
-        db = _new_db(prefix="p2_conc")
+        db = _new_db(prefix="p2_conc", maxconn=15)
         try:
             user_id = "consistency_update"
             # Insert 10 records

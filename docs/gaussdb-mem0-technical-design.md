@@ -740,9 +740,33 @@ CREATE TABLE <collection>_schema_meta (...) WITH (storage_type=ustore)
 DISTRIBUTE BY HASH ("collection_name");
 ```
 
-选择 `id` 作为主表分布键的原因是：当前 mem0 标准 provider 接口里 `get/update/delete/upsert` 都以 `id` 为稳定主键，`DISTRIBUTE BY HASH ("id")` 能保持主键约束和 DML 语义简单，避免为了分布键改写 mem0 公共接口。
+选择 `id` 作为主表分布键的原因是：当前 mem0 标准 provider 接口里 `get/update/delete/upsert` 都以 `id` 为稳定主键，`DISTRIBUTE BY HASH (“id”)` 能保持主键约束和 DML 语义简单，避免为了分布键改写 mem0 公共接口。
 
-这个实现定位是“分布式兼容模式”，不是最终“分布式性能优化模式”。它可以验证分布式库上的建表、写入、向量检索、BM25、filter 和 collection 生命周期；但对于大规模多租户检索，`user_id/agent_id/run_id + vector top-k` 查询仍可能跨 DN 扫描。后续如果要做商用性能优化，应引入 `scope_hash` 或 scope 映射表，并同步改造主键、upsert、get/update/delete、批量检索和迁移方案。
+### 18.2 分布式模式 BM25 约束
+
+GaussDB 分布式模式当前不支持 BM25 索引。Provider 在 `__init__` 中进行早期检测：
+
+```python
+if self.deployment_mode == “distributed” and self.bm25_enabled:
+    if self.bm25_fail_fast:
+        raise ValueError(“bm25_mode='required' is incompatible with deployment_mode='distributed'”)
+    logger.info(“BM25 disabled: not supported in distributed deployment mode”)
+    self.bm25_enabled = False
+```
+
+行为：
+
+| `bm25_mode` | `deployment_mode=distributed` 时行为 |
+|---|---|
+| `auto` | 自动禁用 BM25，`keyword_search` 返回 `None`，不影响向量检索。 |
+| `required` | 抛出 `ValueError`，阻止实例化。 |
+| `disabled` | 无影响，BM25 本身已禁用。 |
+
+这确保分布式部署不会在运行时因 BM25 索引创建失败而产生不可预期的行为。
+
+### 18.3 分布式模式定位
+
+这个实现定位是”分布式兼容模式”，不是最终”分布式性能优化模式”。它可以验证分布式库上的建表、写入、向量检索、filter 和 collection 生命周期；但对于大规模多租户检索，`user_id/agent_id/run_id + vector top-k` 查询仍可能跨 DN 扫描。后续如果要做商用性能优化，应引入 `scope_hash` 或 scope 映射表，并同步改造主键、upsert、get/update/delete、批量检索和迁移方案。
 
 ## 19. 已知限制与后续演进
 

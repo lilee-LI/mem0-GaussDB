@@ -65,8 +65,9 @@ mem0 是面向 AI 应用的长期记忆层。它负责把用户对话、业务�
   - `search_batch`
 - 支持 GaussDB 集中式 A 模式 Ustore 表。
 - 支持 GaussDB 分布式兼容建表模式，用于在分布式库上验证 mem0 provider 基础链路。
+- 分布式模式自动禁用 BM25（`bm25_mode=auto` 时静默禁用，`bm25_mode=required` 时快速失败）。
 - 支持 `FLOATVECTOR`、`gsdiskann`、`gsivfflat`。
-- 支持 BM25 索引和 BM25 score 查询。
+- 支持 BM25 索引和 BM25 score 查询（集中式模式）。
 - 支持 metadata filters 和商用默认 scope 隔离。
 - 支持能力探测、fallback、schema metadata、回填、观测指标和真实库测试。
 
