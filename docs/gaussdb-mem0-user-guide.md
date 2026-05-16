@@ -246,6 +246,8 @@ filters = {
 }
 ```
 
+当前 GaussDB provider 不提供 `gt/gte/lt/lte` range 过滤语义。为了和多数 mem0 provider 保持一致，这类 dict filter 会按普通 metadata 字面值等值过滤处理，并记录 warning；不要把它用于“最近时间”“分数大于”等商用范围召回。需要范围召回时，应等后续 typed metadata range 能力，或在业务层先维护可等值过滤的分桶/标签字段。
+
 ## 8. 常见问题
 
 ### 8.1 分布式库怎么配置

@@ -400,17 +400,19 @@ LIMIT %s;
 
 ### 10.1 支持的 filter 形态
 
-支持简单等值、集合、范围和逻辑组合：
+支持简单等值、集合、字符串包含和逻辑组合：
 
 ```python
 {"user_id": "u1"}
 {"category": {"eq": "travel"}}
 {"priority": {"in": ["high", "medium"]}}
-{"created_at": {"gte": "2026-01-01"}}
+{"title": {"contains": "invoice"}}
 {"$and": [{"user_id": "u1"}, {"category": "travel"}]}
 {"$or": [{"category": "travel"}, {"category": "food"}]}
 {"$not": [{"category": "archived"}]}
 ```
+
+当前版本不提供 `gt/gte/lt/lte` range 语义。为了对齐多数 mem0 provider 的兼容行为，包含这些 key 的 dict filter 会按普通 metadata 字面值等值过滤处理，并记录 warning；它不会生成 SQL 大小比较，也不承诺数值或时间范围召回。Typed range 需要后续引入 metadata schema 或明确的字段类型映射后再开放。
 
 所有 value 参数化传入，所有 key 必须通过 identifier 校验和 allowlist 检查。
 

@@ -208,7 +208,7 @@ GaussDB provider 应同时支持 semantic vector search 和 BM25 keyword search�
 | FR-03 | Ustore schema | P0 | 每个 collection 映射为一张 Ustore 表和一张 schema meta 表。 |
 | FR-04 | 向量写入 | P0 | 支持单条/批量 insert，并按 id upsert。 |
 | FR-05 | 向量检索 | P0 | 支持 cosine 默认检索和 l2 可选检索。 |
-| FR-06 | Metadata filters | P0 | 支持安全 filter key、参数化值和范围/集合/逻辑操作。 |
+| FR-06 | Metadata filters | P0 | 支持安全 filter key、参数化值和等值/集合/包含/逻辑操作；`gt/gte/lt/lte` range 语义不在本期 P0。 |
 | FR-07 | Scope 强隔离 | P0 | 商用默认要求正向 scope predicate。 |
 | FR-08 | BM25 keyword search | P0 | 支持空 query、BM25 默认参数、失败 fallback。 |
 | FR-09 | Update/delete/get/list | P0 | 对齐 mem0 标准生命周期语义。 |

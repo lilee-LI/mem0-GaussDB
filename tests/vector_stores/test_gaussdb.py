@@ -1,3 +1,5 @@
+import logging
+
 import pytest
 from unittest.mock import MagicMock, patch
 
@@ -204,6 +206,16 @@ def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
     mock_conn.commit.assert_called()
 
 
+def test_create_col_does_not_accept_alternate_collection_name():
+    db, _, _, _ = make_gaussdb()
+
+    with pytest.raises(TypeError):
+        db.create_col(name="other_collection")
+
+    with pytest.raises(TypeError):
+        db.create_col("other_collection")
+
+
 def test_distributed_create_col_generates_hash_distribution_clauses():
     db, _, _, mock_cursor = make_gaussdb(deployment_mode="distributed")
 
@@ -262,9 +274,10 @@ def test_capability_probe_falls_back_to_text_on_jsonb_failure():
     assert db.metadata_column_mode == "text"
 
 
-def test_capability_probe_falls_back_on_expression_index_failure():
+def test_capability_probe_keeps_json_filters_on_expression_index_failure(caplog):
     db, _, _, mock_cursor = make_gaussdb()
     mock_cursor.fetchone.return_value = ("on",)
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
 
     def execute_side_effect(sql, *args):
         if "payload->>'user_id'" in str(sql):
@@ -275,8 +288,27 @@ def test_capability_probe_falls_back_on_expression_index_failure():
     db._probe_capabilities()
 
     assert db.payload_storage_mode == "jsonb"
-    assert db.filter_storage_mode == "redundant_columns"
-    assert db.metadata_column_mode == "redundant_columns"
+    assert db.filter_storage_mode == "json_expression"
+    assert db.metadata_column_mode == "jsonb"
+    assert db.capabilities.expression_index is False
+    assert "metadata filters remain available without expression indexes" in caplog.text
+
+
+def test_filter_index_creation_failure_warns_and_keeps_filter_mode(caplog):
+    db, _, _, mock_cursor = make_gaussdb()
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
+
+    def execute_side_effect(sql, *args):
+        if "CREATE INDEX IF NOT EXISTS" in str(sql) and "payload->>'user_id'" in str(sql):
+            raise Exception("expression index unsupported")
+
+    mock_cursor.execute.side_effect = execute_side_effect
+
+    db._create_filter_indexes(mock_cursor, '"public"."test_collection"')
+
+    assert db.filter_storage_mode == "json_expression"
+    assert db.metrics.get("gaussdb_fallback_count") == 1
+    assert "Filter index creation failed for key user_id" in caplog.text
 
 
 def test_capability_probe_bm25_score_failure_disables_bm25():
@@ -397,6 +429,24 @@ def test_insert_raises_on_mismatched_lengths():
 
     with pytest.raises(ValueError, match="same length"):
         db.insert(vectors=[[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]], ids=["id1"])
+
+    with pytest.raises(ValueError, match="same length"):
+        db.insert(vectors=[[0.1, 0.2, 0.3]], payloads=[], ids=["id1"])
+
+    with pytest.raises(ValueError, match="same length"):
+        db.insert(vectors=[[0.1, 0.2, 0.3]], payloads=[{}], ids=[])
+
+
+def test_insert_none_payloads_and_ids_use_defaults():
+    db, _, _, mock_cursor = make_gaussdb()
+
+    db.insert(vectors=[[0.1, 0.2, 0.3]], payloads=None, ids=None)
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "MERGE INTO" in sql
+    assert params[1] == "[0.1,0.2,0.3]"
+    assert params[3] is None
 
 
 # ============================================================
@@ -680,6 +730,26 @@ def test_icontains_filter_escapes_backslash():
     assert any(r"%a\\b%" in str(p) for p in params)
 
 
+@pytest.mark.parametrize("op", ["gt", "gte", "lt", "lte"])
+def test_range_filter_operator_dict_is_treated_as_literal_value(op, caplog):
+    db, _, _, mock_cursor = make_gaussdb()
+    db.require_scoped_filters = False
+    mock_cursor.fetchall.return_value = []
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
+
+    db.list(filters={"priority": {op: 2}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert f"payload->>'priority' = %s" in sql
+    assert "payload->>'priority' > %s" not in sql
+    assert "payload->>'priority' >= %s" not in sql
+    assert "payload->>'priority' < %s" not in sql
+    assert "payload->>'priority' <= %s" not in sql
+    assert params == (str({op: 2}), 100)
+    assert "range filter operators" in caplog.text
+
+
 # ============================================================
 # Transaction rollback test
 # ============================================================
@@ -765,6 +835,15 @@ def test_list_returns_wrapped_results():
     assert isinstance(results, list)
     assert isinstance(results[0], list)
     assert results[0][0].id == "id1"
+
+
+def test_list_top_k_zero_is_preserved():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.list(filters={"user_id": "u1"}, top_k=0)
+
+    assert mock_cursor.execute.call_args.args[1][-1] == 0
 
 
 def test_col_info_reads_schema_version():

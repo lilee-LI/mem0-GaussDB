@@ -187,9 +187,7 @@ class GaussDB(VectorStoreBase):
         if auto_create:
             collections = self.list_cols()
             if self.collection_name not in collections:
-                self.create_col(
-                    name=self.collection_name, vector_size=self.embedding_model_dims, distance=self.vector_metric
-                )
+                self.create_col(vector_size=self.embedding_model_dims, distance=self.vector_metric)
 
     @staticmethod
     def _validate_positive_int(value: int, field_name: str) -> int:
@@ -523,17 +521,22 @@ class GaussDB(VectorStoreBase):
 
                 if self.filter_storage_mode == "json_expression":
                     expr_index = self._quote_identifier(self._index_name(f"probe_{uuid.uuid4().hex[:8]}", "user_idx"))
+                    savepoint = self._quote_identifier(f"mem0_expr_idx_probe_{uuid.uuid4().hex[:8]}")
+                    cur.execute(f"SAVEPOINT {savepoint}")
                     try:
                         cur.execute(f"CREATE INDEX {expr_index} ON {probe_table} ((payload->>'user_id'))")
+                        cur.execute(f"RELEASE SAVEPOINT {savepoint}")
                         report.expression_index = True
                     except Exception as exc:
                         logger.warning(
-                            "JSON expression index probe failed; falling back to redundant scope columns: %s", exc
+                            "JSON expression index probe failed; metadata filters remain available without expression indexes: %s",
+                            exc,
                         )
-                        self.filter_storage_mode = "redundant_columns"
-                        self._sync_metadata_column_mode()
-                        report.filter_storage_mode = self.filter_storage_mode
-                        report.metadata_column_mode = self.metadata_column_mode
+                        try:
+                            cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                            cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                        except Exception:
+                            logger.debug("Failed to roll back JSON expression index probe savepoint", exc_info=True)
         except Exception as exc:
             err_msg = str(exc).lower()
             if "max dimension" in err_msg or ("exceeds" in err_msg and "dimension" in err_msg):
@@ -576,8 +579,8 @@ class GaussDB(VectorStoreBase):
         if cur.fetchone()[0] == 0:
             cur.execute(f'CREATE SCHEMA "{self.schema}"')
 
-    def create_col(self, name: str = None, vector_size: int = None, distance: str = None) -> None:
-        table = f'{self._schema_prefix}{self._quote_identifier(name or self.collection_name)}'
+    def create_col(self, *, vector_size: int = None, distance: str = None) -> None:
+        table = self.table_name
         dims = vector_size or self.embedding_model_dims
         if distance:
             self.vector_metric = self._validate_choice(distance.lower(), "distance", {"cosine", "l2"})
@@ -691,10 +694,24 @@ class GaussDB(VectorStoreBase):
         for key in self.scope_filter_keys:
             safe_key = self._validate_filter_key(key)
             index_name = self._quote_identifier(self._index_name(self.collection_name, f"{safe_key}_idx"))
-            if self.filter_storage_mode == "redundant_columns" and safe_key in self._redundant_scope_columns:
-                cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({self._quote_identifier(safe_key)})")
-            elif self.filter_storage_mode == "json_expression":
-                cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ((payload->>'{safe_key}'))")
+            savepoint = self._quote_identifier(f"mem0_filter_idx_{uuid.uuid4().hex[:8]}")
+            cur.execute(f"SAVEPOINT {savepoint}")
+            try:
+                if self.filter_storage_mode == "redundant_columns" and safe_key in self._redundant_scope_columns:
+                    cur.execute(
+                        f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({self._quote_identifier(safe_key)})"
+                    )
+                elif self.filter_storage_mode == "json_expression":
+                    cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ((payload->>'{safe_key}'))")
+                cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except Exception as exc:
+                try:
+                    cur.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                    cur.execute(f"RELEASE SAVEPOINT {savepoint}")
+                except Exception:
+                    logger.debug("Failed to roll back optional filter index savepoint", exc_info=True)
+                self._increment_metric("gaussdb_fallback_count")
+                logger.warning("Filter index creation failed for key %s; continuing without this index: %s", safe_key, exc)
 
     def _ensure_indexes(self, cur, table: str):
         self._create_vector_index(cur, table)
@@ -705,8 +722,8 @@ class GaussDB(VectorStoreBase):
     def insert(
         self, vectors: List[List[float]], payloads: Optional[List[Dict]] = None, ids: Optional[List[str]] = None
     ) -> None:
-        payloads = payloads or [{} for _ in vectors]
-        ids = ids or [str(uuid.uuid4()) for _ in vectors]
+        payloads = [{} for _ in vectors] if payloads is None else payloads
+        ids = [str(uuid.uuid4()) for _ in vectors] if ids is None else ids
         if len(vectors) != len(payloads) or len(vectors) != len(ids):
             raise ValueError("vectors, payloads, and ids must have the same length")
 
@@ -1058,6 +1075,7 @@ class GaussDB(VectorStoreBase):
 
     def list(self, filters: Optional[dict] = None, top_k: Optional[int] = 100) -> List[List[OutputData]]:
         where_clause, params = self._build_where_clause(filters, require_scope=True)
+        limit = 100 if top_k is None else top_k
 
         def op():
             with self._get_cursor() as cur:
@@ -1069,7 +1087,7 @@ class GaussDB(VectorStoreBase):
                     ORDER BY updated_at DESC, id ASC
                     LIMIT %s
                     """,
-                    (*params, top_k or 100),
+                    (*params, limit),
                 )
                 rows = cur.fetchall()
             return [[OutputData(id=str(row[0]), score=None, payload=self._decode_payload(row[1])) for row in rows]]
@@ -1079,7 +1097,7 @@ class GaussDB(VectorStoreBase):
     def reset(self) -> None:
         logger.warning("Resetting GaussDB collection %s", self.collection_name)
         self.delete_col()
-        self.create_col(name=self.collection_name, vector_size=self.embedding_model_dims, distance=self.vector_metric)
+        self.create_col(vector_size=self.embedding_model_dims, distance=self.vector_metric)
 
     def migration_dry_run(self) -> Dict[str, Any]:
         return {
@@ -1241,15 +1259,13 @@ class GaussDB(VectorStoreBase):
         ops = set(value.keys())
         range_ops = {"gt", "gte", "lt", "lte"}
         if ops & range_ops:
-            expressions = []
-            params: List[Any] = []
-            op_map = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
-            for op in ("gt", "gte", "lt", "lte"):
-                if op in value:
-                    field_sql, field_params = self._field_sql(key)
-                    expressions.append(f"{field_sql} {op_map[op]} %s")
-                    params.extend([*field_params, str(value[op])])
-            return " AND ".join(expressions), params
+            logger.warning(
+                "GaussDB range filter operators %s are not supported; treating filter on %s as literal equality",
+                sorted(ops & range_ops),
+                key,
+            )
+            field_sql, params = self._field_sql(key)
+            return f"{field_sql} = %s", [*params, str(value)]
         if "eq" in value:
             return self._build_field_filter(key, value["eq"])
         if "ne" in value:
