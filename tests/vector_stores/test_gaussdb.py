@@ -55,6 +55,7 @@ def test_gaussdb_config_defaults():
     assert cfg.minconn == 1
     assert cfg.maxconn == 5
     assert cfg.auto_create is True
+    assert cfg.require_scoped_filters is True
 
 
 def test_gaussdb_config_accepts_connection_string():
@@ -76,6 +77,30 @@ def test_gaussdb_config_accepts_distributed_deployment_mode():
     assert cfg.deployment_mode == "distributed"
 
 
+def test_gaussdb_config_accepts_require_scoped_filters_override():
+    cfg = GaussDBConfig(
+        host="localhost",
+        port=5432,
+        user="test",
+        password="test",
+        require_scoped_filters=False,
+    )
+
+    assert cfg.require_scoped_filters is False
+
+
+def test_gaussdb_config_rejects_centralized_with_too_high_dims():
+    with pytest.raises(Exception, match="centralized mode only supports"):
+        GaussDBConfig(
+            host="localhost",
+            port=5432,
+            user="test",
+            password="test",
+            deployment_mode="centralized",
+            embedding_model_dims=8192,
+        )
+
+
 def test_gaussdb_config_rejects_distributed_with_high_dims():
     with pytest.raises(Exception):
         GaussDBConfig(
@@ -85,6 +110,56 @@ def test_gaussdb_config_rejects_distributed_with_high_dims():
             password="test",
             deployment_mode="distributed",
             embedding_model_dims=2048,
+        )
+
+
+def test_gaussdb_config_rejects_high_dims_with_gsivfflat():
+    with pytest.raises(Exception, match="only GsDiskANN supports"):
+        GaussDBConfig(
+            host="localhost",
+            port=5432,
+            user="test",
+            password="test",
+            vector_index_type="gsivfflat",
+            embedding_model_dims=2048,
+        )
+
+
+def test_gaussdb_config_rejects_partial_credentials_without_connection_string():
+    with pytest.raises(Exception, match="both 'user' and 'password' must be provided together"):
+        GaussDBConfig(
+            host="localhost",
+            port=5432,
+            user="test",
+        )
+
+
+def test_gaussdb_config_rejects_partial_host_port_without_connection_string():
+    with pytest.raises(Exception, match="both 'host' and 'port' must be provided together"):
+        GaussDBConfig(
+            user="test",
+            password="test",
+            host="localhost",
+        )
+
+
+def test_gaussdb_config_rejects_zero_pool_sizes():
+    with pytest.raises(Exception, match="minconn must be >= 1"):
+        GaussDBConfig(
+            host="localhost",
+            port=5432,
+            user="test",
+            password="test",
+            minconn=0,
+        )
+
+    with pytest.raises(Exception, match="maxconn must be >= 1"):
+        GaussDBConfig(
+            host="localhost",
+            port=5432,
+            user="test",
+            password="test",
+            maxconn=0,
         )
 
 
@@ -113,6 +188,16 @@ def test_gaussdb_config_rejects_extra_fields():
             password="test",
             unexpected=True,
         )
+
+
+def test_gaussdb_enable_bm25_alias_tracks_bm25_enabled():
+    db, _, _, _ = make_gaussdb()
+
+    assert db.enable_bm25 is True
+    db.enable_bm25 = False
+    assert db.bm25_enabled is False
+    db.bm25_enabled = True
+    assert db.enable_bm25 is True
 
 
 def test_vector_store_config_and_factory_register_gaussdb():
@@ -245,6 +330,27 @@ def test_capability_probe_sets_vector_index_maintenance_work_mem():
     assert "INSERT INTO" in sql
     assert "text_lemmatized ### %s AS score" in sql
     mock_cursor.execute.assert_any_call("SET LOCAL maintenance_work_mem = %s", ("128MB",))
+
+
+def test_set_vector_index_maintenance_work_mem_skips_when_current_is_higher():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchone.return_value = ("4GB",)
+
+    db._set_vector_index_maintenance_work_mem(mock_cursor)
+
+    sql = executed_sql(mock_cursor)
+    assert "SHOW maintenance_work_mem" in sql
+    assert "SET LOCAL maintenance_work_mem" not in sql
+
+
+def test_set_vector_index_maintenance_work_mem_raises_default_for_high_dim_gsdiskann():
+    db, _, _, mock_cursor = make_gaussdb(embedding_model_dims=2048)
+    mock_cursor.fetchone.return_value = ("1GB",)
+
+    db._set_vector_index_maintenance_work_mem(mock_cursor)
+
+    mock_cursor.execute.assert_any_call("SHOW maintenance_work_mem")
+    mock_cursor.execute.assert_any_call("SET LOCAL maintenance_work_mem = %s", ("2GB",))
 
 
 def test_capability_probe_uses_distributed_probe_table_suffix():
@@ -473,6 +579,16 @@ def test_search_requires_scoped_filters_by_default():
 
     with pytest.raises(ValueError, match="requires at least one scoped filter"):
         db.search("hello", [0.1, 0.2, 0.3], filters={"category": "test"})
+
+
+def test_constructor_can_disable_scoped_filters_with_warning(caplog):
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchall.return_value = []
+
+    assert db.require_scoped_filters is False
+    assert "scope guard is disabled" in caplog.text
+    assert db.search("hello", [0.1, 0.2, 0.3], filters={"category": "test"}) == []
 
 
 @pytest.mark.parametrize(
@@ -870,6 +986,18 @@ def test_col_info_defaults_schema_version_when_meta_table_missing():
     info = db.col_info()
 
     assert info["schema_version"] == 1
+
+
+def test_analyze_uses_autocommit_and_restores_previous_state():
+    db, mock_pool, mock_conn, mock_cursor = make_gaussdb()
+    mock_conn.autocommit = False
+
+    db.analyze()
+
+    mock_conn.set_client_encoding.assert_called_with("UTF8")
+    mock_cursor.execute.assert_called_once_with('ANALYZE "public"."test_collection"')
+    assert mock_conn.autocommit is False
+    mock_pool.putconn.assert_called_with(mock_conn)
 
 
 # ============================================================

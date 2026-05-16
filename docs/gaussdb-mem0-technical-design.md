@@ -1,800 +1,708 @@
-# mem0 GaussDB 适配技术设计文档
+# mem0 GaussDB 适配技术设计
 
-> 生成日期：2026-04-28  
-> 代码基线：`codex/add-gaussdb-ustore-provider`，当前提交 `463718fc`  
-> 设计对象：`mem0.vector_stores.gaussdb.GaussDB` provider 与 `GaussDBConfig`。
+> 更新时间: 2026-05-16  
+> 设计对象: `mem0.vector_stores.gaussdb.GaussDB`  
+> 对应代码: `mem0/mem0/vector_stores/gaussdb.py`
 
-## 1. 设计目标
+## 1. 设计原则
 
-GaussDB provider 的目标不是只把 embedding 写进一张表，而是完整接入 mem0 的 memory 生命周期和检索链路：
+GaussDB provider 的设计遵循以下原则:
 
-- 对齐 `VectorStoreBase` 标准接口。
-- 对齐 `Memory.from_config` 到 provider 的初始化链路。
-- 支持 semantic vector search、BM25 keyword search 和 batch search。
-- 在集中式 A 模式 Ustore 上使用 GaussDB 原生 `FLOATVECTOR`、`gsdiskann`/`gsivfflat`、BM25。
-- 商用默认强制 scope filters，防止跨用户、跨 agent、跨 run 泄露 memory。
-- 通过能力探测和 fallback 适配 GaussDB 小版本、构建号和 A 模式差异。
-- 提供可测试、可观测、可迁移、可运维的实现。
+1. 以 mem0 现有 provider 契约为边界，不发明新的公共接口。
+2. 以商用正确性优先，不为了表面兼容而返回错误结果。
+3. 能力探测和降级必须可解释。
+4. 集中式优先保证完整体验，分布式优先保证兼容与可验证。
+5. 过滤语义和索引能力分离。
+6. 单实例绑定单 collection，不做隐式切表。
 
-## 2. 总体架构
-
-```mermaid
-flowchart TD
-    A["应用调用 Memory.add/search/update/delete"] --> B["mem0 Memory 层"]
-    B --> C["Embedder: 文本转 embedding"]
-    B --> D["LLM: infer=True 时抽取/合并 memory"]
-    B --> E["VectorStoreFactory"]
-    E --> F["GaussDB provider"]
-    F --> G["GaussDB Ustore memory table"]
-    F --> H["GaussDB FLOATVECTOR index"]
-    F --> I["GaussDB BM25 index"]
-    F --> J["schema meta table"]
-    B --> K["history DB"]
-```
-
-### 2.1 mem0 执行链路
-
-`Memory.from_config(config)`：
+## 2. 整体架构
 
 ```text
 Memory.from_config
-  -> MemoryConfig / VectorStoreConfig 校验
-  -> EmbedderFactory.create(...)
   -> VectorStoreFactory.create("gaussdb", config)
-  -> LlmFactory.create(...)
-  -> SQLiteManager(history_db_path)
+  -> GaussDB.__init__
+     -> _create_connection_pool()
+     -> _probe_capabilities()
+     -> auto_create -> list_cols() / create_col()
+
+运行期主链路:
+  add    -> insert()
+  search -> search() + keyword_search()
+  batch  -> search_batch()
+  admin  -> col_info() / list_cols() / reset() / analyze()
 ```
 
-`Memory.add()`：
+GaussDB provider 只负责向量存储与检索层，不负责:
+
+- LLM memory 提取
+- embedding 生成
+- semantic/BM25/entity 融合排序
+- 上层鉴权
+
+这些逻辑仍在 mem0 的 `Memory` 层完成。
+
+## 3. 配置设计
+
+### 3.1 当前真实配置项
+
+当前 `GaussDBConfig` 只支持以下字段:
+
+| 分类 | 字段 |
+|---|---|
+| 连接 | `database`, `user`, `password`, `host`, `port`, `connection_string`, `sslmode`, `sslrootcert` |
+| collection | `collection_name`, `embedding_model_dims` |
+| 连接池 | `minconn`, `maxconn` |
+| 部署 | `deployment_mode` |
+| 向量 | `vector_index_type`, `vector_metric` |
+| 运维 | `auto_create`, `require_scoped_filters` |
+
+说明:
+
+- 默认 `minconn=1`, `maxconn=5`
+- 默认 `deployment_mode="centralized"`
+- 默认 `vector_index_type="gsdiskann"`
+- 默认 `vector_metric="cosine"`
+- 默认 `require_scoped_filters=True`
+
+建议对外按两层理解这些配置:
+
+- 基础项: 连接信息、`collection_name`、`embedding_model_dims`、`deployment_mode`
+- 高阶项: `sslmode`、`sslrootcert`、`minconn`、`maxconn`、`vector_index_type`、`vector_metric`、`auto_create`、`require_scoped_filters`
+
+这里的“基础项”当前是文档层约定，不是运行时强制必填。也就是说，代码仍然保留默认值，但商用接入建议显式填写这些关键字段，避免隐式落到默认 collection、默认维度或默认部署模式。
+
+### 3.2 为什么不暴露更多高阶配置
+
+当前实现里，`payload_storage_mode`、`filter_storage_mode`、`bm25_enabled` 等行为参数仍然是 provider 内部默认值；`require_scoped_filters` 已作为高级安全配置正式暴露，默认保持开启。
+
+原因:
+
+- P0 阶段优先保证接口简洁和默认行为稳定。
+- capability probe 已经承担了自动选择和自动降级责任。
+- 过早暴露底层旋钮，会让用户文档复杂度远大于收益。
+- `require_scoped_filters` 之所以例外开放，是因为它直接决定检索类接口是否强制作用域约束，属于商用安全策略，而不只是调优项。
+
+因此当前推荐策略是:
+
+- 基础项在接入文档和样例中显式给出
+- 高阶项保留默认值，按需覆盖
+- 暂不继续开放 `payload_storage_mode`、`filter_storage_mode`、`bm25_enabled`、`retry_attempts` 等更底层旋钮
+
+### 3.3 环境变量解析
+
+当前支持以下环境变量:
+
+- `GAUSSDB_CONNECTION_STRING`
+- `GAUSSDB_DSN`
+- `GAUSSDB_URL`
+- `GAUSSDB_HOST`
+- `GAUSSDB_PORT`
+- `GAUSSDB_DATABASE`
+- `GAUSSDB_DBNAME`
+- `GAUSSDB_USER`
+- `GAUSSDB_PASSWORD`
+- `GAUSSDB_SSLMODE`
+- `GAUSSDB_SSLROOTCERT`
+
+设计目的:
+
+- 对齐企业环境中“配置来自环境变量”的常见部署方式。
+- 允许连接信息与业务代码解耦。
+
+## 4. 连接池设计
+
+### 4.1 当前实现
+
+GaussDB 使用 `psycopg2.pool.ThreadedConnectionPool`:
+
+- `minconn=1`
+- `maxconn=5`
+
+设计考虑:
+
+- 与 mem0 中 `pgvector` 和 `azure_mysql` 的 SQL provider 默认值保持一致。
+- 保守默认值更适合 SDK/provider 层。
+- 具体并发容量应由部署方根据 worker 数和数据库容量调优。
+
+### 4.2 与其他 provider 对比
+
+| Provider | 连接池设计 |
+|---|---|
+| GaussDB | 显式连接池，默认 1/5 |
+| pgvector | 显式连接池，默认 1/5 |
+| Azure MySQL | 显式连接池，默认 1/5 |
+| MongoDB | 依赖 MongoClient 默认池 |
+| Qdrant | 依赖 QdrantClient 默认 HTTP 池 |
+| Redis | 依赖 redis-py 默认连接池 |
+| OpenSearch | 显式 `pool_maxsize=20` |
+
+结论:
+
+- GaussDB 的连接池方案属于 SQL provider 常规做法，不是特例。
+
+## 5. collection 与 schema 设计
+
+### 5.1 单实例单 collection
+
+一个 `GaussDB` 实例只绑定一个 `self.collection_name`。  
+它对应:
+
+- 一张主表
+- 一张 schema meta 表
+- 若干索引
+
+当前不支持:
+
+```python
+db.create_col(name="other_collection")
+```
+
+设计原因:
+
+- 避免“实例状态绑定 A，建表却建到 B”的半支持语义。
+- 与 `pgvector`/`MongoDB`/`Qdrant` 的单 collection 实例模型保持一致。
+
+### 5.2 主表结构
+
+当前主表核心字段如下:
+
+| 字段 | 说明 |
+|---|---|
+| `id` | 主键，当前默认 `UUID` |
+| `vector` | `FLOATVECTOR(dims)` |
+| `payload` | `JSONB` 或 `TEXT` |
+| `memory` | 从 payload 派生出的主文本 |
+| `text_lemmatized` | 用于 BM25 |
+| `created_at` | 创建时间 |
+| `updated_at` | 更新时间 |
+| `schema_version` | 行级 schema 版本 |
+| `user_id/agent_id/run_id` | 仅在 `redundant_columns` 模式下出现 |
+
+### 5.3 schema meta 表
+
+每个 collection 还会有一张:
 
 ```text
-Memory.add
-  -> 组装 user_id / agent_id / run_id / metadata
-  -> infer=True 时调用 LLM 抽取 memory facts
-  -> embedding_model.embed / embed_batch
-  -> vector_store.insert(vectors, payloads, ids)
-  -> history DB 写 add 记录
+<collection_name>_schema_meta
 ```
 
-`Memory.search()`：
+用途:
 
-```text
-Memory.search
-  -> 校验 filters
-  -> query lemmatize / entity extract
-  -> embedding_model.embed(query)
-  -> vector_store.search(query, vector, top_k, filters)
-  -> vector_store.keyword_search(query, top_k, filters)
-  -> entity store search
-  -> semantic + keyword + entity 融合排序
+- 记录 collection 的 schema version
+- 供 `col_info()` 与运维工具读取
+
+设计原因:
+
+- 把 provider 管理状态从业务表中解耦出来。
+- 为后续迁移与回填提供最小元数据基座。
+
+## 6. capability probe 设计
+
+### 6.1 探测目标
+
+构造阶段 `_probe_capabilities()` 会探测:
+
+- `enable_vectordb`
+- `FLOATVECTOR`
+- 向量索引可用性
+- `JSONB`
+- BM25 index
+- BM25 score query
+- JSON expression index
+
+### 6.2 为什么要探测而不是写死
+
+GaussDB 的实际运行环境可能在以下方面存在差异:
+
+- 集中式 / 分布式
+- 小版本差异
+- 某些特性是否启用
+- 某些索引/操作符是否可用
+
+如果写死假设，用户会在初始化后第一次真实写入或查询时才踩雷。  
+探测的价值是尽量把失败前移到 provider 初始化阶段，或者提前决定降级路径。
+
+### 6.3 当前降级策略
+
+#### 向量能力不可用
+
+- 直接失败
+
+原因:
+
+- 没有向量能力，provider 不成立
+
+#### JSONB 不可用
+
+- `payload_storage_mode = "text"`
+- `filter_storage_mode = "redundant_columns"`
+
+原因:
+
+- JSONB 都不可用时，不可能再维持任意 metadata SQL 过滤
+- 退化到最小可商用路径，只保障 scope filter
+
+#### BM25 不可用
+
+- `bm25_enabled = False`
+- 主链路继续可用
+
+原因:
+
+- BM25 是增强能力，不应拖垮语义检索
+
+#### JSON expression index 不可用
+
+- 只 warning
+- 保持 `filter_storage_mode = "json_expression"`
+
+原因:
+
+- 表达式索引失败不等于 payload 查询失败
+- 应该损失性能，不应该损失 metadata filter 语义
+
+## 7. 建表与索引设计
+
+### 7.1 storage type
+
+当前主表统一使用:
+
+```sql
+WITH (storage_type=ustore)
 ```
 
-GaussDB provider 负责底层存储和召回，最终融合排序仍由 mem0 Memory 层完成。
+原因:
 
-## 3. 代码结构
+- 这是当前商用目标形态。
+- 对更新型 workload 更友好。
 
-| 文件 | 作用 |
-|---|---|
-| `mem0/vector_stores/gaussdb.py` | Provider 主实现。 |
-| `mem0/configs/vector_stores/gaussdb.py` | Pydantic 配置模型。 |
-| `mem0/vector_stores/configs.py` | 将 `gaussdb` 纳入 vector store config union。 |
-| `mem0/utils/factory.py` | 将 `gaussdb` 注册到 `VectorStoreFactory`。 |
-| `tests/vector_stores/test_gaussdb.py` | Mock 单测。 |
-| `tests/vector_stores/test_gaussdb_p0.py` | 真实库 P0 验收。 |
-| `tests/vector_stores/test_gaussdb_e2e.py` | 真实库 e2e。 |
-| `tests/vector_stores/test_gaussdb_quality.py` | 质量、并发和 benchmark。 |
+### 7.2 集中式与分布式
 
-## 4. 配置设计
+当前 `distribution_mode` 规则:
 
-### 4.1 分层配置
+- 集中式 -> `none`
+- 分布式 -> `hash`
 
-配置分为两层：
+分布式 DDL 会追加:
 
-- 高层配置：面向普通用户，减少必填项。
-- 低层配置：面向 DBA、测试和性能调优。
+```sql
+DISTRIBUTE BY HASH ("id")
+```
 
-高层配置：
+设计原因:
 
-| 参数 | 值 | 行为 |
+- 当前 provider 的 CRUD、检索和管理接口都以 `id` 为主键基础。
+- 用 `id` 做 hash 分布最直接，兼容性最好。
+
+### 7.3 向量索引
+
+支持:
+
+- `gsdiskann`
+- `gsivfflat`
+
+支持 metric:
+
+- `cosine`
+- `l2`
+
+映射关系:
+
+| 业务 metric | 查询算子 | 索引 metric |
 |---|---|---|
-| `profile=commercial` | 默认 | Ustore、能力探测、scope guard、BM25 auto、`gsdiskann`。 |
-| `profile=compatibility` | 可选 | 更保守，倾向 `metadata_mode=compatible` 和 `gsivfflat`。 |
-| `metadata_mode=auto` | 默认 | 优先 JSONB + JSON expression filters，失败时 fallback。 |
-| `metadata_mode=compatible/text` | 可选 | text payload + redundant scope columns。 |
-| `bm25_mode=auto` | 默认 | 尝试 BM25，失败后允许禁用。 |
-| `bm25_mode=required` | 可选 | BM25 失败则整体失败。 |
-| `bm25_mode=disabled` | 可选 | 禁用 `keyword_search`。 |
+| cosine | `<+>` | `COSINE` |
+| l2 | `<->` | `L2` |
 
-低层配置：
+设计原因:
 
-| 参数 | 说明 |
-|---|---|
-| `payload_storage_mode` | `jsonb` 或 `text`，控制 payload 列类型。 |
-| `filter_storage_mode` | `json_expression` 或 `redundant_columns`，控制 filters SQL 路径。 |
-| `vector_index_type` | `gsdiskann` 或 `gsivfflat`。 |
-| `vector_metric` | `cosine` 或 `l2`。 |
-| `require_scoped_filters` | 是否强制读路径包含 scope。 |
-| `scope_filter_keys` | 可作为 scope 的 key，默认 `user_id/agent_id/run_id`。 |
-| `allowed_filter_keys` | 可选 filter key allowlist。 |
-| `bm25_*` | BM25 ranking、candidate、dictionary 等参数。 |
-| `retry_*` | 瞬态错误重试配置。 |
-| `slow_query_ms` | 慢查询日志阈值。 |
+- 对齐 GaussDB 当前向量能力。
+- 对 mem0 上层隐藏底层算子差异。
 
-### 4.2 连接配置
+### 7.4 maintenance_work_mem
 
-Provider 支持三种连接来源：
-
-1. 外部传入 `connection_pool`。
-2. `connection_string` / `dsn` / `url`。
-3. 单项字段或环境变量：
-   - `GAUSSDB_HOST`
-   - `GAUSSDB_PORT`
-   - `GAUSSDB_DATABASE` / `GAUSSDB_DBNAME`
-   - `GAUSSDB_USER`
-   - `GAUSSDB_PASSWORD`
-   - `GAUSSDB_SSLMODE`
-   - `GAUSSDB_SSLROOTCERT`
-
-实现使用 GaussDB 官方兼容 `psycopg2` API，避免依赖 psycopg3 特性。
-
-## 5. Schema 设计
-
-每个 mem0 collection 映射为一张 Ustore 主表和一张 schema meta 表。
-
-### 5.1 主表逻辑结构
+建向量索引前会设置:
 
 ```sql
-CREATE TABLE <collection> (
-    id <uuid_or_varchar> PRIMARY KEY,
-    vector FLOATVECTOR(<dimension>) NOT NULL,
-    payload JSONB | TEXT,
-    memory TEXT,
-    text_lemmatized TEXT,
-    created_at TIMESTAMPTZ,
-    updated_at TIMESTAMPTZ,
-    schema_version INTEGER DEFAULT 1,
-    user_id TEXT NULL,
-    agent_id TEXT NULL,
-    run_id TEXT NULL
-) WITH (storage_type=ustore);
+SET LOCAL maintenance_work_mem = ...
 ```
 
-说明：
+高维 `gsdiskann` 会自动把默认值从 `128MB` 提高到 `2GB`。
 
-- `payload` 保存 mem0 原始 metadata。
-- `memory` 保存展示和回填使用的 memory 原文。
-- `text_lemmatized` 保存 BM25 查询字段。
-- `user_id/agent_id/run_id` 只在 redundant columns 模式下作为 filter 加速和隔离字段。
-- `schema_version` 便于行级演进。
+设计原因:
 
-### 5.2 Schema meta 表
+- 避免修改全局 DB 参数。
+- 把优化限制在当前建索引事务内。
 
-```sql
-CREATE TABLE <collection>_schema_meta (
-    collection_name TEXT PRIMARY KEY,
-    schema_version INTEGER NOT NULL,
-    payload_storage_mode TEXT NOT NULL,
-    filter_storage_mode TEXT NOT NULL,
-    metadata_column_mode TEXT NOT NULL,
-    vector_index_type TEXT NOT NULL,
-    vector_metric TEXT NOT NULL,
-    bm25_enabled BOOLEAN NOT NULL,
-    updated_at TIMESTAMPTZ NOT NULL
-);
-```
+### 7.5 BM25 索引
 
-`col_info()` 会读取该表返回真实 schema version，不再硬编码 `1`。
+BM25 索引创建走 savepoint 包裹。
 
-## 6. 索引设计
+设计原因:
 
-### 6.1 向量索引
+- BM25 是可选能力。
+- 即便 BM25 索引失败，也不能影响主表和向量索引创建。
 
-默认：
+### 7.6 scope filter 索引
 
-```sql
-CREATE INDEX <collection>_vector_idx
-ON <collection>
-USING gsdiskann (vector COSINE);
-```
+默认会为:
 
-可选：
+- `user_id`
+- `agent_id`
+- `run_id`
 
-- `vector_index_type=gsivfflat`
-- `vector_metric=l2`
+创建过滤索引。
 
-查询算子映射：
+当前有两种实现路径:
 
-| metric | 查询算子 | 索引 metric | 说明 |
-|---|---|---|---|
-| `cosine` | `<+>` | `COSINE` | 默认，适合常见 embedding 相似度。 |
-| `l2` | `<->` | `L2` | 可选，适合欧氏距离。 |
+1. `redundant_columns` 模式: 普通列索引
+2. `json_expression` 模式: `payload->>'key'` 表达式索引
 
-索引构建前可使用：
-
-```sql
-SET LOCAL maintenance_work_mem = '128MB';
-```
-
-该设置只在当前事务内生效，不修改数据库全局参数。
-
-### 6.2 BM25 索引
-
-BM25 使用 `text_lemmatized` 字段。
-
-设计原则：
-
-- BM25 是增强能力，不是 semantic search 的硬依赖。
-- `bm25_mode=auto` 下 BM25 建索引失败不应导致 collection 创建失败。
-- BM25 DDL 使用 savepoint 保护，失败后 rollback 到 savepoint。
-- `bm25_mode=required` 下 BM25 失败应 fail fast。
-
-默认参数：
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `bm25_ranking_metric` | `0` | BM25 OKAPI。 |
-| `bm25_ncandidates` | `128` | 候选数量。 |
-| `bm25_dictionary` | `None` | 使用数据库默认 dictionary。 |
-
-### 6.3 Filter 索引
-
-`json_expression` 模式：
-
-- payload 为 JSONB。
-- filter 通过 JSON expression 提取字段。
-- 对高频 scope/filter 字段创建表达式索引。
-
-`redundant_columns` 模式：
-
-- payload 可以是 JSONB 或 TEXT。
-- `user_id/agent_id/run_id` 冗余为普通列。
-- 对冗余列创建 BTree 索引。
-- 这是 A 模式 JSON/表达式索引不可靠时的商用 fallback。
-
-## 7. 能力探测设计
-
-能力探测在 provider 初始化时执行，除非 `enable_capability_probe=False`。
-
-探测项：
-
-| 能力 | 必需 | 失败处理 |
-|---|---|---|
-| 连接可用 | 是 | fail fast。 |
-| `FLOATVECTOR` | 是 | fail fast。 |
-| 向量索引 | 是 | fail fast 或切换已配置索引类型。 |
-| UUID | 否 | fallback 到 `VARCHAR(36)`。 |
-| JSONB payload | 否 | fallback 到 `TEXT`。 |
-| JSON expression index | 否 | fallback 到 `redundant_columns`。 |
-| BM25 index | 否/按配置 | auto 下禁用 BM25，required 下 fail fast。 |
-| BM25 score query | 否/按配置 | auto 下禁用 BM25，required 下 fail fast。 |
-
-探测流程：
-
-```mermaid
-flowchart TD
-    A["启动 provider"] --> B["连接 GaussDB"]
-    B --> C["探测 FLOATVECTOR 与向量索引"]
-    C -->|失败| X["fail fast"]
-    C --> D["探测 UUID / JSONB"]
-    D --> E["探测 JSON expression index"]
-    E --> F["确定 payload/filter 模式"]
-    F --> G["探测 BM25 index + score query"]
-    G -->|auto 失败| H["bm25_enabled=False"]
-    G -->|required 失败| X
-    G -->|成功| I["创建 collection"]
-    H --> I
-```
+当前每个索引都用 savepoint 包裹，失败仅 warning。
 
 ## 8. 写入设计
 
-### 8.1 Insert/upsert
+### 8.1 insert
 
-`insert(vectors, payloads, ids)` 支持多行批量写入。
+`insert()` 使用单条 `MERGE INTO` 完成批量 upsert。
 
-设计要求：
+设计原因:
 
-- 单事务写入。
-- 所有行作为 CTE incoming set 输入。
-- 先 set-based `UPDATE` 已存在记录。
-- 再 set-based `INSERT` 不存在记录。
-- 避免逐行 DML。
-- 对每行派生：
-  - `memory = payload["data"] or payload["memory"]`
-  - `text_lemmatized = payload["text_lemmatized"] or memory`
-  - redundant scope columns。
+- 比“先查再更再插”更原子。
+- 比逐条 DML 更高效。
+- 避免某些数据库模式下 `ON CONFLICT` 路线的不确定性。
 
-该设计绕开 A 模式下 PostgreSQL `ON CONFLICT` 兼容风险，同时保持批量性能。
+### 8.2 派生字段
 
-### 8.2 Update
+每条记录在 provider 层自动派生:
 
-`update(vector_id, vector=None, payload=None)` 只更新显式传入字段：
+- `memory = payload["data"] or payload["memory"]`
+- `text_lemmatized = payload["text_lemmatized"] or memory`
 
-| 输入 | 行为 |
-|---|---|
-| `vector` 非空 | 更新 `vector`。 |
-| `payload` 非空 | 更新 `payload`、`memory`、`text_lemmatized`。 |
-| redundant columns 模式 | 只在 payload 显式包含 scope key 时更新对应冗余列。 |
-| 任意 update | 刷新 `updated_at`。 |
+设计原因:
 
-注意：
+- 让 BM25 和展示主文本都有稳定来源。
+- 降低对上层传参完整性的依赖。
 
-- vector-only update 不更新 payload/text 字段，这是显式语义：只替换 embedding。
-- 如果业务文本变化，应通过 payload/full update 路径传入新的 `data` 或 `memory`。
+### 8.3 UTF-8 处理
 
-### 8.3 Delete/get/list/reset
+provider 统一:
 
-- `delete(vector_id)` 幂等，删除不存在记录视为成功。
-- `get(vector_id)` 按 mem0 标准接口只接收 id，不支持 provider-level filters。
-- `list(filters, top_k)` 支持 filters 和稳定排序。
-- `reset()` 删除并重建 collection。
-- `delete_col()` 删除主表和 schema meta 表，主表索引随表自动删除。
+- 设置 client encoding 为 `UTF8`
+- payload 使用 `json.dumps(..., ensure_ascii=False)`
 
-## 9. 检索设计
+设计原因:
 
-### 9.1 Semantic search
+- 避免 psycopg2 JSON adapter 在某些环境下的编码问题
+- 保障中文和多语言 payload 在集中式真实库中稳定 round-trip
 
-逻辑 SQL：
+## 9. 查询设计
 
-```sql
-SELECT
-    id,
-    payload,
-    memory,
-    vector <operator> %s::FLOATVECTOR AS distance
-FROM <collection>
-WHERE <filters>
-ORDER BY distance ASC, id ASC
-LIMIT %s;
+### 9.1 语义检索
+
+`search()` 的 SQL 语义是:
+
+- 在 DB 内完成距离计算
+- 在 DB 内完成 filter
+- 在 DB 内完成 top_k 与排序
+
+排序规则:
+
+```text
+distance ASC, id ASC
 ```
 
-Provider 将 distance 归一为 mem0 兼容 score：
+返回分数:
 
 ```text
 score = 1 / (1 + max(distance, 0))
 ```
 
-该公式对 cosine distance 和 l2 distance 都保持“距离越小，score 越大”的方向。不同 metric 的 score 分布范围不同，mem0 上层融合排序按相对分数使用。
+设计原因:
 
-### 9.2 Keyword search
+- 对上层暴露单调可比较的正向分数
+- 保持结果稳定性
 
-逻辑 SQL：
+注意:
 
-```sql
-SELECT
-    id,
-    payload,
-    memory,
-    text_lemmatized ### %s AS score
-FROM <collection>
-WHERE <filters>
-ORDER BY score DESC, id ASC
-LIMIT %s;
-```
+- 这个 `score` 是 **GaussDB provider 自己归一化后的 semantic score**
+- 它不是原始距离，也不是严格数学意义上的 cosine similarity
+- 它的设计目标是适配 mem0 上层 `threshold` 与混合排序逻辑
 
-行为：
+因此:
 
-- 空 query 返回 `[]`。
-- BM25 禁用返回 `None`，保持 mem0 provider 约定：`None` 表示不支持 keyword search。
-- BM25 查询异常时：
-  - `bm25_fail_fast=True`：抛出异常。
-  - `bm25_fail_fast=False`：记录 fallback metric 并返回 `None`。
+- **不能把 GaussDB 的 `score` 与 pgvector 返回的 raw distance 直接横向比较**
+- 也**不能把不同 provider 返回的 `score` 数值混在一起做统一排序**
 
-### 9.3 Batch search
+原因是 mem0 当前各 provider 的 `score` 语义并不统一:
 
-`search_batch(queries, vectors_list, top_k, filters)` 返回二维结果：
+| Provider | score 语义 |
+|---|---|
+| GaussDB | provider-normalized semantic score，越大越好 |
+| pgvector | raw distance，越小越好 |
+| Azure MySQL | raw distance，越小越好 |
+| MongoDB / OpenSearch / Elasticsearch / Qdrant | 后端原生 score，通常越大越好，但量纲不统一 |
 
-```python
-[
-    [OutputData(...), OutputData(...)],
-    [OutputData(...)]
-]
-```
+所以当前正确使用方式是:
 
-设计目标：
+- 同一次检索只在单个 provider 内解释 `score`
+- 不跨 provider 直接比较原始 `score`
 
-- 用一次 SQL 处理多个 query vector，减少 entity store 场景往返。
-- 每个 query 保持独立 top-k。
-- 原生 batch 失败时 fallback 到逐条 `search`，复用相同 filters 和 scope guard。
+### 9.2 关键词检索
 
-## 10. Filter 与租户隔离设计
+`keyword_search()` 只有在 `bm25_enabled=True` 时才工作。  
+否则返回 `None`。
 
-### 10.1 支持的 filter 形态
+设计原因:
 
-支持简单等值、集合、字符串包含和逻辑组合：
+- `None` 能明确表达“该 provider 当前不支持关键词检索”
+- 上层 `Memory.search()` 会自行做兼容处理
 
-```python
-{"user_id": "u1"}
-{"category": {"eq": "travel"}}
-{"priority": {"in": ["high", "medium"]}}
-{"title": {"contains": "invoice"}}
-{"$and": [{"user_id": "u1"}, {"category": "travel"}]}
-{"$or": [{"category": "travel"}, {"category": "food"}]}
-{"$not": [{"category": "archived"}]}
-```
+对于当前 GaussDB provider，还需要明确一点:
 
-当前版本不提供 `gt/gte/lt/lte` range 语义。为了对齐多数 mem0 provider 的兼容行为，包含这些 key 的 dict filter 会按普通 metadata 字面值等值过滤处理，并记录 warning；它不会生成 SQL 大小比较，也不承诺数值或时间范围召回。Typed range 需要后续引入 metadata schema 或明确的字段类型映射后再开放。
+- **集中式模式**: 默认尝试启用 BM25，因此可提供 `keyword_search()`
+- **分布式模式**: 当前直接禁用 BM25，因此不提供 `keyword_search()` 能力
 
-所有 value 参数化传入，所有 key 必须通过 identifier 校验和 allowlist 检查。
+这不是异常降级，而是当前产品边界。  
+分布式场景下，mem0 仍然使用 semantic search 主链路完成召回。
 
-### 10.2 Scope guard
+### 9.3 batch search
 
-商用默认：
+优先走原生 SQL:
 
-```python
-require_scoped_filters=True
-scope_filter_keys=["user_id", "agent_id", "run_id"]
-```
+- 用 `VALUES` 构造 query vector 集
+- 用窗口函数 `ROW_NUMBER() OVER (PARTITION BY query_index ...)`
 
-读路径包括：
+失败时退化为逐条 `search()`
+
+设计原因:
+
+- 原生 batch 在可用时更高效
+- fallback 保证功能完整性
+
+## 10. filter 设计
+
+### 10.1 scope guard
+
+默认开启 `require_scoped_filters = True`。
+
+要求:
 
 - `search`
 - `keyword_search`
 - `search_batch`
 - `list`
 
-这些路径必须包含能约束整个查询的正向 scope predicate。
+都必须至少带一个正向 scope 条件。
 
-有效例子：
+正向 scope 的定义包括:
+
+- `{"user_id": "u1"}`
+- `{"user_id": {"eq": "u1"}}`
+- `{"user_id": {"in": ["u1", "u2"]}}`
+- 合法 `AND`
+- 所有分支都收敛到正向 scope 的 `OR`
+
+不允许:
+
+- `{"user_id": {"ne": "u1"}}`
+- `{"$or": [{"user_id": "u1"}, {"category": "public"}]}`
+- 仅在 `NOT` 中出现 scope
+
+设计原因:
+
+- 防止用户用布尔逻辑绕过隔离约束。
+
+### 10.2 当前支持的 operator
+
+当前支持:
+
+- 直接值等值
+- `eq`
+- `ne`
+- `in`
+- `nin`
+- `contains`
+- `icontains`
+- `AND/$and`
+- `OR/$or`
+- `NOT/$not`
+
+### 10.3 当前不支持的 operator
+
+`gt/gte/lt/lte` 当前不支持 typed range。
+
+当前行为:
+
+- 记录 warning
+- 按 dict 字面值做等值比较
+
+为什么这么设计:
+
+- 当前 SQL 走的是 `payload->>'key'`，得到的是文本
+- 如果直接用字符串比较，`10 > 2` 会出现错误结果
+- 错误结果比显式不支持更危险
+
+### 10.4 为什么不直接删掉这些 operator
+
+因为 mem0 上层 filter 语义已经公开存在。  
+provider 需要有明确响应，而不是完全不认识该结构。
+
+当前策略是:
+
+- 明确 warning
+- 保证不会误做错误的 range 语义
+
+### 10.5 与其他 provider 对比
+
+| Provider | range 支持情况 |
+|---|---|
+| Qdrant | 原生支持 typed range |
+| GaussDB 当前 | 不支持 typed range |
+| pgvector | 通常不做真正 typed payload range |
+| Azure MySQL | 通常也是 JSON 文本抽取思路 |
+
+结论:
+
+- GaussDB 当前不是最强 filter provider
+- 但当前设计比“假支持字符串 range”更正确
+
+## 11. 管理接口设计
+
+### 11.1 get / update / delete
+
+这三个接口当前都是按 `id` 直接操作，不附带 scope filter。
+
+设计原因:
+
+- 对齐 `VectorStoreBase` 当前契约
+
+代价:
+
+- provider 自身无法独立承诺按 id 的强租户隔离
+
+这需要在上层 API、业务鉴权或更改公共契约时解决。
+
+### 11.2 list
+
+`list()` 返回值保持与 mem0 其他 provider 一致，是:
 
 ```python
-{"user_id": "alice"}
-{"$and": [{"user_id": {"eq": "alice"}}, {"category": "travel"}]}
-{"agent_id": {"in": ["agent-a", "agent-b"]}}
+List[List[OutputData]]
 ```
 
-无效例子：
+而不是直接扁平 list。
 
-```python
-{"$or": [{"user_id": "alice"}, {"category": "public"}]}
-{"user_id": {"ne": "alice"}}
-{"$not": [{"user_id": "alice"}]}
-{"$and": []}
+设计原因:
+
+- 与上层现有使用方式兼容
+
+### 11.3 reset
+
+`reset()` 的语义是:
+
+```text
+drop collection + schema_meta
+recreate collection
 ```
 
-原因：
+设计原因:
 
-- `$or` 中某个分支有 scope，不代表整个查询被 scope 约束。
-- `ne/nin/not` 是负向条件，不能证明只查询某个租户。
-- 空逻辑条件不能提供隔离。
+- 用于测试和全量重置场景
 
-## 11. Metadata fallback 设计
+### 11.4 analyze
 
-早期设计中 `metadata_column_mode` 同时承担 payload 存储和 filter 实现两件事，容易导致 JSONB fallback 到 text 后 filters 不可用。当前设计拆为两个维度：
+`analyze()` 当前单独走 autocommit。
 
-| 维度 | 参数 | 可选值 |
-|---|---|---|
-| payload 存储 | `payload_storage_mode` | `jsonb`、`text` |
-| filter 实现 | `filter_storage_mode` | `json_expression`、`redundant_columns` |
+设计原因:
 
-组合规则：
+- 分布式环境已验证 `ANALYZE` 不能在 transaction block 中执行
+- 集中式与分布式统一走 autocommit 更稳
 
-| payload | filter | 是否允许 | 说明 |
-|---|---|---|---|
-| `jsonb` | `json_expression` | 是 | 优先模式。 |
-| `jsonb` | `redundant_columns` | 是 | JSON payload + scope 冗余列。 |
-| `text` | `redundant_columns` | 是 | A 模式兼容模式。 |
-| `text` | `json_expression` | 否 | text payload 无法执行 JSON expression filters。 |
+## 12. retry 与观测设计
 
-## 12. 事务、重试与错误处理
+### 12.1 retry
 
-### 12.1 事务边界
+当前只对明显瞬态错误重试:
 
-- `create_col` 在事务内创建主表、schema meta 和索引。
-- 可选 BM25 DDL 使用 savepoint 保护。
-- `insert`、`update`、`delete`、`reset` 使用明确 commit/rollback。
-- `_get_cursor(commit=True)` 统一管理连接归还。
-
-### 12.2 重试规则
-
-可重试错误包括：
-
-- connection 中断
+- connection
 - timeout
 - deadlock
 - lock wait
 - serialization failure
-- server closed connection
 
-不可重试错误包括：
+设计原因:
 
-- 输入校验失败
-- unsafe identifier
-- 不支持 filter operator
-- schema/config mismatch
-- SQL 语法或类型错误
+- 对永久性 SQL 错误重试没有意义
+- 只对短暂性数据库抖动兜底
 
-### 12.3 BM25 fallback
+### 12.2 metrics
 
-BM25 是增强能力：
+当前 provider 内部会维护简单计数:
 
-- `bm25_mode=auto`：BM25 DDL/query 失败时禁用 keyword search。
-- `bm25_mode=required`：失败即抛错。
-- `bm25_mode=disabled`：不创建 BM25 索引，`keyword_search` 返回 `None`。
-
-## 13. 迁移与运维设计
-
-### 13.1 Schema version
-
-Provider 使用 collection 级 schema meta 跟踪：
-
-- schema version
-- payload/filter 模式
-- vector index type
-- vector metric
-- BM25 状态
-
-`col_info()` 返回真实 schema version 和当前能力信息。
-
-### 13.2 Migration dry-run
-
-`migration_dry_run()` 输出当前 v1 helper 能力：
-
-- 当前 collection 与 schema 状态。
-- 需要回填的派生字段。
-- 预计影响行数。
-- 不会修改数据。
-- 对完整跨版本 schema migration 的局限说明。
-
-### 13.3 Backfill
-
-`backfill_derived_fields()` 用于：
-
-- 从 payload/memory 回填 `text_lemmatized`。
-- 回填 redundant scope columns。
-- 对 text payload 场景报告需要应用层重算的记录。
-
-### 13.4 Analyze
-
-`analyze()` 执行表统计维护，便于优化器选择更稳定的执行计划。
-
-### 13.5 `_ensure_indexes()`
-
-索引确保能力被设计为私有方法，只用于内部建表/修复路径。它只做 `CREATE INDEX IF NOT EXISTS`，不承诺 drop/recreate，也不作为 mem0 标准公共接口暴露。
-
-## 14. 观测设计
-
-Provider 内部维护轻量 metrics：
-
-- operation latency
 - fallback count
 - retry count
 - error count
-- BM25 fallback count
+- latency count
 
-日志原则：
+设计目的:
 
-- 慢查询超过 `slow_query_ms` 记录 warning。
-- 错误日志记录 operation 和脱敏错误分类。
-- 不输出 password、token、完整 DSN 或敏感 payload。
+- 作为最小可观测性基础
+- 为后续导出到日志/监控系统预留接口
 
-## 15. 与现有 provider 对比
+## 13. 测试设计
 
-| 能力 | pgvector | Qdrant | MongoDB | Elasticsearch/OpenSearch | GaussDB |
-|---|---|---|---|---|---|
-| 标准 CRUD | 支持 | 支持 | 支持 | 支持 | 支持 |
-| SQL/事务 | 支持 | 不适用 | 部分 | 不适用 | 支持 |
-| 原生向量索引 | pgvector | Qdrant | Atlas Vector Search | kNN/vector | `FLOATVECTOR` + `gsdiskann/gsivfflat` |
-| `keyword_search` | 支持 | 支持 | 支持 | 支持 | 支持 |
-| `search_batch` override | 不支持 | 支持 | 不支持 | 不支持 | 支持 |
-| 商用 scope guard | 不强制 | 不强制 | 不强制 | 不强制 | 默认强制 |
-| 能力探测 fallback | 较少 | 客户端能力固定 | 依赖服务 | 依赖服务 | 支持 |
-| JSON fallback | 不突出 | payload 原生 | 文档原生 | 文档原生 | JSONB/TEXT 拆维 fallback |
-| BM25 事务保护 | 不突出 | 不适用 | 服务侧 | 服务侧 | savepoint 保护 |
-| 真实库能力矩阵 | 较少 | mock 为主 | mock 为主 | 需要服务 | P0/e2e/quality 覆盖 |
+### 13.1 unit tests
 
-结论：
+覆盖:
 
-- GaussDB 对齐了 `pgvector` 的 SQL provider 基础能力。
-- GaussDB 对齐了 Qdrant 的 `search_batch` 增强能力。
-- GaussDB 对齐了 Elasticsearch/OpenSearch 的关键词检索能力。
-- GaussDB 额外补齐了商用隔离、A 模式 fallback、Ustore/BM25 事务保护和真实库验收。
+- 配置校验
+- capability probe
+- DDL SQL
+- fallback
+- filter 语义
+- retry / rollback
+- analyze autocommit
 
-## 16. 测试设计
+### 13.2 centralized live tests
 
-### 16.1 Mock 单测
+覆盖:
 
-`tests/vector_stores/test_gaussdb.py` 覆盖：
+- CRUD
+- filter matrix
+- scope guard
+- UTF-8 / multilang
+- BM25
+- search_batch
+- e2e memory flow
 
-- 配置默认值和 alias。
-- high-level mode 到 low-level mode 映射。
-- factory 注册。
-- unsafe identifier 拒绝。
-- Ustore/vector/BM25/filter index SQL。
-- 能力探测 fallback。
-- BM25 savepoint。
-- batch insert set-based SQL。
-- semantic search score normalization。
-- scope guard 正反例。
-- keyword search。
-- batch search fallback。
-- update partial payload 和 redundant columns 保留。
-- transaction rollback。
-- schema version 读取。
-- migration/backfill report。
+### 13.3 commercial validation suite
 
-### 16.2 Live P0
+这是最接近交付门禁的一层:
 
-`tests/vector_stores/test_gaussdb_p0.py` 覆盖真实 GaussDB：
+- collection contract
+- CRUD and batch
+- filter matrix
+- unsupported range behavior
+- vector order
+- UTF-8
+- keyword search
+- distributed smoke
 
-- `Memory.from_config` 上层链路。
-- provider CRUD、upsert、update、delete。
-- scope search/list/batch 隔离。
-- JSON filter operator matrix。
-- compatibility profile。
-- UTF-8 中文和中英混合 round trip。
-- cosine/l2 metric。
-- native batch 与 sequential 一致性。
-- collection operations。
-- migration/backfill。
-- BM25 keyword search。
-- index/metric matrix。
+## 14. 已知限制
 
-### 16.3 E2E 和质量测试
+1. 未支持 typed metadata range。
+2. `get/update/delete` 无 scope guard。
+3. 公共配置还没有暴露更细粒度 BM25 / metadata 策略开关。
+4. 分布式场景已具备代码路径和样例，但商用结论仍依赖客户环境复验。
 
-`test_gaussdb_e2e.py`：
+## 15. 设计结论
 
-- 用较少用例串起 Ustore、vector、BM25、CRUD、batch。
-- 验证 redundant scope partial update。
+GaussDB 当前设计不是“能力最多”的 provider，但它已经形成了一条很清晰的商用设计路线:
 
-`test_gaussdb_quality.py`：
+- 用单 collection 实例模型保持接口干净
+- 用 capability probe 吞掉环境差异
+- 用 scope guard 强化商用默认安全性
+- 用 savepoint 和 fallback 保护可选能力
+- 用明确 warning 代替错误的伪兼容
 
-- 固定质量回放。
-- 并发操作。
-- benchmark 报告。
-
-### 16.4 已执行结果
-
-```text
-pytest tests/vector_stores/test_gaussdb.py \
-       tests/vector_stores/test_gaussdb_p0.py \
-       tests/vector_stores/test_gaussdb_e2e.py \
-       tests/vector_stores/test_gaussdb_quality.py -q
-
-96 passed, 1 skipped
-```
-
-真实库 P0：
-
-```text
-pytest tests/vector_stores/test_gaussdb_p0.py -q
-
-22 passed
-```
-
-## 17. 使用示例
-
-### 17.1 环境变量
-
-```powershell
-$env:GAUSSDB_HOST="<host>"
-$env:GAUSSDB_PORT="19995"
-$env:GAUSSDB_DATABASE="<database>"
-$env:GAUSSDB_USER="<user>"
-$env:GAUSSDB_PASSWORD="<password>"
-```
-
-### 17.2 mem0 配置
-
-```python
-from mem0 import Memory
-
-memory = Memory.from_config({
-    "vector_store": {
-        "provider": "gaussdb",
-        "config": {
-            "collection_name": "mem0_memories",
-            "embedding_model_dims": 1536,
-            "profile": "commercial",
-            "metadata_mode": "auto",
-            "bm25_mode": "auto",
-        },
-    },
-    "embedder": {
-        "provider": "openai",
-        "config": {
-            "model": "text-embedding-3-small",
-            "api_key": "<api-key>",
-        },
-    },
-    "llm": {
-        "provider": "openai",
-        "config": {
-            "model": "gpt-4o-mini",
-            "api_key": "<api-key>",
-        },
-    },
-})
-```
-
-### 17.3 写入与检索
-
-```python
-memory.add(
-    "用户喜欢早晨喝拿铁咖啡，出差时优先选择靠窗座位。",
-    user_id="user-001",
-    agent_id="travel-agent",
-    run_id="run-20260428",
-)
-
-result = memory.search(
-    "帮用户安排明早的航班和早餐",
-    filters={"user_id": "user-001"},
-    top_k=5,
-)
-```
-
-## 18. 分布式兼容模式
-
-当前 provider 增加了显式部署形态配置：
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `deployment_mode` | `centralized` | `centralized` 或 `distributed`。 |
-| `distribution_mode` | `auto` | `auto` 在集中式下解析为 `none`，在分布式下解析为 `hash`。 |
-
-当 `deployment_mode="distributed"` 且 `distribution_mode="auto/hash"` 时，建表 DDL 会追加分布式子句：
-
-```sql
-CREATE TABLE <collection> (...) WITH (storage_type=ustore)
-DISTRIBUTE BY HASH ("id");
-
-CREATE TABLE <collection>_schema_meta (...) WITH (storage_type=ustore)
-DISTRIBUTE BY HASH ("collection_name");
-```
-
-选择 `id` 作为主表分布键的原因是：当前 mem0 标准 provider 接口里 `get/update/delete/upsert` 都以 `id` 为稳定主键，`DISTRIBUTE BY HASH (“id”)` 能保持主键约束和 DML 语义简单，避免为了分布键改写 mem0 公共接口。
-
-### 18.2 分布式模式 BM25 约束
-
-GaussDB 分布式模式当前不支持 BM25 索引。Provider 在 `__init__` 中进行早期检测：
-
-```python
-if self.deployment_mode == “distributed” and self.bm25_enabled:
-    if self.bm25_fail_fast:
-        raise ValueError(“bm25_mode='required' is incompatible with deployment_mode='distributed'”)
-    logger.info(“BM25 disabled: not supported in distributed deployment mode”)
-    self.bm25_enabled = False
-```
-
-行为：
-
-| `bm25_mode` | `deployment_mode=distributed` 时行为 |
-|---|---|
-| `auto` | 自动禁用 BM25，`keyword_search` 返回 `None`，不影响向量检索。 |
-| `required` | 抛出 `ValueError`，阻止实例化。 |
-| `disabled` | 无影响，BM25 本身已禁用。 |
-
-这确保分布式部署不会在运行时因 BM25 索引创建失败而产生不可预期的行为。
-
-### 18.3 分布式模式定位
-
-这个实现定位是”分布式兼容模式”，不是最终”分布式性能优化模式”。它可以验证分布式库上的建表、写入、向量检索、filter 和 collection 生命周期；但对于大规模多租户检索，`user_id/agent_id/run_id + vector top-k` 查询仍可能跨 DN 扫描。后续如果要做商用性能优化，应引入 `scope_hash` 或 scope 映射表，并同步改造主键、upsert、get/update/delete、批量检索和迁移方案。
-
-## 19. 已知限制与后续演进
-
-| 限制 | 当前处理 | 后续方向 |
-|---|---|---|
-| `get(id)` 无 filters | 文档明确 provider-level 无法 scope。 | Memory/API 层增加 scoped get。 |
-| 完整 migration framework 尚未实现 | 提供 v1 dry-run/backfill helper。 | 增加 schema inspector、可执行 plan、rollback plan。 |
-| BM25 多语言质量需要业务语料校验 | 默认使用 GaussDB 参数 + 质量回放。 | 建立中文、英文、中英混合 benchmark。 |
-| 分布式当前为兼容模式 | `DISTRIBUTE BY HASH ("id")`，不改变 mem0 标准接口。 | 评估 `scope_hash` 分布、全局 top-k 代价和数据倾斜。 |
-| 全仓测试依赖大量可选 SDK | GaussDB 测试单独可跑。 | CI matrix 按 provider extras 拆分。 |
-| 大规模性能数据仍依赖目标环境 | 提供 benchmark 报告入口。 | 在商用规格环境建立 P95 门禁。 |
-
-## 20. 设计结论
-
-GaussDB provider 当前设计可以作为 mem0 的生产级 SQL/vector provider：
-
-- 标准接口完整。
-- 增强接口覆盖 `keyword_search` 和 `search_batch`。
-- 与 `pgvector` 在基础生命周期上对齐。
-- 与 Qdrant 在 batch search 上对齐。
-- 与 Elasticsearch/OpenSearch 在 keyword search 上对齐。
-- 在 GaussDB 商用场景额外提供 Ustore、A 模式 fallback、scope guard、能力探测、BM25 事务保护和真实库验收。
-
-后续工作重点不是补齐基础接口，而是围绕商用交付继续加强：
-
-- 更完整的 migration framework。
-- 更明确的 scoped `get` 上层契约。
-- 更多真实业务语料质量回放。
-- 大规模性能和稳定性门禁。
+从工程判断上看，这套设计是稳的，也适合继续向交付文档和生产门禁推进。

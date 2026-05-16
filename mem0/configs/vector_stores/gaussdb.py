@@ -49,6 +49,10 @@ class GaussDBConfig(BaseModel):
 
     # Operational
     auto_create: bool = Field(True, description="Automatically create collection on init if it does not exist")
+    require_scoped_filters: bool = Field(
+        True,
+        description="Require at least one positive scoped filter (user_id, agent_id, run_id) on read paths; strongly recommended for production multi-tenant use",
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -71,10 +75,14 @@ class GaussDBConfig(BaseModel):
         if not values.get("connection_string"):
             user, password = values.get("user"), values.get("password")
             host, port = values.get("host"), values.get("port")
+            if bool(user) != bool(password):
+                raise ValueError("When 'connection_string' is not provided, both 'user' and 'password' must be provided together.")
             if not user and not password:
-                raise ValueError("Either 'connection_string' or 'user'+'password' must be provided.")
+                raise ValueError("Either 'connection_string' or both 'user' and 'password' must be provided.")
+            if bool(host) != bool(port):
+                raise ValueError("When 'connection_string' is not provided, both 'host' and 'port' must be provided together.")
             if not host and not port:
-                raise ValueError("Either 'connection_string' or 'host'+'port' must be provided.")
+                raise ValueError("Either 'connection_string' or both 'host' and 'port' must be provided.")
         return values
 
     @model_validator(mode="after")
@@ -90,6 +98,20 @@ class GaussDBConfig(BaseModel):
                 f"GaussDB distributed mode only supports embedding dimensions <= 1024, "
                 f"but embedding_model_dims={self.embedding_model_dims}."
             )
+        if self.deployment_mode == "centralized" and self.embedding_model_dims > 4096:
+            raise ValueError(
+                f"GaussDB centralized mode only supports embedding dimensions <= 4096, "
+                f"but embedding_model_dims={self.embedding_model_dims}."
+            )
+        if self.embedding_model_dims > 1024 and self.vector_index_type != "gsdiskann":
+            raise ValueError(
+                f"embedding_model_dims={self.embedding_model_dims} exceeds 1024; "
+                f"only GsDiskANN supports >1024 dimensions. Set vector_index_type='gsdiskann'."
+            )
+        if self.minconn < 1:
+            raise ValueError("minconn must be >= 1")
+        if self.maxconn < 1:
+            raise ValueError("maxconn must be >= 1")
         if self.maxconn < self.minconn:
             raise ValueError("maxconn must be >= minconn")
         return self

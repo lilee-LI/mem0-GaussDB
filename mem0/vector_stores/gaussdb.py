@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 _FILTER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+_MEMORY_SETTING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]+)\s*$")
 _RETRYABLE_ERROR_FRAGMENTS = (
     "connection",
     "timeout",
@@ -97,6 +98,7 @@ class GaussDB(VectorStoreBase):
         vector_index_type: str = "gsdiskann",
         vector_metric: str = "cosine",
         auto_create: bool = True,
+        require_scoped_filters: bool = True,
     ):
         connection_string = connection_string or _first_env("GAUSSDB_CONNECTION_STRING", "GAUSSDB_DSN", "GAUSSDB_URL")
         database = _first_env("GAUSSDB_DATABASE", "GAUSSDB_DBNAME") or database
@@ -157,7 +159,7 @@ class GaussDB(VectorStoreBase):
         self.payload_storage_mode = "jsonb"
         self.filter_storage_mode = "json_expression"
         self.metadata_column_mode = "jsonb"
-        self.require_scoped_filters = True
+        self.require_scoped_filters = bool(require_scoped_filters)
         self.scope_filter_keys = ("user_id", "agent_id", "run_id")
         self.allowed_filter_keys = None
         self.enable_observability = True
@@ -184,15 +186,30 @@ class GaussDB(VectorStoreBase):
         self.connection_pool = self._create_connection_pool()
         self._probe_capabilities()
 
+        if not self.require_scoped_filters:
+            logger.warning(
+                "GaussDB scope guard is disabled (require_scoped_filters=False). "
+                "This is not recommended for production multi-tenant environments."
+            )
+
         if auto_create:
             collections = self.list_cols()
             if self.collection_name not in collections:
                 self.create_col(vector_size=self.embedding_model_dims, distance=self.vector_metric)
 
+    @property
+    def enable_bm25(self) -> bool:
+        """Backward-compatible alias for older tests/config snippets."""
+        return self.bm25_enabled
+
+    @enable_bm25.setter
+    def enable_bm25(self, value: bool) -> None:
+        self.bm25_enabled = bool(value)
+
     @staticmethod
     def _validate_positive_int(value: int, field_name: str) -> int:
-        if value < 0:
-            raise ValueError(f"{field_name} must be non-negative")
+        if value <= 0:
+            raise ValueError(f"{field_name} must be >= 1")
         return value
 
     @staticmethod
@@ -274,7 +291,7 @@ class GaussDB(VectorStoreBase):
         ]
         if missing:
             raise ValueError(
-                "GaussDB connection requires connection_pool, connection_string, or individual fields. "
+                "GaussDB connection requires connection_string or individual fields. "
                 f"Missing: {', '.join(missing)}"
             )
 
@@ -660,11 +677,56 @@ class GaussDB(VectorStoreBase):
         return ""
 
     def _set_vector_index_maintenance_work_mem(self, cur):
-        mem = self.vector_index_maintenance_work_mem
-        if self.embedding_model_dims > 1024 and mem == "128MB":
-            mem = "2GB"
-        if mem:
-            cur.execute("SET LOCAL maintenance_work_mem = %s", (mem,))
+        target_mem = self.vector_index_maintenance_work_mem
+        if self.embedding_model_dims > 1024 and target_mem == "128MB":
+            target_mem = "2GB"
+        if not target_mem:
+            return
+
+        target_bytes = self._parse_memory_setting_bytes(target_mem)
+        if target_bytes is None:
+            cur.execute("SET LOCAL maintenance_work_mem = %s", (target_mem,))
+            return
+
+        try:
+            cur.execute("SHOW maintenance_work_mem")
+            current_row = cur.fetchone()
+            current_value = current_row[0] if current_row else None
+            current_bytes = self._parse_memory_setting_bytes(current_value)
+        except Exception:
+            logger.debug("Unable to read current maintenance_work_mem; applying provider target", exc_info=True)
+            current_bytes = None
+
+        if current_bytes is None or current_bytes < target_bytes:
+            cur.execute("SET LOCAL maintenance_work_mem = %s", (target_mem,))
+
+    @staticmethod
+    def _parse_memory_setting_bytes(value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return int(value)
+        match = _MEMORY_SETTING_RE.match(str(value))
+        if not match:
+            return None
+        amount = float(match.group(1))
+        unit = match.group(2).lower()
+        multipliers = {
+            "b": 1,
+            "bytes": 1,
+            "kb": 1024,
+            "kib": 1024,
+            "mb": 1024 ** 2,
+            "mib": 1024 ** 2,
+            "gb": 1024 ** 3,
+            "gib": 1024 ** 3,
+            "tb": 1024 ** 4,
+            "tib": 1024 ** 4,
+        }
+        multiplier = multipliers.get(unit)
+        if multiplier is None:
+            return None
+        return int(amount * multiplier)
 
     def _create_bm25_index(self, cur, table: str, index_name: Optional[str] = None):
         index_name = index_name or self._quote_identifier(self._index_name(self.collection_name, "bm25_idx"))
@@ -1164,8 +1226,23 @@ class GaussDB(VectorStoreBase):
 
     def analyze(self) -> None:
         def op():
-            with self._get_cursor(commit=True) as cur:
-                cur.execute(f"ANALYZE {self.table_name}")
+            conn = self.connection_pool.getconn()
+            previous_autocommit = getattr(conn, "autocommit", False)
+            try:
+                if self.client_encoding:
+                    conn.set_client_encoding(self.client_encoding)
+                conn.autocommit = True
+                cur = conn.cursor()
+                try:
+                    cur.execute(f"ANALYZE {self.table_name}")
+                finally:
+                    cur.close()
+            finally:
+                try:
+                    conn.autocommit = previous_autocommit
+                except Exception:
+                    logger.debug("Failed to restore autocommit after ANALYZE", exc_info=True)
+                self.connection_pool.putconn(conn)
 
         return self._run_with_retry("analyze", op)
 

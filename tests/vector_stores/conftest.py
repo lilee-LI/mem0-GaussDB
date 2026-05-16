@@ -96,7 +96,7 @@ def _gaussdb_env_config(collection_name: str, **overrides) -> Optional[Dict[str,
         {
             "collection_name": collection_name,
             "embedding_model_dims": EMBEDDING_DIMS,
-            "vector_index_type": os.getenv("GAUSSDB_TEST_VECTOR_INDEX", "gsivfflat"),
+            "vector_index_type": os.getenv("GAUSSDB_TEST_VECTOR_INDEX", "gsdiskann"),
             "deployment_mode": os.getenv("GAUSSDB_TEST_DEPLOYMENT_MODE", "centralized"),
             "auto_create": True,
         }

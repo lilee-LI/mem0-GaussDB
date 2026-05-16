@@ -1,403 +1,392 @@
-# mem0 GaussDB 适配需求分析文档
-
-> 生成日期：2026-04-28  
-> 代码基线：`codex/add-gaussdb-ustore-provider`，当前提交 `463718fc`  
-> 范围：mem0 OSS Python 版 GaussDB vector store provider，目标数据库形态为 GaussDB 集中式、A 兼容模式、Ustore、`FLOATVECTOR`、向量索引与 BM25。
-
-## 1. 背景
-
-mem0 是面向 AI 应用的长期记忆层。它负责把用户对话、业务事件或 agent 运行过程中的信息抽取为 memory，再通过 embedding、向量检索、关键词检索、过滤隔离和更新删除能力，为后续 LLM 请求提供长期上下文。
-
-当前 mem0 已经支持多种 vector store provider，包括 `pgvector`、`qdrant`、`mongodb`、`elasticsearch`、`opensearch`、`milvus`、`pinecone`、`weaviate`、`faiss` 等。GaussDB 团队希望把 GaussDB 作为 mem0 的一等 provider，使企业用户可以把 AI memory 数据落在 GaussDB 商用数据库中，而不是强依赖外部专用向量库或搜索服务。
-
-本适配的核心价值是：
-
-- 复用 GaussDB 已有的企业级数据库能力：事务、连接、权限、备份、审计、运维体系。
-- 用 GaussDB 原生 `FLOATVECTOR` 和向量索引承载 mem0 semantic search。
-- 用 GaussDB 原生 BM25 承载 mem0 `keyword_search`，补齐混合检索链路。
-- 通过 `user_id`、`agent_id`、`run_id` 的 scope filters 满足多租户 memory 隔离。
-- 面向集中式 A 模式 Ustore 商用形态提供能力探测、fallback、测试和验收口径。
-
-## 2. 目标用户与使用场景
-
-### 2.1 目标用户
-
-| 用户角色 | 诉求 |
-|---|---|
-| GaussDB 产品与解决方案团队 | 需要展示 GaussDB 可承载 AI memory 和向量检索业务。 |
-| AI 应用开发者 | 希望用 mem0 快速接入长期记忆，不想单独维护多个存储系统。 |
-| 企业客户 DBA/运维 | 希望 memory 数据留在企业数据库内，便于权限、备份、审计和监控。 |
-| 平台架构师 | 需要评估 GaussDB 与 pgvector、Qdrant、MongoDB 等 provider 的能力差异。 |
-| 测试与交付团队 | 需要明确 P0/P1/P2 验收项、真实库验证方式和边界条件。 |
-
-### 2.2 典型应用场景
-
-| 场景 | mem0 的作用 | GaussDB 适配价值 |
-|---|---|---|
-| AI 个人助理 | 记住用户偏好、习惯、历史任务。 | 使用 scope filters 隔离不同用户，向量 + BM25 找回相关偏好。 |
-| 智能客服 | 记住客户历史问题、工单状态、产品偏好。 | memory 与企业业务数据同库治理，便于审计和删除。 |
-| 企业知识助手 | 记住员工查询习惯、项目上下文和团队术语。 | 数据留在企业数据库，降低外部服务依赖。 |
-| Agent 平台 | 按 agent/run 记住任务过程、约束和阶段性结果。 | `agent_id`、`run_id` 可直接映射为 GaussDB filter/index。 |
-| CRM Copilot | 记住客户画像、沟通记录和下一步动作。 | 关系型数据库更容易和既有 CRM 数据链路集成。 |
-| 合规行业助手 | 需要隔离、可审计、可删除、可回溯 memory。 | GaussDB 的事务、权限和运维能力更适合商用合规。 |
-
-## 3. 范围
-
-### 3.1 本期范围
-
-本期适配覆盖 mem0 Python 版 vector store provider：
-
-- 在 mem0 factory/config 路径中注册 `gaussdb` provider。
-- 实现 `VectorStoreBase` 标准接口：
-  - `create_col`
-  - `insert`
-  - `search`
-  - `delete`
-  - `update`
-  - `get`
-  - `list_cols`
-  - `delete_col`
-  - `col_info`
-  - `list`
-  - `reset`
-- 实现 mem0 可选增强接口：
-  - `keyword_search`
-  - `search_batch`
-- 支持 GaussDB 集中式 A 模式 Ustore 表。
-- 支持 GaussDB 分布式兼容建表模式，用于在分布式库上验证 mem0 provider 基础链路。
-- 分布式模式自动禁用 BM25（`bm25_mode=auto` 时静默禁用，`bm25_mode=required` 时快速失败）。
-- 支持 `FLOATVECTOR`、`gsdiskann`、`gsivfflat`。
-- 支持 BM25 索引和 BM25 score 查询（集中式模式）。
-- 支持 metadata filters 和商用默认 scope 隔离。
-- 支持能力探测、fallback、schema metadata、回填、观测指标和真实库测试。
+# mem0 GaussDB 适配需求分析
 
-### 3.2 非目标范围
+> 更新时间: 2026-05-16  
+> 适用范围: `mem0.vector_stores.gaussdb.GaussDB` 当前实现  
+> 目标读者: 产品经理、架构师、数据库研发、测试、交付、售前
 
-- 不修改 GaussDB 内核。
-- 不实现 GaussDB 控制台、云服务编排或自动建库。
-- 不改变 mem0 上层 `Memory` API 的公共接口。
-- 不实现 graph store。当前 mem0 该路径下主要通过 vector store 和 entity collection 支撑 entity memory。
-- 不默认引入 Astore 影子表。Ustore + vector + BM25 是本期主路径。
-- 不在本期承诺分布式性能最优模型。当前分布式适配以 `id` hash 分布保证兼容；scope-hash、跨 DN 全局 top-k 优化和数据倾斜治理属于后续优化范围。
-- 不承诺 provider-level `get(vector_id)` 的租户过滤，因为 mem0 标准接口没有 `filters` 参数；强隔离 ID 查询需要上层 API 或 Memory 层补充。
+## 1. 文档目标
 
-## 4. 现状分析
+本文档回答四个问题:
 
-### 4.1 mem0 provider 接口现状
+1. mem0 到底如何使用一个 vector store provider。
+2. GaussDB 适配要解决哪些真实业务问题。
+3. 其他主流 provider 是怎么设计的，GaussDB 应该对齐什么，不应该盲目对齐什么。
+4. 以当前代码实现为准，集中式和分布式分别已经做到什么程度，还存在哪些边界。
 
-mem0 的 `VectorStoreBase` 定义了标准生命周期接口，并提供默认的 `keyword_search` 和 `search_batch`：
+本文档是需求分析，不展开具体 SQL 细节和类图；具体实现见技术设计文档。
 
-- 标准接口用于 collection 与 memory record 的增删改查。
-- `keyword_search` 默认返回 `None`，表示 provider 不支持关键词检索。
-- `search_batch` 默认逐条调用 `search`，provider 可以覆盖为原生批量查询。
+## 2. 背景
 
-从现有 provider 看：
+mem0 的定位不是普通聊天记录存档，而是 AI 应用的长期记忆层。它把对话和业务事实转成可检索的 memory，再通过语义检索、关键词检索、实体增强和 metadata filter，把相关记忆在后续请求时召回给模型。
 
-| Provider 类型 | 代表 | 适配重点 |
-|---|---|---|
-| PostgreSQL/SQL 型 | `pgvector`、`supabase`、`azure_mysql` | 表结构、连接池、事务、JSON payload、向量 SQL。 |
-| 专用向量库 | `qdrant`、`milvus`、`pinecone`、`weaviate` | collection/index 创建、payload filter、向量检索。 |
-| 搜索引擎型 | `elasticsearch`、`opensearch` | 向量检索 + keyword/BM25 检索。 |
-| 文档数据库型 | `mongodb` | 文档 payload、Atlas vector search、text search。 |
-| 本地索引型 | `faiss` | 本地索引文件、序列化安全、简单 filter。 |
+对企业客户来说，单独再引入一个外部向量库往往会带来以下问题:
 
-GaussDB 与 `pgvector` 最接近，但相比普通 PostgreSQL 适配，需要额外处理：
+- 数据分散，审计和备份链路变复杂。
+- 用户、Agent、Run 等隔离语义无法直接复用现有数据库治理。
+- 运维团队不愿意为一个 memory 子系统额外维护一套新基础设施。
+- 需要一个可直接纳入企业数据库标准体系的商用落地方案。
 
-- A 兼容模式类型/索引可用性差异。
-- Ustore 表存储要求。
-- GaussDB `FLOATVECTOR` 与向量索引语法。
-- GaussDB BM25 索引语法和 score 查询。
-- 商用多租户隔离策略。
-- 能力探测和兼容 fallback。
+GaussDB 适配的目标，就是让 mem0 的长期记忆能力可以直接落在 GaussDB 上，并尽可能保持与 mem0 现有 provider 生态一致的使用体验。
 
-### 4.2 已验证的数据库能力
+## 3. 问题定义
 
-本期实现以真实 GaussDB 环境验证为依据：
+GaussDB 适配不是“写一个表，塞 embedding”这么简单。它至少要同时满足以下几件事:
 
-- `FLOATVECTOR` 列可用于向量存储。
-- `gsdiskann` 与 `gsivfflat` 可用于向量索引。
-- `cosine` 默认 metric 可通过 `<+>` 执行距离计算。
-- `l2` metric 可通过 `<->` 执行距离计算。
-- Ustore 表上可以创建 BM25 索引并执行 score 查询。
-- `maintenance_work_mem` 可通过 session-local `SET LOCAL` 辅助向量索引构建。
-- UTF-8 数据库可正确承载中文和中英混合 memory。
+- 接上 mem0 的标准 provider 契约。
+- 让 `Memory.add/search/update/delete/get_all` 能真实跑通。
+- 支持向量检索和可选关键词检索。
+- 支持商用场景必须要有的 scope 隔离。
+- 在 GaussDB 能力存在版本差异、DDL 差异、索引差异时，做出明确而可解释的降级。
+- 提供足够完备的测试样例，能作为交付门禁。
 
-### 4.3 主要差距
+## 4. mem0 使用路径走读
 
-在适配前，mem0 没有 GaussDB provider，用户无法通过：
+### 4.1 初始化路径
 
-```python
-Memory.from_config({
-    "vector_store": {
-        "provider": "gaussdb",
-        "config": {...}
-    }
-})
-```
-
-直接把 memory 落到 GaussDB。
-
-同时，简单照搬 `pgvector` 也不够：
-
-- GaussDB A 模式可能不完全支持 PostgreSQL JSONB/UUID/表达式索引路径。
-- GaussDB 向量类型和索引语法不是 pgvector extension 的 `vector`/HNSW/IVFFlat 语法。
-- 商用默认需要 scope 强隔离，而 `pgvector` 适配没有 provider-level scope guard。
-- BM25 建索引失败不能破坏主表和向量索引创建事务。
-- 需要真实库 P0/P1/P2 验收，不只是 mock SQL 单测。
-
-## 5. 业务需求
-
-### BR-01 支持 GaussDB 作为 mem0 长期记忆存储
-
-用户应能通过 mem0 标准配置选择 `provider: gaussdb`，并使用 `Memory.add/search/update/delete` 完成 memory 生命周期管理。
-
-验收标准：
-
-- `Memory.from_config` 能实例化 GaussDB provider。
-- `add` 写入后可以通过 `search` 找回。
-- `update` 后检索结果可见。
-- `delete` 后记录不再出现在 `get/list/search/keyword_search` 中。
-
-### BR-02 支持企业级数据隔离
-
-商用默认配置下，读路径应要求携带 `user_id`、`agent_id` 或 `run_id` 至少一个正向 scope 条件。
-
-验收标准：
-
-- 无 scope 的 `search/list/keyword_search/search_batch` 被拒绝。
-- 只在 `$or`、`not` 或负向条件中出现 scope 时不得绕过隔离。
-- 多租户数据同 collection 下存储时，带 scope 查询只返回匹配租户记录。
-
-### BR-03 支持语义检索与关键词检索
-
-GaussDB provider 应同时支持 semantic vector search 和 BM25 keyword search，以匹配 mem0 hybrid memory search 的调用链。
-
-验收标准：
-
-- `search` 返回 score 越大越相关的结果。
-- `keyword_search` 在 BM25 可用时返回 BM25 score 排序结果。
-- BM25 不可用且配置允许 fallback 时，不影响 semantic search。
-
-### BR-04 支持 GaussDB 商用基线差异
-
-不同 GaussDB 506/507 小版本和 A 模式能力可能存在差异，provider 不应硬编码所有能力假设，而应通过能力探测和配置 fallback 决定实际执行路径。
-
-验收标准：
-
-- JSONB 不可用时可 fallback 到 text payload。
-- JSON 表达式索引不可用时可 fallback 到 redundant scope columns。
-- BM25 建索引失败时可按配置禁用 keyword search 或 fail fast。
-- vector 必需能力不可用时应 fail fast。
-
-### BR-05 提供可交付的测试与文档
-
-适配不仅需要代码，还需要单测、真实库测试、质量回放、性能报告和运维说明。
-
-验收标准：
-
-- mock 单测覆盖配置、SQL 生成、事务、fallback 和 filter。
-- live P0 覆盖真实 GaussDB CRUD、检索、隔离、BM25、中文、batch 和 index matrix。
-- 文档说明配置、能力、限制、验收命令和故障排查。
-
-## 6. 功能需求
-
-| 编号 | 需求 | 优先级 | 说明 |
-|---|---|---|---|
-| FR-01 | Provider 注册 | P0 | `gaussdb` 可通过 mem0 config/factory 创建。 |
-| FR-02 | 配置模型 | P0 | 支持连接、collection、维度、profile、metadata、BM25、索引、重试、观测配置。 |
-| FR-03 | Ustore schema | P0 | 每个 collection 映射为一张 Ustore 表和一张 schema meta 表。 |
-| FR-04 | 向量写入 | P0 | 支持单条/批量 insert，并按 id upsert。 |
-| FR-05 | 向量检索 | P0 | 支持 cosine 默认检索和 l2 可选检索。 |
-| FR-06 | Metadata filters | P0 | 支持安全 filter key、参数化值和等值/集合/包含/逻辑操作；`gt/gte/lt/lte` range 语义不在本期 P0。 |
-| FR-07 | Scope 强隔离 | P0 | 商用默认要求正向 scope predicate。 |
-| FR-08 | BM25 keyword search | P0 | 支持空 query、BM25 默认参数、失败 fallback。 |
-| FR-09 | Update/delete/get/list | P0 | 对齐 mem0 标准生命周期语义。 |
-| FR-10 | Batch search | P1 | 支持 entity store 和多 query 批量检索。 |
-| FR-11 | 能力探测 | P1 | 检测 vector、index、BM25、JSONB、UUID、表达式索引。 |
-| FR-12 | 兼容模式 | P1 | `profile=compatibility` 使用更保守的 metadata/index 路径。 |
-| FR-13 | Schema metadata | P1 | `col_info` 返回真实 schema version 和能力信息。 |
-| FR-14 | Migration/backfill helper | P2 | 提供 dry-run 和派生字段回填能力。 |
-| FR-15 | Observability | P2 | 提供 latency、fallback、retry、error metrics 与日志。 |
-| FR-16 | Analyze/index ensure | P2 | 提供内部索引确保与表统计维护能力。 |
-
-## 7. 非功能需求
-
-### 7.1 安全
-
-- 所有用户值必须通过 driver 参数绑定，不允许字符串拼接。
-- collection/table/index/filter key 这类 SQL identifier 必须经过 allowlist 校验。
-- 日志和异常不得泄露 password、token、完整 DSN。
-- 测试代码不得包含真实公网地址、用户名或密码默认值。
-
-### 7.2 可靠性
-
-- DDL/DML 必须有明确事务边界。
-- BM25 等可选能力失败应通过 savepoint 或独立事务隔离，不能拖垮主表和向量索引。
-- 可重试错误仅限连接抖动、锁等待、死锁、序列化冲突等瞬态错误。
-- 输入校验和 schema mismatch 不应重试。
-
-### 7.3 性能
-
-- 批量 insert 不应逐行 DML，应使用 set-based SQL 路径。
-- 查询必须在数据库侧应用 filters 和 top-k，避免全量拉回 Python 排序。
-- Scope fields 在 redundant columns 模式下必须有索引。
-- `gsdiskann` 建索引需要允许配置 `maintenance_work_mem`。
-
-### 7.4 兼容性
-
-- 运行时使用 GaussDB 官方兼容 `psycopg2` API。
-- 支持 `connection_string`、`dsn`、`url` 别名和 `GAUSSDB_*` 环境变量。
-- 支持 `uuid` 和 `varchar` id fallback。
-- 支持 `jsonb` payload 和 `text` payload fallback。
-
-### 7.5 可维护性
-
-- 高层配置优先简单：`profile`、`metadata_mode`、`bm25_mode`。
-- 低层配置保留专家调优能力：`payload_storage_mode`、`filter_storage_mode`、`bm25_enabled`、`bm25_fail_fast` 等。
-- 不新增非标准公共接口污染 mem0 provider 契约；索引修复能力保持私有 `_ensure_indexes()`。
-
-## 8. 配置需求
-
-### 8.1 推荐最小配置
-
-```python
-config = {
-    "host": "<gaussdb-host>",
-    "port": 19995,
-    "database": "<database>",
-    "user": "<user>",
-    "password": "<password>",
-    "collection_name": "mem0_memories",
-    "embedding_model_dims": 1536,
-    "profile": "commercial",
-    "metadata_mode": "auto",
-    "bm25_mode": "auto",
-}
-```
-
-### 8.2 高层配置
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `profile` | `commercial` | 商用默认。启用 Ustore、能力探测、scope guard、BM25 auto。 |
-| `profile=compatibility` | 无 | 更保守模式，倾向 text payload、redundant filters、`gsivfflat`。 |
-| `metadata_mode` | `auto` | 自动选择 `jsonb/json_expression`，失败时 fallback。 |
-| `metadata_mode=compatible/text` | 无 | 使用 text payload + redundant scope columns。 |
-| `bm25_mode` | `auto` | 尝试 BM25，失败时允许禁用。 |
-| `bm25_mode=required` | 无 | BM25 不可用则 fail fast。 |
-| `bm25_mode=disabled` | 无 | 禁用 keyword search。 |
-
-### 8.3 专家配置
-
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `vector_index_type` | `gsdiskann` | 可选 `gsdiskann`、`gsivfflat`。 |
-| `vector_metric` | `cosine` | 可选 `cosine`、`l2`。 |
-| `payload_storage_mode` | 由高层模式派生 | `jsonb` 或 `text`。 |
-| `filter_storage_mode` | 由高层模式派生 | `json_expression` 或 `redundant_columns`。 |
-| `require_scoped_filters` | `True` | 商用读路径强制 scope。 |
-| `scope_filter_keys` | `user_id/agent_id/run_id` | 可作为租户隔离字段的 key。 |
-| `allowed_filter_keys` | `None` | 额外限制可查询 metadata key。 |
-| `bm25_ranking_metric` | `0` | GaussDB BM25 OKAPI 默认。 |
-| `bm25_ncandidates` | `128` | BM25 candidate count。 |
-| `bm25_dictionary` | `None` | 使用数据库默认 dictionary。 |
-
-## 9. 验收需求
-
-### 9.1 P0 验收
-
-P0 证明“能真实使用”：
-
-- `Memory.from_config` 上层链路接入 GaussDB。
-- provider CRUD、batch upsert、update、delete。
-- scope search/list/batch 不串租户。
-- 非约束性 scope filters 被拒绝。
-- JSON payload filter operator matrix。
-- compatibility profile 与 redundant scope partial update。
-- UTF-8 中文和中英混合 payload round trip。
-- payload-only、vector-only update。
-- cosine/l2 metric exact-match 检索。
-- native batch search 与 sequential search 一致。
-- schema info、analyze、reset、list_cols。
-- migration dry-run 与 backfill helper。
-- BM25 keyword search scoped 行为和空 query 行为。
-- `gsdiskann`/`gsivfflat` 与 `cosine`/`l2` 组合建索引和检索。
-
-### 9.2 P1 验收
-
-P1 证明“商用风险可控”：
-
-- 能力探测 fallback 正确。
-- BM25 建索引失败通过 savepoint 保护事务。
-- JSONB 失败 fallback 到 text payload + redundant filters。
-- scope guard 无法通过 `$or`、`not`、负向条件绕过。
-- `col_info` 读取 schema meta 中的真实 schema version。
-- batch search fallback 语义清晰。
-- 部分 payload update 不清空 redundant scope columns。
-
-### 9.3 P2 验收
-
-P2 证明“可运维、可演进”：
-
-- migration dry-run 输出 action、影响行数和限制说明。
-- `backfill_derived_fields` 可回填 `text_lemmatized` 和 redundant scope columns。
-- `analyze` 可维护统计信息。
-- quality replay 包含语义召回、关键词命中、隔离、更新可见性、删除残留。
-- benchmark 可输出 insert/search/update/delete 延迟报告。
-
-## 10. 测试现状
-
-当前仓库已具备以下测试文件：
-
-| 文件 | 作用 |
-|---|---|
-| `tests/vector_stores/test_gaussdb.py` | Mock 单测，覆盖配置、SQL、filters、fallback、事务、update、schema。 |
-| `tests/vector_stores/test_gaussdb_p0.py` | 真实库 P0 验收，覆盖 Memory 链路和核心商用能力。 |
-| `tests/vector_stores/test_gaussdb_e2e.py` | 真实库 e2e，用较少用例串起 Ustore/vector/BM25/CRUD/batch。 |
-| `tests/vector_stores/test_gaussdb_quality.py` | 质量回放、并发和 benchmark 报告。 |
-
-已执行结果：
+以 `Memory.from_config(...)` 为入口，mem0 的关键初始化链路如下:
 
 ```text
-pytest tests/vector_stores/test_gaussdb.py \
-       tests/vector_stores/test_gaussdb_p0.py \
-       tests/vector_stores/test_gaussdb_e2e.py \
-       tests/vector_stores/test_gaussdb_quality.py -q
-
-96 passed, 1 skipped
+Memory.from_config
+  -> MemoryConfig 校验
+  -> EmbedderFactory.create(...)
+  -> VectorStoreFactory.create("gaussdb", ...)
+  -> GaussDB(...)
+     -> 创建连接池
+     -> capability probe
+     -> auto_create 时检查 collection 是否存在
+     -> create_col()
 ```
 
-单独真实库 P0：
+对 GaussDB 适配而言，这意味着:
+
+- provider 必须能被 `VectorStoreFactory` 正确注册和构造。
+- 构造阶段就要完成运行时能力确认。
+- collection 生命周期必须是 provider 自管理，而不能依赖用户手工先建完整 schema。
+
+### 4.2 写入路径
+
+`Memory.add(...)` 的主路径如下:
 
 ```text
-pytest tests/vector_stores/test_gaussdb_p0.py -q
-
-22 passed
+Memory.add
+  -> 校验 user_id / agent_id / run_id
+  -> 组装 metadata
+  -> infer=True 时做 memory 提取
+  -> embedder 生成向量
+  -> vector_store.insert(vectors, payloads, ids)
 ```
 
-mem0 全仓测试说明：
+GaussDB provider 需要承接的真实需求:
 
-- 全仓存在 900+ 测试，但许多 provider 测试需要可选 SDK 或真实云服务环境。
-- 当前本地 `pytest tests --collect-only -q` 可收集 916 项，因缺少 Azure、MongoDB、Milvus、Chroma、Pinecone、Weaviate 等可选依赖产生 collection errors。
-- 这不是 GaussDB 适配失败，而是 mem0 多 provider 测试体系的依赖隔离现状。
+- 支持单条和批量写入。
+- 支持基于 id 的 upsert。
+- 自动从 payload 派生 `memory` 与 `text_lemmatized`。
+- 在商用默认下，把 `user_id / agent_id / run_id` 写入 payload，并在需要时写入冗余列。
 
-## 11. 风险与约束
+### 4.3 查询路径
 
-| 风险 | 影响 | 缓解 |
-|---|---|---|
-| GaussDB 小版本能力差异 | JSONB、UUID、表达式索引、BM25 语法可能不同。 | 能力探测 + fallback + fail-fast。 |
-| BM25 语言质量差异 | 中文/中英混合排序可能需要调参。 | 固定质量回放集 + 暴露 BM25 参数。 |
-| Scope 配置不当 | 可能导致跨租户读取。 | 商用默认 `require_scoped_filters=True`。 |
-| 非 UTF-8 数据库 | 中文 payload 可能乱码或失败。 | 中文验收要求 UTF-8 数据库。 |
-| 大规模建索引资源消耗 | `gsdiskann` 建索引可能受内存限制。 | `SET LOCAL maintenance_work_mem` + 文档化运维前置条件。 |
-| `get(id)` 无 filters | provider 层无法过滤 ID 查询。 | 文档明确限制，必要时在 Memory/API 层补 scope 校验。 |
+`Memory.search(...)` 的主路径如下:
 
-## 12. 交付物
+```text
+Memory.search
+  -> 校验 filters 至少包含 user_id / agent_id / run_id 之一
+  -> 识别高级 metadata operator
+  -> embed query
+  -> vector_store.search(...)
+  -> vector_store.keyword_search(...)
+  -> entity boost
+  -> score_and_rank
+```
 
-- GaussDB provider 代码：`mem0/vector_stores/gaussdb.py`
-- GaussDB config 模型：`mem0/configs/vector_stores/gaussdb.py`
-- factory/config 注册路径：`mem0/vector_stores/configs.py`、`mem0/utils/factory.py`
-- 单测与真实库测试：`tests/vector_stores/test_gaussdb*.py`
-- 深度说明与对比文档：`docs/gaussdb-mem0-integration-deep-dive.md`
-- 本需求分析文档：`docs/gaussdb-mem0-requirements-analysis.md`
-- 技术设计文档：`docs/gaussdb-mem0-technical-design.md`
+这里有两个关键点:
+
+1. mem0 上层会暴露 `eq/ne/in/nin/gt/gte/lt/lte/contains/icontains/AND/OR/NOT` 这套 filter 接口。
+2. 但每个 provider 并不一定完整支持所有 operator。
+
+因此，GaussDB 的需求不是“机械支持所有接口名”，而是:
+
+- 对支持的能力，要行为正确。
+- 对不支持的能力，要语义明确、结果可解释、不要静默产生错误结果。
+
+### 4.4 更新与删除路径
+
+`Memory.update(...)` 和 `Memory.delete(...)` 在 mem0 当前架构里，最终都会走 provider 的 `update(id, ...)` 与 `delete(id)`。
+
+这意味着一个天然事实:
+
+- provider 层的 `get/update/delete` 是按 id 操作。
+- mem0 标准接口本身并没有把 scope filter 一并传给这些方法。
+
+所以如果业务要求“按 id 的读写也必须强租户隔离”，那是上层 API 或鉴权层的责任，不是单个 vector store provider 在当前契约下能独立彻底解决的问题。
+
+## 5. 目标用户与典型场景
+
+### 5.1 目标用户
+
+- 需要把 AI memory 纳入企业数据库体系的客户。
+- 希望直接复用 GaussDB 运维体系的数据库团队。
+- 需要构建 Agent 平台、知识助理、智能客服、CRM Copilot 的应用研发团队。
+- 需要有一套可测试、可验收、可交付口径的售前和交付团队。
+
+### 5.2 典型场景
+
+- 单用户长期偏好记忆
+- 多租户 SaaS 助手
+- Agent / Run 过程记忆
+- 企业知识问答辅助记忆
+- 审计敏感场景下的可删除、可追踪 memory 存储
+
+## 6. 需求规划
+
+### 6.1 P0 需求
+
+P0 的定义是“必须能作为一个可用 provider 跑通 mem0 主链路”。
+
+- `provider=gaussdb` 可通过 `Memory.from_config` 初始化。
+- 支持集中式 GaussDB collection 自动创建。
+- 支持 `insert/search/update/delete/get/list/reset/col_info/list_cols`。
+- 支持 `search_batch`。
+- 集中式支持 BM25，可降级。
+- 支持 `eq/ne/in/nin/contains/icontains` 及 `AND/OR/NOT`。
+- 默认要求 `user_id / agent_id / run_id` 中至少一个正向 scope filter。
+- UTF-8 client encoding 明确设置为 `UTF8`。
+- capability probe 能识别向量、JSONB、BM25、表达式索引等能力。
+- 当表达式索引不可用时，metadata filter 语义不丢。
+
+### 6.2 P1 需求
+
+P1 的定义是“商用风险要可解释、可验证”。
+
+- JSONB 不可用时退化到 text payload + redundant scope columns。
+- BM25 不可用时只关闭关键词检索，不拖垮主链路。
+- `search_batch` 原生 SQL 失败时可退化为逐条搜索。
+- 有 live tests 和 commercial validation tests。
+- 对集中式与分布式边界有明确说明。
+
+### 6.3 P2 需求
+
+P2 的定义是“便于长期交付与维护”。
+
+- `migration_dry_run`
+- `backfill_derived_fields`
+- `analyze`
+- retry / slow query / fallback metrics
+- 更细的迁移与运维文档
+
+## 7. 友商与现有 provider 设计分析
+
+这里的“友商”主要指 mem0 现有 provider 设计，而不是数据库厂商对外营销口径。
+
+### 7.1 pgvector
+
+特点:
+
+- 典型 SQL provider。
+- `create_col()` 只操作当前实例绑定的 collection。
+- 连接池默认 `minconn=1, maxconn=5`。
+- 过滤通常依赖 `payload->>'key'` 这种 JSON 文本抽取。
+- 没有 provider-level scope guard。
+
+对 GaussDB 的启发:
+
+- 单 collection 实例模型是合理的。
+- 显式连接池参数是合理的。
+- SQL/JSON 类 provider 天生更难做 typed range。
+
+### 7.2 Azure MySQL
+
+特点:
+
+- 也是 SQL provider。
+- 默认连接池也是 `1/5`。
+- `create_col(name=...)` 能创建别的表，但后续 CRUD 仍主要绑定当前实例的 collection。
+- `JSON_EXTRACT` 为主，filter 语义偏文本。
+
+对 GaussDB 的启发:
+
+- 半支持多表名很容易造成语义混乱。
+- 如果不打算做完整多 collection 管理，就应该明确采用单 collection 实例模型。
+
+### 7.3 MongoDB
+
+特点:
+
+- 文档模型，filter 天然按 `payload.key` 走。
+- 不需要额外设计 scope 冗余列。
+- Atlas Search 与向量检索是两套索引体系。
+
+对 GaussDB 的启发:
+
+- metadata filter 能力与索引能力应该解耦。
+- 即使索引创建失败，也不应该把 filter 语义砍掉。
+
+### 7.4 Qdrant
+
+特点:
+
+- 原生 typed payload filter。
+- 支持 numeric range 与 datetime range。
+- 不需要用户额外声明 SQL cast，因为底层 payload 本身就是 typed。
+
+对 GaussDB 的启发:
+
+- `gt/gte/lt/lte` 在 Qdrant 这类引擎里天然成立。
+- 但 GaussDB 当前实现基于 `payload->>'key'`，得到的是文本，不具备自动 typed range 基础。
+
+因此，GaussDB 当前阶段不支持 typed range 是可以接受的，但必须在文档和测试里明确。
+
+### 7.5 OpenSearch / Elasticsearch / Redis
+
+特点:
+
+- 更多依赖搜索引擎或 schema 化字段。
+- 通常对部分 filter 字段有较强支持，但不一定等价于任意 payload JSON 范式。
+
+对 GaussDB 的启发:
+
+- 不是所有 provider 都支持任意复杂 metadata operator。
+- “和友商一致”更应该理解为语义清晰、边界明确，而不是表面上暴露同名 operator。
+
+## 8. 当前 GaussDB 适配的需求落地状态
+
+### 8.1 已完成
+
+- provider 注册完成。
+- `GaussDBConfig` 可校验连接、维度、部署模式、索引类型、连接池大小。
+- 集中式主链路实现完成。
+- 分布式兼容路径实现完成。
+- expression index fallback 已修正为“降性能、不降语义”。
+- `create_col` 已收敛为单 collection 实例模型。
+- range operator 已明确设为“不支持 typed range，warning + literal equality”。
+- `analyze()` 已改成 autocommit 路径。
+- 商用门禁测试文件已建立。
+
+### 8.2 明确边界
+
+- 当前不支持 typed range。
+- 当前 `get/update/delete` 不带 scope guard。
+- BM25 是 auto-enable / auto-disable 语义，不是 required/fail-fast 语义。
+- 分布式模式当前不支持 BM25，因此也不提供 `keyword_search` 能力。
+- 集中式是主推荐模式；分布式已做兼容实现和样例，但商用结论仍依赖客户内网实库复验。
+
+## 9. 关键设计要求
+
+### 9.1 强 scope 隔离
+
+这是 GaussDB 方案区别于多数现有 SQL provider 的关键点之一。
+
+要求:
+
+- `search`
+- `keyword_search`
+- `search_batch`
+- `list`
+
+默认都必须要求至少一个正向 scope filter。
+
+原因:
+
+- 商用 memory 场景天然多租户。
+- 相比“默认全表可搜”，强约束更适合企业交付。
+
+### 9.2 结果正确性优先于表面兼容
+
+对 `gt/gte/lt/lte` 的策略就是这个原则的体现。
+
+不应因为 mem0 上层暴露了某个 operator，就在底层用错误的字符串比较强行“假支持”。  
+错误结果比明确不支持更危险。
+
+### 9.3 索引能力与过滤语义解耦
+
+JSON expression index 失败，不应导致 metadata filter 只剩 `user_id / agent_id / run_id`。
+
+正确做法是:
+
+- JSONB 可用 -> 任意 metadata filter 继续可用
+- 表达式索引失败 -> 只是少了加速
+- JSONB 本身不可用 -> 才退化到 text + redundant columns
+
+### 9.4 单实例单 collection 模型
+
+`self.collection_name` 只有一个。  
+因此 GaussDB provider 不应该假装支持 `create_col(name="other")` 这种动态切表语义。
+
+## 10. 验收口径
+
+### 10.1 单元测试
+
+覆盖以下内容:
+
+- 配置校验
+- 建表 SQL
+- 索引创建
+- capability probe
+- fallback 行为
+- filter 语义
+- retry / rollback / analyze
+
+### 10.2 集中式 live tests
+
+重点验证:
+
+- CRUD
+- filter matrix
+- scope isolation
+- UTF-8
+- BM25
+- batch search
+- e2e memory 链路
+
+### 10.3 商用门禁样例
+
+`test_gaussdb_commercial_validation.py` 用于承接更明确的交付验收，包括:
+
+- collection contract
+- CRUD smoke
+- filter matrix
+- unsupported range behavior
+- vector order and top_k
+- UTF-8 roundtrip
+- keyword search
+- distributed smoke
+
+## 11. 需求结论
+
+基于当前实现，GaussDB 集中式已经满足以下结论:
+
+- 能作为 mem0 的一个可用 provider 落地。
+- 能支撑主流商用 memory 场景。
+- 在 SQL/JSON 类 provider 中，设计已经比较扎实。
+
+但同时也必须明确:
+
+- 它还不是“所有 mem0 provider 中能力最强”的实现。
+- 它没有对齐 Qdrant 这类原生 typed payload range 能力。
+- 它也不能脱离上层鉴权，单独承诺按 id 的强租户隔离。
+
+因此，最准确的产品口径应是:
+
+> GaussDB 集中式已经可以完整支撑 mem0 的核心商用场景；当前已知边界主要是 typed range 未支持，以及按 id 的管理接口仍需上层鉴权配合。
+
+## 12. 后续建议
+
+建议将后续工作分两条线推进:
+
+1. 商用交付线
+   - 保持集中式主路径稳定。
+   - 完善用户手册、部署说明、故障排查。
+   - 用 commercial validation suite 作为交付门禁。
+
+2. 能力增强线
+   - 如果后续确实有强需求，再设计 typed metadata range。
+   - 如果要承诺更强隔离，再推动上层 API 契约扩展。
+   - 分布式场景继续做公司内网实库复验，沉淀单独结论。
+
+## 13. 配置分层建议
+
+为了降低对外接入复杂度，同时保留商用部署所需的调优空间，建议将 GaussDB 配置按两层表达:
+
+- 基础项: 建议显式填写，包括连接信息、`collection_name`、`embedding_model_dims`、`deployment_mode`
+- 高阶项: 可以不填，由 provider 提供默认值，包括 `sslmode`、`sslrootcert`、`minconn`、`maxconn`、`vector_index_type`、`vector_metric`、`auto_create`、`require_scoped_filters`
+
+这里的“基础项”当前是交付和文档层面的约定，不是运行时硬性必填。当前代码仍然保留默认值，但商用接入时建议显式写出这些关键字段，避免落入默认 collection、默认维度或默认部署模式。
