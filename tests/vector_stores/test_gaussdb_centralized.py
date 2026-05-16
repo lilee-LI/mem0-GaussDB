@@ -158,135 +158,103 @@ def _load_quality_cases():
 class TestCRUD:
     """Basic CRUD operations: insert, get, update, delete, list, search."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="crud")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_insert_single_and_get(self):
         """Insert a single record and retrieve it by ID."""
-        db = _new_db(prefix="crud")
-        try:
-            vid = _uuid(1)
-            _insert_memories(db, [(vid, VECTOR_COFFEE, _make_payload("I love coffee", "alice"))])
-            result = db.get(vid)
-            assert result is not None
-            assert result.id == vid
-            assert result.payload["data"] == "I love coffee"
-            assert result.payload["user_id"] == "alice"
-        finally:
-            db.delete_col()
+        vid = _uuid(1)
+        _insert_memories(self.db, [(vid, VECTOR_COFFEE, _make_payload("I love coffee", "crud_insert"))])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.id == vid
+        assert result.payload["data"] == "I love coffee"
+        assert result.payload["user_id"] == "crud_insert"
 
     def test_insert_batch_and_list(self):
         """Insert multiple records and list them."""
-        db = _new_db(prefix="crud")
-        try:
-            records = [
-                (_uuid(10), VECTOR_COFFEE, _make_payload("coffee memory", "alice")),
-                (_uuid(11), VECTOR_FLIGHT, _make_payload("flight memory", "alice")),
-                (_uuid(12), VECTOR_WINDOW, _make_payload("window seat", "alice")),
-            ]
-            _insert_memories(db, records)
-            listed = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
-            assert len(listed) == 3
-            _assert_exact_ids(listed, {_uuid(10), _uuid(11), _uuid(12)})
-        finally:
-            db.delete_col()
+        records = [
+            (_uuid(10), VECTOR_COFFEE, _make_payload("coffee memory", "crud_batch")),
+            (_uuid(11), VECTOR_FLIGHT, _make_payload("flight memory", "crud_batch")),
+            (_uuid(12), VECTOR_WINDOW, _make_payload("window seat", "crud_batch")),
+        ]
+        _insert_memories(self.db, records)
+        listed = _list_flat(self.db, filters={"user_id": "crud_batch"}, top_k=100)
+        assert len(listed) == 3
+        _assert_exact_ids(listed, {_uuid(10), _uuid(11), _uuid(12)})
 
     def test_upsert_existing_record(self):
         """Upsert (MERGE INTO) updates existing record without creating duplicate."""
-        db = _new_db(prefix="crud")
-        try:
-            vid = _uuid(20)
-            _insert_memories(db, [(vid, VECTOR_COFFEE, _make_payload("original", "alice"))])
-            db.update(vector_id=vid, payload=_make_payload("updated", "alice"))
-            result = db.get(vid)
-            assert result.payload["data"] == "updated"
-            listed = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
-            assert len(listed) == 1
-        finally:
-            db.delete_col()
+        vid = _uuid(20)
+        _insert_memories(self.db, [(vid, VECTOR_COFFEE, _make_payload("original", "crud_upsert"))])
+        self.db.update(vector_id=vid, payload=_make_payload("updated", "crud_upsert"))
+        result = self.db.get(vid)
+        assert result.payload["data"] == "updated"
+        listed = _list_flat(self.db, filters={"user_id": "crud_upsert"}, top_k=100)
+        assert len(listed) == 1
 
     def test_update_vector(self):
         """Update the vector of an existing record."""
-        db = _new_db(prefix="crud")
-        try:
-            vid = _uuid(21)
-            _insert_memories(db, [(vid, VECTOR_COFFEE, _make_payload("coffee", "alice"))])
-            db.update(vector_id=vid, vector=VECTOR_FLIGHT)
-            results = db.search("flight", VECTOR_FLIGHT, top_k=1, filters={"user_id": "alice"})
-            assert len(results) >= 1
-            assert results[0].id == vid
-        finally:
-            db.delete_col()
+        vid = _uuid(21)
+        _insert_memories(self.db, [(vid, VECTOR_COFFEE, _make_payload("coffee", "crud_upvec"))])
+        self.db.update(vector_id=vid, vector=VECTOR_FLIGHT)
+        results = self.db.search("flight", VECTOR_FLIGHT, top_k=1, filters={"user_id": "crud_upvec"})
+        assert len(results) >= 1
+        assert results[0].id == vid
 
     def test_delete_by_id(self):
         """Delete a record by ID."""
-        db = _new_db(prefix="crud")
-        try:
-            vid = _uuid(30)
-            _insert_memories(db, [(vid, VECTOR_COFFEE, _make_payload("to delete", "alice"))])
-            db.delete(vector_id=vid)
-            assert db.get(vid) is None
-        finally:
-            db.delete_col()
+        vid = _uuid(30)
+        _insert_memories(self.db, [(vid, VECTOR_COFFEE, _make_payload("to delete", "crud_del"))])
+        self.db.delete(vector_id=vid)
+        assert self.db.get(vid) is None
 
     def test_search_basic(self):
         """Basic vector search returns relevant results."""
-        db = _new_db(prefix="crud")
-        try:
-            _insert_memories(db, [
-                (_uuid(40), VECTOR_COFFEE, _make_payload("coffee lover", "alice")),
-                (_uuid(41), VECTOR_FLIGHT, _make_payload("frequent flyer", "alice")),
-            ])
-            results = db.search("coffee", VECTOR_COFFEE, top_k=2, filters={"user_id": "alice"})
-            assert len(results) >= 1
-            assert results[0].id == _uuid(40)
-        finally:
-            db.delete_col()
+        _insert_memories(self.db, [
+            (_uuid(40), VECTOR_COFFEE, _make_payload("coffee lover", "crud_search")),
+            (_uuid(41), VECTOR_FLIGHT, _make_payload("frequent flyer", "crud_search")),
+        ])
+        results = self.db.search("coffee", VECTOR_COFFEE, top_k=2, filters={"user_id": "crud_search"})
+        assert len(results) >= 1
+        assert results[0].id == _uuid(40)
 
     def test_search_with_top_k(self):
         """Search respects top_k limit."""
-        db = _new_db(prefix="crud")
-        try:
-            records = [(_uuid(50 + i), VECTOR_COFFEE, _make_payload(f"item {i}", "alice")) for i in range(10)]
-            _insert_memories(db, records)
-            results = db.search("item", VECTOR_COFFEE, top_k=3, filters={"user_id": "alice"})
-            assert len(results) <= 3
-        finally:
-            db.delete_col()
+        records = [(_uuid(50 + i), VECTOR_COFFEE, _make_payload(f"item {i}", "crud_topk")) for i in range(10)]
+        _insert_memories(self.db, records)
+        results = self.db.search("item", VECTOR_COFFEE, top_k=3, filters={"user_id": "crud_topk"})
+        assert len(results) <= 3
 
     def test_get_nonexistent_returns_none(self):
         """Get a non-existent ID returns None."""
-        db = _new_db(prefix="crud")
-        try:
-            result = db.get(_uuid(999))
-            assert result is None
-        finally:
-            db.delete_col()
+        result = self.db.get(_uuid(999))
+        assert result is None
 
     def test_delete_nonexistent_no_error(self):
         """Deleting a non-existent ID does not raise."""
-        db = _new_db(prefix="crud")
-        try:
-            db.delete(vector_id=_uuid(998))
-        finally:
-            db.delete_col()
+        self.db.delete(vector_id=_uuid(998))
 
     def test_search_batch(self):
         """search_batch returns results for multiple queries."""
-        db = _new_db(prefix="crud")
-        try:
-            _insert_memories(db, [
-                (_uuid(60), VECTOR_COFFEE, _make_payload("coffee", "alice")),
-                (_uuid(61), VECTOR_FLIGHT, _make_payload("flight", "alice")),
-            ])
-            results = db.search_batch(
-                ["coffee", "flight"],
-                [VECTOR_COFFEE, VECTOR_FLIGHT],
-                top_k=5,
-                filters={"user_id": "alice"},
-            )
-            assert len(results) == 2
-            assert len(results[0]) >= 1
-            assert len(results[1]) >= 1
-        finally:
-            db.delete_col()
+        _insert_memories(self.db, [
+            (_uuid(60), VECTOR_COFFEE, _make_payload("coffee", "crud_sbatch")),
+            (_uuid(61), VECTOR_FLIGHT, _make_payload("flight", "crud_sbatch")),
+        ])
+        results = self.db.search_batch(
+            ["coffee", "flight"],
+            [VECTOR_COFFEE, VECTOR_FLIGHT],
+            top_k=5,
+            filters={"user_id": "crud_sbatch"},
+        )
+        assert len(results) == 2
+        assert len(results[0]) >= 1
+        assert len(results[1]) >= 1
 
 
 
@@ -297,254 +265,143 @@ class TestCRUD:
 class TestSimpleOperators:
     """Tests for eq, ne, in, nin, contains, icontains operators."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="filter_simple")
+        _insert_memories(cls.db, [
+            # eq string (user_id="u100")
+            (_uuid(100), VECTOR_COFFEE, _make_payload("coffee note", user_id="u100", category="food")),
+            (_uuid(101), VECTOR_FLIGHT, _make_payload("flight note", user_id="u100", category="travel")),
+            # eq number (user_id="u110")
+            (_uuid(110), VECTOR_COFFEE, _make_payload("low priority", user_id="u110", priority="3")),
+            (_uuid(111), VECTOR_FLIGHT, _make_payload("high priority", user_id="u110", priority="7")),
+            # eq boolean (user_id="u120")
+            (_uuid(120), VECTOR_COFFEE, _make_payload("active item", user_id="u120", active="true")),
+            (_uuid(121), VECTOR_FLIGHT, _make_payload("inactive item", user_id="u120", active="false")),
+            # ne string (user_id="u130")
+            (_uuid(130), VECTOR_COFFEE, _make_payload("food item", user_id="u130", category="food")),
+            (_uuid(131), VECTOR_FLIGHT, _make_payload("travel item", user_id="u130", category="travel")),
+            (_uuid(132), VECTOR_WINDOW, _make_payload("work item", user_id="u130", category="work")),
+            # ne number (user_id="u140")
+            (_uuid(140), VECTOR_COFFEE, _make_payload("pri 2", user_id="u140", priority="2")),
+            (_uuid(141), VECTOR_FLIGHT, _make_payload("pri 5", user_id="u140", priority="5")),
+            (_uuid(142), VECTOR_WINDOW, _make_payload("pri 8", user_id="u140", priority="8")),
+            # in single (user_id="u150")
+            (_uuid(150), VECTOR_COFFEE, _make_payload("food", user_id="u150", category="food")),
+            (_uuid(151), VECTOR_FLIGHT, _make_payload("travel", user_id="u150", category="travel")),
+            # in multi (user_id="u160")
+            (_uuid(160), VECTOR_COFFEE, _make_payload("food", user_id="u160", category="food")),
+            (_uuid(161), VECTOR_FLIGHT, _make_payload("travel", user_id="u160", category="travel")),
+            (_uuid(162), VECTOR_WINDOW, _make_payload("work", user_id="u160", category="work")),
+            # in empty (user_id="u170")
+            (_uuid(170), VECTOR_COFFEE, _make_payload("food", user_id="u170", category="food")),
+            # nin single (user_id="u180")
+            (_uuid(180), VECTOR_COFFEE, _make_payload("food", user_id="u180", category="food")),
+            (_uuid(181), VECTOR_FLIGHT, _make_payload("travel", user_id="u180", category="travel")),
+            (_uuid(182), VECTOR_WINDOW, _make_payload("work", user_id="u180", category="work")),
+            # nin multi (user_id="u190")
+            (_uuid(190), VECTOR_COFFEE, _make_payload("food", user_id="u190", category="food")),
+            (_uuid(191), VECTOR_FLIGHT, _make_payload("travel", user_id="u190", category="travel")),
+            (_uuid(192), VECTOR_WINDOW, _make_payload("work", user_id="u190", category="work")),
+            # contains exact (user_id="u200")
+            (_uuid(200), VECTOR_COFFEE, _make_payload("coffee shop", user_id="u200", tag="morning-coffee")),
+            (_uuid(201), VECTOR_FLIGHT, _make_payload("flight plan", user_id="u200", tag="evening-flight")),
+            # contains partial (user_id="u210")
+            (_uuid(210), VECTOR_COFFEE, _make_payload("item1", user_id="u210", tag="super-coffee-deluxe")),
+            (_uuid(211), VECTOR_FLIGHT, _make_payload("item2", user_id="u210", tag="no-match-here")),
+            # contains not exists (user_id="u220")
+            (_uuid(220), VECTOR_COFFEE, _make_payload("item", user_id="u220", tag="morning-tea")),
+            # icontains (user_id="u230")
+            (_uuid(230), VECTOR_COFFEE, _make_payload("item1", user_id="u230", tag="MorningCoffee")),
+            (_uuid(231), VECTOR_FLIGHT, _make_payload("item2", user_id="u230", tag="EVENING-COFFEE")),
+            (_uuid(232), VECTOR_WINDOW, _make_payload("item3", user_id="u230", tag="afternoon-tea")),
+            # eq implicit (user_id="u240")
+            (_uuid(240), VECTOR_COFFEE, _make_payload("food item", user_id="u240", category="food")),
+            (_uuid(241), VECTOR_FLIGHT, _make_payload("travel item", user_id="u240", category="travel")),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_eq_string_exact_match(self):
         """eq operator with string value returns exact match."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(100), VECTOR_COFFEE, _make_payload("coffee note", user_id="alice", category="food")),
-                    (_uuid(101), VECTOR_FLIGHT, _make_payload("flight note", user_id="alice", category="travel")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "alice", "category": {"eq": "food"}})
-            _assert_exact_ids(rows, {_uuid(100)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u100", "category": {"eq": "food"}})
+        _assert_exact_ids(rows, {_uuid(100)})
 
     def test_eq_number_exact_match(self):
         """eq operator with numeric value returns exact match."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(110), VECTOR_COFFEE, _make_payload("low priority", user_id="alice", priority="3")),
-                    (_uuid(111), VECTOR_FLIGHT, _make_payload("high priority", user_id="alice", priority="7")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "alice", "priority": {"eq": "7"}})
-            _assert_exact_ids(rows, {_uuid(111)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u110", "priority": {"eq": "7"}})
+        _assert_exact_ids(rows, {_uuid(111)})
 
     def test_eq_boolean_exact_match(self):
         """eq operator with boolean-like value returns exact match."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(120), VECTOR_COFFEE, _make_payload("active item", user_id="alice", active="true")),
-                    (_uuid(121), VECTOR_FLIGHT, _make_payload("inactive item", user_id="alice", active="false")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "alice", "active": {"eq": "true"}})
-            _assert_exact_ids(rows, {_uuid(120)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u120", "active": {"eq": "true"}})
+        _assert_exact_ids(rows, {_uuid(120)})
 
     def test_ne_string_exclusion(self):
         """ne operator excludes matching string value."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(130), VECTOR_COFFEE, _make_payload("food item", user_id="bob", category="food")),
-                    (_uuid(131), VECTOR_FLIGHT, _make_payload("travel item", user_id="bob", category="travel")),
-                    (_uuid(132), VECTOR_WINDOW, _make_payload("work item", user_id="bob", category="work")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "bob", "category": {"ne": "food"}})
-            _assert_exact_ids(rows, {_uuid(131), _uuid(132)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u130", "category": {"ne": "food"}})
+        _assert_exact_ids(rows, {_uuid(131), _uuid(132)})
 
     def test_ne_number_exclusion(self):
         """ne operator excludes matching numeric value."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(140), VECTOR_COFFEE, _make_payload("pri 2", user_id="bob", priority="2")),
-                    (_uuid(141), VECTOR_FLIGHT, _make_payload("pri 5", user_id="bob", priority="5")),
-                    (_uuid(142), VECTOR_WINDOW, _make_payload("pri 8", user_id="bob", priority="8")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "bob", "priority": {"ne": "5"}})
-            _assert_exact_ids(rows, {_uuid(140), _uuid(142)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u140", "priority": {"ne": "5"}})
+        _assert_exact_ids(rows, {_uuid(140), _uuid(142)})
 
     def test_in_single_value(self):
         """in operator with single value list returns matching record."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(150), VECTOR_COFFEE, _make_payload("food", user_id="carol", category="food")),
-                    (_uuid(151), VECTOR_FLIGHT, _make_payload("travel", user_id="carol", category="travel")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "carol", "category": {"in": ["food"]}})
-            _assert_exact_ids(rows, {_uuid(150)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u150", "category": {"in": ["food"]}})
+        _assert_exact_ids(rows, {_uuid(150)})
 
     def test_in_multi_value(self):
         """in operator with multiple values returns all matching records."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(160), VECTOR_COFFEE, _make_payload("food", user_id="carol", category="food")),
-                    (_uuid(161), VECTOR_FLIGHT, _make_payload("travel", user_id="carol", category="travel")),
-                    (_uuid(162), VECTOR_WINDOW, _make_payload("work", user_id="carol", category="work")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10, filters={"user_id": "carol", "category": {"in": ["food", "travel"]}}
-            )
-            _assert_exact_ids(rows, {_uuid(160), _uuid(161)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u160", "category": {"in": ["food", "travel"]}}
+        )
+        _assert_exact_ids(rows, {_uuid(160), _uuid(161)})
 
     def test_in_empty_list_returns_nothing(self):
         """in operator with empty list returns no results."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(170), VECTOR_COFFEE, _make_payload("food", user_id="carol", category="food")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "carol", "category": {"in": []}})
-            assert len(rows) == 0
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u170", "category": {"in": []}})
+        assert len(rows) == 0
 
     def test_nin_single_value(self):
         """nin operator with single value excludes matching record."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(180), VECTOR_COFFEE, _make_payload("food", user_id="dave", category="food")),
-                    (_uuid(181), VECTOR_FLIGHT, _make_payload("travel", user_id="dave", category="travel")),
-                    (_uuid(182), VECTOR_WINDOW, _make_payload("work", user_id="dave", category="work")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "dave", "category": {"nin": ["food"]}})
-            _assert_exact_ids(rows, {_uuid(181), _uuid(182)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u180", "category": {"nin": ["food"]}})
+        _assert_exact_ids(rows, {_uuid(181), _uuid(182)})
 
     def test_nin_multi_value_exclusion(self):
         """nin operator with multiple values excludes all matching records."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(190), VECTOR_COFFEE, _make_payload("food", user_id="dave", category="food")),
-                    (_uuid(191), VECTOR_FLIGHT, _make_payload("travel", user_id="dave", category="travel")),
-                    (_uuid(192), VECTOR_WINDOW, _make_payload("work", user_id="dave", category="work")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10, filters={"user_id": "dave", "category": {"nin": ["food", "travel"]}}
-            )
-            _assert_exact_ids(rows, {_uuid(192)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u190", "category": {"nin": ["food", "travel"]}}
+        )
+        _assert_exact_ids(rows, {_uuid(192)})
 
     def test_contains_exact_substring(self):
         """contains operator matches exact substring."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(200), VECTOR_COFFEE, _make_payload("coffee shop", user_id="eve", tag="morning-coffee")),
-                    (_uuid(201), VECTOR_FLIGHT, _make_payload("flight plan", user_id="eve", tag="evening-flight")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "eve", "tag": {"contains": "coffee"}})
-            _assert_exact_ids(rows, {_uuid(200)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u200", "tag": {"contains": "coffee"}})
+        _assert_exact_ids(rows, {_uuid(200)})
 
     def test_contains_partial_substring(self):
         """contains operator matches partial substring within value."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(210), VECTOR_COFFEE, _make_payload("item1", user_id="eve", tag="super-coffee-deluxe")),
-                    (_uuid(211), VECTOR_FLIGHT, _make_payload("item2", user_id="eve", tag="no-match-here")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "eve", "tag": {"contains": "coffee"}})
-            _assert_exact_ids(rows, {_uuid(210)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u210", "tag": {"contains": "coffee"}})
+        _assert_exact_ids(rows, {_uuid(210)})
 
     def test_contains_not_exists_returns_empty(self):
         """contains operator with non-matching substring returns empty."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(220), VECTOR_COFFEE, _make_payload("item", user_id="eve", tag="morning-tea")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "eve", "tag": {"contains": "coffee"}})
-            assert len(rows) == 0
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u220", "tag": {"contains": "coffee"}})
+        assert len(rows) == 0
 
     def test_icontains_case_insensitive_match(self):
         """icontains operator matches regardless of case."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(230), VECTOR_COFFEE, _make_payload("item1", user_id="eve", tag="MorningCoffee")),
-                    (_uuid(231), VECTOR_FLIGHT, _make_payload("item2", user_id="eve", tag="EVENING-COFFEE")),
-                    (_uuid(232), VECTOR_WINDOW, _make_payload("item3", user_id="eve", tag="afternoon-tea")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "eve", "tag": {"icontains": "coffee"}})
-            _assert_exact_ids(rows, {_uuid(230), _uuid(231)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u230", "tag": {"icontains": "coffee"}})
+        _assert_exact_ids(rows, {_uuid(230), _uuid(231)})
 
     def test_eq_implicit_direct_value(self):
         """Direct value (without eq wrapper) acts as implicit equality filter."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(240), VECTOR_COFFEE, _make_payload("food item", user_id="frank", category="food")),
-                    (_uuid(241), VECTOR_FLIGHT, _make_payload("travel item", user_id="frank", category="travel")),
-                ],
-            )
-            # Direct value without {"eq": ...} wrapper
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "frank", "category": "food"})
-            _assert_exact_ids(rows, {_uuid(240)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u240", "category": "food"})
+        _assert_exact_ids(rows, {_uuid(240)})
 
 
 # ===========================================================================
@@ -555,148 +412,102 @@ class TestSimpleOperators:
 class TestRangeOperators:
     """Tests for gt, gte, lt, lte and combined range operators."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="filter_range")
+        _insert_memories(cls.db, [
+            # gt (user_id="u300")
+            (_uuid(300), VECTOR_COFFEE, _make_payload("pri 2", user_id="u300", priority="2")),
+            (_uuid(301), VECTOR_FLIGHT, _make_payload("pri 5", user_id="u300", priority="5")),
+            (_uuid(302), VECTOR_WINDOW, _make_payload("pri 8", user_id="u300", priority="8")),
+            # gte (user_id="u310")
+            (_uuid(310), VECTOR_COFFEE, _make_payload("pri 2", user_id="u310", priority="2")),
+            (_uuid(311), VECTOR_FLIGHT, _make_payload("pri 5", user_id="u310", priority="5")),
+            (_uuid(312), VECTOR_WINDOW, _make_payload("pri 8", user_id="u310", priority="8")),
+            # lt (user_id="u320")
+            (_uuid(320), VECTOR_COFFEE, _make_payload("pri 2", user_id="u320", priority="2")),
+            (_uuid(321), VECTOR_FLIGHT, _make_payload("pri 5", user_id="u320", priority="5")),
+            (_uuid(322), VECTOR_WINDOW, _make_payload("pri 8", user_id="u320", priority="8")),
+            # lte (user_id="u330")
+            (_uuid(330), VECTOR_COFFEE, _make_payload("pri 2", user_id="u330", priority="2")),
+            (_uuid(331), VECTOR_FLIGHT, _make_payload("pri 5", user_id="u330", priority="5")),
+            (_uuid(332), VECTOR_WINDOW, _make_payload("pri 8", user_id="u330", priority="8")),
+            # combined gte+lte (user_id="u340")
+            (_uuid(340), VECTOR_COFFEE, _make_payload("pri 1", user_id="u340", priority="1")),
+            (_uuid(341), VECTOR_FLIGHT, _make_payload("pri 3", user_id="u340", priority="3")),
+            (_uuid(342), VECTOR_WINDOW, _make_payload("pri 5", user_id="u340", priority="5")),
+            (_uuid(343), VECTOR_AISLE, _make_payload("pri 7", user_id="u340", priority="7")),
+            (_uuid(344), VECTOR_COFFEE, _make_payload("pri 9", user_id="u340", priority="9")),
+            # combined gt+lt exclusive (user_id="u350")
+            (_uuid(350), VECTOR_COFFEE, _make_payload("pri 1", user_id="u350", priority="1")),
+            (_uuid(351), VECTOR_FLIGHT, _make_payload("pri 3", user_id="u350", priority="3")),
+            (_uuid(352), VECTOR_WINDOW, _make_payload("pri 5", user_id="u350", priority="5")),
+            (_uuid(353), VECTOR_AISLE, _make_payload("pri 7", user_id="u350", priority="7")),
+            (_uuid(354), VECTOR_COFFEE, _make_payload("pri 9", user_id="u350", priority="9")),
+            # combined with eq (user_id="u360")
+            (_uuid(360), VECTOR_COFFEE, _make_payload("food pri 2", user_id="u360", category="food", priority="2")),
+            (_uuid(361), VECTOR_FLIGHT, _make_payload("food pri 5", user_id="u360", category="food", priority="5")),
+            (_uuid(362), VECTOR_WINDOW, _make_payload("travel pri 5", user_id="u360", category="travel", priority="5")),
+            # gt date string (user_id="u370")
+            (_uuid(370), VECTOR_COFFEE, _make_payload("old", user_id="u370", created="2024-01-01")),
+            (_uuid(371), VECTOR_FLIGHT, _make_payload("mid", user_id="u370", created="2024-06-15")),
+            (_uuid(372), VECTOR_WINDOW, _make_payload("new", user_id="u370", created="2025-01-01")),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_gt_operator(self):
         """gt operator returns records with value strictly greater than threshold."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(300), VECTOR_COFFEE, _make_payload("pri 2", user_id="range_user", priority="2")),
-                    (_uuid(301), VECTOR_FLIGHT, _make_payload("pri 5", user_id="range_user", priority="5")),
-                    (_uuid(302), VECTOR_WINDOW, _make_payload("pri 8", user_id="range_user", priority="8")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "range_user", "priority": {"gt": "5"}})
-            _assert_exact_ids(rows, {_uuid(302)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u300", "priority": {"gt": "5"}})
+        _assert_exact_ids(rows, {_uuid(302)})
 
     def test_gte_operator(self):
         """gte operator returns records with value greater than or equal to threshold."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(310), VECTOR_COFFEE, _make_payload("pri 2", user_id="range_user", priority="2")),
-                    (_uuid(311), VECTOR_FLIGHT, _make_payload("pri 5", user_id="range_user", priority="5")),
-                    (_uuid(312), VECTOR_WINDOW, _make_payload("pri 8", user_id="range_user", priority="8")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "range_user", "priority": {"gte": "5"}})
-            _assert_exact_ids(rows, {_uuid(311), _uuid(312)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u310", "priority": {"gte": "5"}})
+        _assert_exact_ids(rows, {_uuid(311), _uuid(312)})
 
     def test_lt_operator(self):
         """lt operator returns records with value strictly less than threshold."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(320), VECTOR_COFFEE, _make_payload("pri 2", user_id="range_user", priority="2")),
-                    (_uuid(321), VECTOR_FLIGHT, _make_payload("pri 5", user_id="range_user", priority="5")),
-                    (_uuid(322), VECTOR_WINDOW, _make_payload("pri 8", user_id="range_user", priority="8")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "range_user", "priority": {"lt": "5"}})
-            _assert_exact_ids(rows, {_uuid(320)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u320", "priority": {"lt": "5"}})
+        _assert_exact_ids(rows, {_uuid(320)})
 
     def test_lte_operator(self):
         """lte operator returns records with value less than or equal to threshold."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(330), VECTOR_COFFEE, _make_payload("pri 2", user_id="range_user", priority="2")),
-                    (_uuid(331), VECTOR_FLIGHT, _make_payload("pri 5", user_id="range_user", priority="5")),
-                    (_uuid(332), VECTOR_WINDOW, _make_payload("pri 8", user_id="range_user", priority="8")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "range_user", "priority": {"lte": "5"}})
-            _assert_exact_ids(rows, {_uuid(330), _uuid(331)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u330", "priority": {"lte": "5"}})
+        _assert_exact_ids(rows, {_uuid(330), _uuid(331)})
 
     def test_range_combined_gte_lte(self):
         """Combined gte + lte creates an inclusive range filter."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(340), VECTOR_COFFEE, _make_payload("pri 1", user_id="range_user", priority="1")),
-                    (_uuid(341), VECTOR_FLIGHT, _make_payload("pri 3", user_id="range_user", priority="3")),
-                    (_uuid(342), VECTOR_WINDOW, _make_payload("pri 5", user_id="range_user", priority="5")),
-                    (_uuid(343), VECTOR_AISLE, _make_payload("pri 7", user_id="range_user", priority="7")),
-                    (_uuid(344), VECTOR_COFFEE, _make_payload("pri 9", user_id="range_user", priority="9")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10, filters={"user_id": "range_user", "priority": {"gte": "3", "lte": "7"}}
-            )
-            _assert_exact_ids(rows, {_uuid(341), _uuid(342), _uuid(343)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u340", "priority": {"gte": "3", "lte": "7"}},
+        )
+        _assert_exact_ids(rows, {_uuid(341), _uuid(342), _uuid(343)})
 
-    def test_gt_negative_numbers(self):
-        """gt operator with negative number strings uses lexicographic comparison."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(350), VECTOR_COFFEE, _make_payload("neg", user_id="range_user", score="-5")),
-                    (_uuid(351), VECTOR_FLIGHT, _make_payload("zero", user_id="range_user", score="0")),
-                    (_uuid(352), VECTOR_WINDOW, _make_payload("pos", user_id="range_user", score="5")),
-                ],
-            )
-            # Note: JSON string comparison is lexicographic, so "-5" > "-3" is true
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "range_user", "score": {"gt": "-3"}})
-            _assert_exact_ids(rows, {_uuid(350), _uuid(351), _uuid(352)})
-        finally:
-            db.delete_col()
+    def test_range_combined_gt_lt_exclusive(self):
+        """Combined gt + lt creates an exclusive range filter."""
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u350", "priority": {"gt": "1", "lt": "9"}},
+        )
+        _assert_exact_ids(rows, {_uuid(351), _uuid(352), _uuid(353)})
 
-    def test_gt_float_values(self):
-        """gt operator works with float value strings."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(360), VECTOR_COFFEE, _make_payload("low", user_id="range_user", rating="2.5")),
-                    (_uuid(361), VECTOR_FLIGHT, _make_payload("mid", user_id="range_user", rating="4.2")),
-                    (_uuid(362), VECTOR_WINDOW, _make_payload("high", user_id="range_user", rating="4.9")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "range_user", "rating": {"gt": "4.0"}})
-            _assert_exact_ids(rows, {_uuid(361), _uuid(362)})
-        finally:
-            db.delete_col()
+    def test_range_combined_with_eq(self):
+        """Range filter combined with eq on another field."""
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u360", "category": "food", "priority": {"gte": "3"}},
+        )
+        _assert_exact_ids(rows, {_uuid(361)})
 
     def test_gt_date_string(self):
         """gt operator works with ISO date strings for lexicographic comparison."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(370), VECTOR_COFFEE, _make_payload("old", user_id="range_user", created="2024-01-01")),
-                    (_uuid(371), VECTOR_FLIGHT, _make_payload("mid", user_id="range_user", created="2024-06-15")),
-                    (_uuid(372), VECTOR_WINDOW, _make_payload("new", user_id="range_user", created="2025-01-01")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10, filters={"user_id": "range_user", "created": {"gt": "2024-06-01"}}
-            )
-            _assert_exact_ids(rows, {_uuid(371), _uuid(372)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10, filters={"user_id": "u370", "created": {"gt": "2024-06-01"}}
+        )
+        _assert_exact_ids(rows, {_uuid(371), _uuid(372)})
 
 
 # ===========================================================================
@@ -707,151 +518,105 @@ class TestRangeOperators:
 class TestLogicalCombinationOperators:
     """Tests for AND, OR, NOT logical operators."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="filter_logic")
+        _insert_memories(cls.db, [
+            # test_and_implicit_two_keys (user_id="u400")
+            (_uuid(400), VECTOR_COFFEE, _make_payload("food hi", user_id="u400", category="food", priority="7")),
+            (_uuid(401), VECTOR_FLIGHT, _make_payload("food lo", user_id="u400", category="food", priority="2")),
+            (_uuid(402), VECTOR_WINDOW, _make_payload("travel hi", user_id="u400", category="travel", priority="7")),
+            # test_and_implicit_three_keys (user_id="u410")
+            (_uuid(410), VECTOR_COFFEE, _make_payload("match", user_id="u410", category="food", status="active", priority="5")),
+            (_uuid(411), VECTOR_FLIGHT, _make_payload("no cat", user_id="u410", category="travel", status="active", priority="5")),
+            (_uuid(412), VECTOR_WINDOW, _make_payload("no status", user_id="u410", category="food", status="archived", priority="5")),
+            # test_and_explicit_operator (user_id="u420")
+            (_uuid(420), VECTOR_COFFEE, _make_payload("match", user_id="u420", category="food", priority="7")),
+            (_uuid(421), VECTOR_FLIGHT, _make_payload("no match", user_id="u420", category="travel", priority="7")),
+            # test_or_two_conditions (user_id="u430")
+            (_uuid(430), VECTOR_COFFEE, _make_payload("food", user_id="u430", category="food")),
+            (_uuid(431), VECTOR_FLIGHT, _make_payload("travel", user_id="u430", category="travel")),
+            (_uuid(432), VECTOR_WINDOW, _make_payload("work", user_id="u430", category="work")),
+            # test_or_three_conditions (user_id="u440")
+            (_uuid(440), VECTOR_COFFEE, _make_payload("food", user_id="u440", category="food")),
+            (_uuid(441), VECTOR_FLIGHT, _make_payload("travel", user_id="u440", category="travel")),
+            (_uuid(442), VECTOR_WINDOW, _make_payload("work", user_id="u440", category="work")),
+            (_uuid(443), VECTOR_AISLE, _make_payload("health", user_id="u440", category="health")),
+            # test_not_single_condition (user_id="u450")
+            (_uuid(450), VECTOR_COFFEE, _make_payload("food", user_id="u450", category="food")),
+            (_uuid(451), VECTOR_FLIGHT, _make_payload("travel", user_id="u450", category="travel")),
+            (_uuid(452), VECTOR_WINDOW, _make_payload("work", user_id="u450", category="work")),
+            # test_not_with_scoped_guard (user_id="u460")
+            (_uuid(460), VECTOR_COFFEE, _make_payload("food", user_id="u460", category="food")),
+            (_uuid(461), VECTOR_FLIGHT, _make_payload("travel", user_id="u460", category="travel")),
+            (_uuid(462), VECTOR_WINDOW, _make_payload("work", user_id="u460_other", category="work")),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_and_implicit_two_keys(self):
         """Implicit AND with two keys in same dict filters by both conditions."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(400), VECTOR_COFFEE, _make_payload("food hi", user_id="logic_user", category="food", priority="7")),
-                    (_uuid(401), VECTOR_FLIGHT, _make_payload("food lo", user_id="logic_user", category="food", priority="2")),
-                    (_uuid(402), VECTOR_WINDOW, _make_payload("travel hi", user_id="logic_user", category="travel", priority="7")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "logic_user", "category": "food", "priority": {"gte": "5"}},
-            )
-            _assert_exact_ids(rows, {_uuid(400)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u400", "category": "food", "priority": {"gte": "5"}},
+        )
+        _assert_exact_ids(rows, {_uuid(400)})
 
     def test_and_implicit_three_keys(self):
         """Implicit AND with three filter keys narrows results correctly."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(410), VECTOR_COFFEE, _make_payload("match", user_id="logic_user", category="food", status="active", priority="5")),
-                    (_uuid(411), VECTOR_FLIGHT, _make_payload("no cat", user_id="logic_user", category="travel", status="active", priority="5")),
-                    (_uuid(412), VECTOR_WINDOW, _make_payload("no status", user_id="logic_user", category="food", status="archived", priority="5")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "logic_user", "category": "food", "status": "active"},
-            )
-            _assert_exact_ids(rows, {_uuid(410)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u410", "category": "food", "status": "active"},
+        )
+        _assert_exact_ids(rows, {_uuid(410)})
 
     def test_and_explicit_operator(self):
         """Explicit $and operator combines conditions."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(420), VECTOR_COFFEE, _make_payload("match", user_id="logic_user", category="food", priority="7")),
-                    (_uuid(421), VECTOR_FLIGHT, _make_payload("no match", user_id="logic_user", category="travel", priority="7")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"$and": [{"user_id": "logic_user"}, {"category": "food"}, {"priority": {"gte": "5"}}]},
-            )
-            _assert_exact_ids(rows, {_uuid(420)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"$and": [{"user_id": "u420"}, {"category": "food"}, {"priority": {"gte": "5"}}]},
+        )
+        _assert_exact_ids(rows, {_uuid(420)})
 
     def test_or_two_conditions(self):
         """$or operator with two conditions returns union of matches."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(430), VECTOR_COFFEE, _make_payload("food", user_id="logic_user", category="food")),
-                    (_uuid(431), VECTOR_FLIGHT, _make_payload("travel", user_id="logic_user", category="travel")),
-                    (_uuid(432), VECTOR_WINDOW, _make_payload("work", user_id="logic_user", category="work")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"$or": [{"user_id": "logic_user", "category": "food"}, {"user_id": "logic_user", "category": "travel"}]},
-            )
-            _assert_exact_ids(rows, {_uuid(430), _uuid(431)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"$or": [{"user_id": "u430", "category": "food"}, {"user_id": "u430", "category": "travel"}]},
+        )
+        _assert_exact_ids(rows, {_uuid(430), _uuid(431)})
 
     def test_or_three_conditions(self):
         """$or operator with three conditions returns union of all matches."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(440), VECTOR_COFFEE, _make_payload("food", user_id="logic_user", category="food")),
-                    (_uuid(441), VECTOR_FLIGHT, _make_payload("travel", user_id="logic_user", category="travel")),
-                    (_uuid(442), VECTOR_WINDOW, _make_payload("work", user_id="logic_user", category="work")),
-                    (_uuid(443), VECTOR_AISLE, _make_payload("health", user_id="logic_user", category="health")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={
-                    "$or": [
-                        {"user_id": "logic_user", "category": "food"},
-                        {"user_id": "logic_user", "category": "travel"},
-                        {"user_id": "logic_user", "category": "work"},
-                    ]
-                },
-            )
-            _assert_exact_ids(rows, {_uuid(440), _uuid(441), _uuid(442)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={
+                "$or": [
+                    {"user_id": "u440", "category": "food"},
+                    {"user_id": "u440", "category": "travel"},
+                    {"user_id": "u440", "category": "work"},
+                ]
+            },
+        )
+        _assert_exact_ids(rows, {_uuid(440), _uuid(441), _uuid(442)})
 
     def test_not_single_condition(self):
         """$not operator excludes matching records."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(450), VECTOR_COFFEE, _make_payload("food", user_id="logic_user", category="food")),
-                    (_uuid(451), VECTOR_FLIGHT, _make_payload("travel", user_id="logic_user", category="travel")),
-                    (_uuid(452), VECTOR_WINDOW, _make_payload("work", user_id="logic_user", category="work")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "logic_user", "$not": [{"category": "food"}]},
-            )
-            _assert_exact_ids(rows, {_uuid(451), _uuid(452)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u450", "$not": [{"category": "food"}]},
+        )
+        _assert_exact_ids(rows, {_uuid(451), _uuid(452)})
 
     def test_not_with_scoped_guard(self):
         """$not combined with scoped user_id filter works correctly."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(460), VECTOR_COFFEE, _make_payload("food", user_id="logic_user", category="food")),
-                    (_uuid(461), VECTOR_FLIGHT, _make_payload("travel", user_id="logic_user", category="travel")),
-                    (_uuid(462), VECTOR_WINDOW, _make_payload("work", user_id="other_user", category="work")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "logic_user", "$not": [{"category": "travel"}]},
-            )
-            _assert_exact_ids(rows, {_uuid(460)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u460", "$not": [{"category": "travel"}]},
+        )
+        _assert_exact_ids(rows, {_uuid(460)})
 
 
 # ===========================================================================
@@ -862,114 +627,88 @@ class TestLogicalCombinationOperators:
 class TestNestedLogicCombinations:
     """Tests for nested logical operator combinations."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="filter_nest")
+        _insert_memories(cls.db, [
+            # test_or_nested_and (user_id="u500")
+            (_uuid(500), VECTOR_COFFEE, _make_payload("food hi", user_id="u500", category="food", priority="7")),
+            (_uuid(501), VECTOR_FLIGHT, _make_payload("food lo", user_id="u500", category="food", priority="2")),
+            (_uuid(502), VECTOR_WINDOW, _make_payload("travel hi", user_id="u500", category="travel", priority="8")),
+            (_uuid(503), VECTOR_AISLE, _make_payload("travel lo", user_id="u500", category="travel", priority="1")),
+            # test_and_nested_or (user_id="u510")
+            (_uuid(510), VECTOR_COFFEE, _make_payload("food hi", user_id="u510", category="food", priority="7")),
+            (_uuid(511), VECTOR_FLIGHT, _make_payload("travel hi", user_id="u510", category="travel", priority="8")),
+            (_uuid(512), VECTOR_WINDOW, _make_payload("work hi", user_id="u510", category="work", priority="9")),
+            # test_not_nested_or (user_id="u520")
+            (_uuid(520), VECTOR_COFFEE, _make_payload("food", user_id="u520", category="food")),
+            (_uuid(521), VECTOR_FLIGHT, _make_payload("travel", user_id="u520", category="travel")),
+            (_uuid(522), VECTOR_WINDOW, _make_payload("work", user_id="u520", category="work")),
+            (_uuid(523), VECTOR_AISLE, _make_payload("health", user_id="u520", category="health")),
+            # test_complex_three_level_nesting (user_id="u530")
+            (_uuid(530), VECTOR_COFFEE, _make_payload("a", user_id="u530", category="food", status="active", priority="7")),
+            (_uuid(531), VECTOR_FLIGHT, _make_payload("b", user_id="u530", category="travel", status="active", priority="3")),
+            (_uuid(532), VECTOR_WINDOW, _make_payload("c", user_id="u530", category="food", status="archived", priority="9")),
+            (_uuid(533), VECTOR_AISLE, _make_payload("d", user_id="u530", category="work", status="active", priority="6")),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_or_nested_and(self):
         """$or containing nested AND conditions (implicit via dict keys)."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(500), VECTOR_COFFEE, _make_payload("food hi", user_id="nest_user", category="food", priority="7")),
-                    (_uuid(501), VECTOR_FLIGHT, _make_payload("food lo", user_id="nest_user", category="food", priority="2")),
-                    (_uuid(502), VECTOR_WINDOW, _make_payload("travel hi", user_id="nest_user", category="travel", priority="8")),
-                    (_uuid(503), VECTOR_AISLE, _make_payload("travel lo", user_id="nest_user", category="travel", priority="1")),
-                ],
-            )
-            # Match: (food AND priority>=5) OR (travel AND priority>=5)
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={
-                    "$or": [
-                        {"user_id": "nest_user", "category": "food", "priority": {"gte": "5"}},
-                        {"user_id": "nest_user", "category": "travel", "priority": {"gte": "5"}},
-                    ]
-                },
-            )
-            _assert_exact_ids(rows, {_uuid(500), _uuid(502)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={
+                "$or": [
+                    {"user_id": "u500", "category": "food", "priority": {"gte": "5"}},
+                    {"user_id": "u500", "category": "travel", "priority": {"gte": "5"}},
+                ]
+            },
+        )
+        _assert_exact_ids(rows, {_uuid(500), _uuid(502)})
 
     def test_and_nested_or(self):
         """$and containing a nested $or condition."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(510), VECTOR_COFFEE, _make_payload("food hi", user_id="nest_user", category="food", priority="7")),
-                    (_uuid(511), VECTOR_FLIGHT, _make_payload("travel hi", user_id="nest_user", category="travel", priority="8")),
-                    (_uuid(512), VECTOR_WINDOW, _make_payload("work hi", user_id="nest_user", category="work", priority="9")),
-                ],
-            )
-            # Match: user_id=nest_user AND (category=food OR category=travel) AND priority>=7
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={
-                    "$and": [
-                        {"user_id": "nest_user"},
-                        {"$or": [{"user_id": "nest_user", "category": "food"}, {"user_id": "nest_user", "category": "travel"}]},
-                        {"priority": {"gte": "7"}},
-                    ]
-                },
-            )
-            _assert_exact_ids(rows, {_uuid(510), _uuid(511)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={
+                "$and": [
+                    {"user_id": "u510"},
+                    {"$or": [{"user_id": "u510", "category": "food"}, {"user_id": "u510", "category": "travel"}]},
+                    {"priority": {"gte": "7"}},
+                ]
+            },
+        )
+        _assert_exact_ids(rows, {_uuid(510), _uuid(511)})
 
     def test_not_nested_or(self):
         """$not applied to an $or-like condition via multiple NOT items."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(520), VECTOR_COFFEE, _make_payload("food", user_id="nest_user", category="food")),
-                    (_uuid(521), VECTOR_FLIGHT, _make_payload("travel", user_id="nest_user", category="travel")),
-                    (_uuid(522), VECTOR_WINDOW, _make_payload("work", user_id="nest_user", category="work")),
-                    (_uuid(523), VECTOR_AISLE, _make_payload("health", user_id="nest_user", category="health")),
-                ],
-            )
-            # Exclude food AND exclude travel => only work and health remain
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "nest_user", "$not": [{"category": "food"}, {"category": "travel"}]},
-            )
-            _assert_exact_ids(rows, {_uuid(522), _uuid(523)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u520", "$not": [{"category": "food"}, {"category": "travel"}]},
+        )
+        _assert_exact_ids(rows, {_uuid(522), _uuid(523)})
 
     def test_complex_three_level_nesting(self):
         """Complex filter with three levels of nesting."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(530), VECTOR_COFFEE, _make_payload("a", user_id="nest_user", category="food", status="active", priority="7")),
-                    (_uuid(531), VECTOR_FLIGHT, _make_payload("b", user_id="nest_user", category="travel", status="active", priority="3")),
-                    (_uuid(532), VECTOR_WINDOW, _make_payload("c", user_id="nest_user", category="food", status="archived", priority="9")),
-                    (_uuid(533), VECTOR_AISLE, _make_payload("d", user_id="nest_user", category="work", status="active", priority="6")),
-                ],
-            )
-            # Match: user_id=nest_user AND status=active AND (category=food OR (category=work AND priority>=5))
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={
-                    "$and": [
-                        {"user_id": "nest_user"},
-                        {"status": "active"},
-                        {
-                            "$or": [
-                                {"user_id": "nest_user", "category": "food"},
-                                {"user_id": "nest_user", "category": "work", "priority": {"gte": "5"}},
-                            ]
-                        },
-                    ]
-                },
-            )
-            _assert_exact_ids(rows, {_uuid(530), _uuid(533)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={
+                "$and": [
+                    {"user_id": "u530"},
+                    {"status": "active"},
+                    {
+                        "$or": [
+                            {"user_id": "u530", "category": "food"},
+                            {"user_id": "u530", "category": "work", "priority": {"gte": "5"}},
+                        ]
+                    },
+                ]
+            },
+        )
+        _assert_exact_ids(rows, {_uuid(530), _uuid(533)})
 
 
 # ===========================================================================
@@ -980,111 +719,75 @@ class TestNestedLogicCombinations:
 class TestNullValueHandling:
     """Tests for null, missing key, and empty string filter behavior."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="filter_null")
+        _insert_memories(cls.db, [
+            # test_filter_key_not_exists_returns_empty (user_id="u600")
+            (_uuid(600), VECTOR_COFFEE, _make_payload("item", user_id="u600", category="food")),
+            # test_eq_null_value (user_id="u610")
+            (_uuid(610), VECTOR_COFFEE, _make_payload("with tag", user_id="u610", tag="hello")),
+            (_uuid(611), VECTOR_FLIGHT, _make_payload("no tag", user_id="u610")),
+            # test_ne_null_value_returns_records_with_key (user_id="u620")
+            (_uuid(620), VECTOR_COFFEE, _make_payload("tagged", user_id="u620", tag="hello")),
+            (_uuid(621), VECTOR_FLIGHT, _make_payload("diff tag", user_id="u620", tag="world")),
+            # test_empty_string_match (user_id="u630")
+            (_uuid(630), VECTOR_COFFEE, _make_payload("empty tag", user_id="u630", tag="")),
+            (_uuid(631), VECTOR_FLIGHT, _make_payload("has tag", user_id="u630", tag="hello")),
+            # test_missing_vs_empty_string_difference (user_id="u640")
+            (_uuid(640), VECTOR_COFFEE, _make_payload("empty", user_id="u640", tag="")),
+            (_uuid(641), VECTOR_FLIGHT, _make_payload("missing", user_id="u640")),
+            (_uuid(642), VECTOR_WINDOW, _make_payload("present", user_id="u640", tag="value")),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_filter_key_not_exists_returns_empty(self):
         """Filtering on a key that does not exist in payload returns no results."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(600), VECTOR_COFFEE, _make_payload("item", user_id="null_user", category="food")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "null_user", "nonexistent_key": "some_value"},
-            )
-            assert len(rows) == 0
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u600", "nonexistent_key": "some_value"},
+        )
+        assert len(rows) == 0
 
     def test_eq_null_value(self):
         """Filtering with eq on a None/null value matches records where key is null or missing."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(610), VECTOR_COFFEE, _make_payload("with tag", user_id="null_user", tag="hello")),
-                    (_uuid(611), VECTOR_FLIGHT, _make_payload("no tag", user_id="null_user")),
-                ],
-            )
-            # Filtering for tag=None should match the record without tag (payload->>tag IS NULL)
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "null_user", "tag": {"eq": "None"}},
-            )
-            # The record without tag has payload->>tag = NULL, which won't match string "None"
-            # so this should return empty (strict string comparison)
-            assert len(rows) == 0
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u610", "tag": {"eq": "None"}},
+        )
+        assert len(rows) == 0
 
     def test_ne_null_value_returns_records_with_key(self):
         """ne with a value returns records that have the key with a different value."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(620), VECTOR_COFFEE, _make_payload("tagged", user_id="null_user", tag="hello")),
-                    (_uuid(621), VECTOR_FLIGHT, _make_payload("diff tag", user_id="null_user", tag="world")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "null_user", "tag": {"ne": "hello"}},
-            )
-            _assert_exact_ids(rows, {_uuid(621)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u620", "tag": {"ne": "hello"}},
+        )
+        _assert_exact_ids(rows, {_uuid(621)})
 
     def test_empty_string_match(self):
         """Filtering for empty string - GaussDB JSON eq does not match empty strings."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(630), VECTOR_COFFEE, _make_payload("empty tag", user_id="null_user", tag="")),
-                    (_uuid(631), VECTOR_FLIGHT, _make_payload("has tag", user_id="null_user", tag="hello")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "null_user", "tag": ""},
-            )
-            # GaussDB JSON filter does not match empty string values
-            assert len(rows) == 0
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u630", "tag": ""},
+        )
+        assert len(rows) == 0
 
     def test_missing_vs_empty_string_difference(self):
         """Records with missing key vs empty string - empty string eq returns empty."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(640), VECTOR_COFFEE, _make_payload("empty", user_id="null_user", tag="")),
-                    (_uuid(641), VECTOR_FLIGHT, _make_payload("missing", user_id="null_user")),
-                    (_uuid(642), VECTOR_WINDOW, _make_payload("present", user_id="null_user", tag="value")),
-                ],
-            )
-            # Empty string eq does not match in GaussDB JSON filter
-            rows_empty = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "null_user", "tag": ""},
-            )
-            assert len(rows_empty) == 0
-            # Non-empty match works normally
-            rows_value = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "null_user", "tag": "value"},
-            )
-            _assert_exact_ids(rows_value, {_uuid(642)})
-        finally:
-            db.delete_col()
+        rows_empty = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u640", "tag": ""},
+        )
+        assert len(rows_empty) == 0
+        rows_value = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "u640", "tag": "value"},
+        )
+        _assert_exact_ids(rows_value, {_uuid(642)})
 
 
 # ===========================================================================
@@ -1095,207 +798,121 @@ class TestNullValueHandling:
 class TestMultiTenantIsolation:
     """Tests for multi-tenant scoped filter isolation and enforcement."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="filter_tenant")
+        _insert_memories(cls.db, [
+            # test_user_id_isolation (user_id="mt_alice", "mt_bob", "mt_carol")
+            (_uuid(700), VECTOR_COFFEE, _make_payload("alice item", user_id="mt_alice")),
+            (_uuid(701), VECTOR_FLIGHT, _make_payload("bob item", user_id="mt_bob")),
+            (_uuid(702), VECTOR_WINDOW, _make_payload("carol item", user_id="mt_carol")),
+            # test_cross_tenant_search_returns_only_own_data (user_id="mt_alice2", "mt_bob2")
+            (_uuid(710), VECTOR_COFFEE, _make_payload("alice secret", user_id="mt_alice2")),
+            (_uuid(711), VECTOR_COFFEE, _make_payload("bob secret", user_id="mt_bob2")),
+            # test_agent_id_isolation (user_id="mt_u720")
+            (_uuid(720), VECTOR_COFFEE, _make_payload("agent1 item", user_id="mt_u720", agent_id="agent_a")),
+            (_uuid(721), VECTOR_FLIGHT, _make_payload("agent2 item", user_id="mt_u720", agent_id="agent_b")),
+            # test_run_id_isolation (user_id="mt_u730")
+            (_uuid(730), VECTOR_COFFEE, _make_payload("run1 item", user_id="mt_u730", run_id="run_001")),
+            (_uuid(731), VECTOR_FLIGHT, _make_payload("run2 item", user_id="mt_u730", run_id="run_002")),
+            # test_combined_user_and_agent_isolation (user_id="mt_u740", "mt_u742")
+            (_uuid(740), VECTOR_COFFEE, _make_payload("u1 a1", user_id="mt_u740", agent_id="agent_a")),
+            (_uuid(741), VECTOR_FLIGHT, _make_payload("u1 a2", user_id="mt_u740", agent_id="agent_b")),
+            (_uuid(742), VECTOR_WINDOW, _make_payload("u2 a1", user_id="mt_u742", agent_id="agent_a")),
+            # test_combined_user_and_run_isolation (user_id="mt_u750", "mt_u752")
+            (_uuid(750), VECTOR_COFFEE, _make_payload("u1 r1", user_id="mt_u750", run_id="run_001")),
+            (_uuid(751), VECTOR_FLIGHT, _make_payload("u1 r2", user_id="mt_u750", run_id="run_002")),
+            (_uuid(752), VECTOR_WINDOW, _make_payload("u2 r1", user_id="mt_u752", run_id="run_001")),
+            # test_combined_all_three_scope_filters (user_id="mt_u760")
+            (_uuid(760), VECTOR_COFFEE, _make_payload("exact", user_id="mt_u760", agent_id="agent_a", run_id="run_001")),
+            (_uuid(761), VECTOR_FLIGHT, _make_payload("diff run", user_id="mt_u760", agent_id="agent_a", run_id="run_002")),
+            (_uuid(762), VECTOR_WINDOW, _make_payload("diff agent", user_id="mt_u760", agent_id="agent_b", run_id="run_001")),
+            # test_scope_guard_missing_user_id_raises_error (user_id="mt_u770")
+            (_uuid(770), VECTOR_COFFEE, _make_payload("item", user_id="mt_u770", category="food")),
+            # test_or_without_scope_in_all_branches_raises_error (user_id="mt_u780")
+            (_uuid(780), VECTOR_COFFEE, _make_payload("item", user_id="mt_u780", category="food")),
+            # test_filter_mode_json_expression_basic (user_id="mt_json")
+            (_uuid(790), VECTOR_COFFEE, _make_payload("food item", user_id="mt_json", category="food")),
+            (_uuid(791), VECTOR_FLIGHT, _make_payload("travel item", user_id="mt_json", category="travel")),
+            # test_filter_mode_json_expression_range (user_id="mt_json2")
+            (_uuid(800), VECTOR_COFFEE, _make_payload("low", user_id="mt_json2", priority="2")),
+            (_uuid(801), VECTOR_FLIGHT, _make_payload("high", user_id="mt_json2", priority="8")),
+            # test_filter_mode_redundant_columns_basic (user_id="mt_rc_alice", "mt_rc_bob")
+            (_uuid(810), VECTOR_COFFEE, _make_payload("alice item", user_id="mt_rc_alice")),
+            (_uuid(811), VECTOR_FLIGHT, _make_payload("bob item", user_id="mt_rc_bob")),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_user_id_isolation(self):
         """Records from different user_ids are isolated by filter."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(700), VECTOR_COFFEE, _make_payload("alice item", user_id="alice")),
-                    (_uuid(701), VECTOR_FLIGHT, _make_payload("bob item", user_id="bob")),
-                    (_uuid(702), VECTOR_WINDOW, _make_payload("carol item", user_id="carol")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "alice"})
-            _assert_exact_ids(rows, {_uuid(700)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_alice"})
+        _assert_exact_ids(rows, {_uuid(700)})
 
     def test_cross_tenant_search_returns_only_own_data(self):
         """Searching with one user_id never returns another user's data."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(710), VECTOR_COFFEE, _make_payload("alice secret", user_id="alice")),
-                    (_uuid(711), VECTOR_COFFEE, _make_payload("bob secret", user_id="bob")),
-                ],
-            )
-            alice_rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "alice"})
-            bob_rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "bob"})
-            _assert_exact_ids(alice_rows, {_uuid(710)})
-            _assert_exact_ids(bob_rows, {_uuid(711)})
-        finally:
-            db.delete_col()
+        alice_rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_alice2"})
+        bob_rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_bob2"})
+        _assert_exact_ids(alice_rows, {_uuid(710)})
+        _assert_exact_ids(bob_rows, {_uuid(711)})
 
     def test_agent_id_isolation(self):
         """Records are isolated by agent_id scope filter."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(720), VECTOR_COFFEE, _make_payload("agent1 item", user_id="user1", agent_id="agent_a")),
-                    (_uuid(721), VECTOR_FLIGHT, _make_payload("agent2 item", user_id="user1", agent_id="agent_b")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"agent_id": "agent_a"})
-            _assert_exact_ids(rows, {_uuid(720)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_u720", "agent_id": "agent_a"})
+        _assert_exact_ids(rows, {_uuid(720)})
 
     def test_run_id_isolation(self):
         """Records are isolated by run_id scope filter."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(730), VECTOR_COFFEE, _make_payload("run1 item", user_id="user1", run_id="run_001")),
-                    (_uuid(731), VECTOR_FLIGHT, _make_payload("run2 item", user_id="user1", run_id="run_002")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"run_id": "run_001"})
-            _assert_exact_ids(rows, {_uuid(730)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_u730", "run_id": "run_001"})
+        _assert_exact_ids(rows, {_uuid(730)})
 
     def test_combined_user_and_agent_isolation(self):
         """Combined user_id + agent_id filter narrows results correctly."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(740), VECTOR_COFFEE, _make_payload("u1 a1", user_id="user1", agent_id="agent_a")),
-                    (_uuid(741), VECTOR_FLIGHT, _make_payload("u1 a2", user_id="user1", agent_id="agent_b")),
-                    (_uuid(742), VECTOR_WINDOW, _make_payload("u2 a1", user_id="user2", agent_id="agent_a")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "user1", "agent_id": "agent_a"})
-            _assert_exact_ids(rows, {_uuid(740)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_u740", "agent_id": "agent_a"})
+        _assert_exact_ids(rows, {_uuid(740)})
 
     def test_combined_user_and_run_isolation(self):
         """Combined user_id + run_id filter narrows results correctly."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(750), VECTOR_COFFEE, _make_payload("u1 r1", user_id="user1", run_id="run_001")),
-                    (_uuid(751), VECTOR_FLIGHT, _make_payload("u1 r2", user_id="user1", run_id="run_002")),
-                    (_uuid(752), VECTOR_WINDOW, _make_payload("u2 r1", user_id="user2", run_id="run_001")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "user1", "run_id": "run_001"})
-            _assert_exact_ids(rows, {_uuid(750)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_u750", "run_id": "run_001"})
+        _assert_exact_ids(rows, {_uuid(750)})
 
     def test_combined_all_three_scope_filters(self):
         """Combined user_id + agent_id + run_id filter narrows to exact match."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(760), VECTOR_COFFEE, _make_payload("exact", user_id="user1", agent_id="agent_a", run_id="run_001")),
-                    (_uuid(761), VECTOR_FLIGHT, _make_payload("diff run", user_id="user1", agent_id="agent_a", run_id="run_002")),
-                    (_uuid(762), VECTOR_WINDOW, _make_payload("diff agent", user_id="user1", agent_id="agent_b", run_id="run_001")),
-                ],
-            )
-            rows = db.search(
-                "test", VECTOR_COFFEE, top_k=10,
-                filters={"user_id": "user1", "agent_id": "agent_a", "run_id": "run_001"},
-            )
-            _assert_exact_ids(rows, {_uuid(760)})
-        finally:
-            db.delete_col()
+        rows = self.db.search(
+            "test", VECTOR_COFFEE, top_k=10,
+            filters={"user_id": "mt_u760", "agent_id": "agent_a", "run_id": "run_001"},
+        )
+        _assert_exact_ids(rows, {_uuid(760)})
 
     def test_scope_guard_missing_user_id_raises_error(self):
         """Search without any scope filter raises ValueError when require_scoped_filters=True."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(770), VECTOR_COFFEE, _make_payload("item", user_id="user1", category="food")),
-                ],
-            )
-            with pytest.raises(ValueError, match="requires at least one scoped filter"):
-                db.search("test", VECTOR_COFFEE, top_k=10, filters={"category": "food"})
-        finally:
-            db.delete_col()
+        with pytest.raises(ValueError, match="requires at least one scoped filter"):
+            self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"category": "food"})
 
     def test_or_without_scope_in_all_branches_raises_error(self):
         """$or where not all branches have scope filter raises ValueError."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(780), VECTOR_COFFEE, _make_payload("item", user_id="user1", category="food")),
-                ],
+        with pytest.raises(ValueError, match="requires at least one scoped filter"):
+            self.db.search(
+                "test", VECTOR_COFFEE, top_k=10,
+                filters={"$or": [{"user_id": "mt_u780"}, {"category": "food"}]},
             )
-            with pytest.raises(ValueError, match="requires at least one scoped filter"):
-                db.search(
-                    "test", VECTOR_COFFEE, top_k=10,
-                    filters={"$or": [{"user_id": "user1"}, {"category": "food"}]},
-                )
-        finally:
-            db.delete_col()
 
     def test_filter_mode_json_expression_basic(self):
         """json_expression filter mode supports payload key filtering."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(790), VECTOR_COFFEE, _make_payload("food item", user_id="json_user", category="food")),
-                    (_uuid(791), VECTOR_FLIGHT, _make_payload("travel item", user_id="json_user", category="travel")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "json_user", "category": "food"})
-            _assert_exact_ids(rows, {_uuid(790)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_json", "category": "food"})
+        _assert_exact_ids(rows, {_uuid(790)})
 
     def test_filter_mode_json_expression_range(self):
         """json_expression filter mode supports range operators on payload fields."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(800), VECTOR_COFFEE, _make_payload("low", user_id="json_user", priority="2")),
-                    (_uuid(801), VECTOR_FLIGHT, _make_payload("high", user_id="json_user", priority="8")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "json_user", "priority": {"gte": "5"}})
-            _assert_exact_ids(rows, {_uuid(801)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_json2", "priority": {"gte": "5"}})
+        _assert_exact_ids(rows, {_uuid(801)})
 
     def test_filter_mode_redundant_columns_basic(self):
         """Scope column filtering (now uses json_expression mode)."""
-        db = _new_db(prefix="p1_filter")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(810), VECTOR_COFFEE, _make_payload("alice item", user_id="rc_alice")),
-                    (_uuid(811), VECTOR_FLIGHT, _make_payload("bob item", user_id="rc_bob")),
-                ],
-            )
-            rows = db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "rc_alice"})
-            _assert_exact_ids(rows, {_uuid(810)})
-        finally:
-            db.delete_col()
+        rows = self.db.search("test", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_rc_alice"})
+        _assert_exact_ids(rows, {_uuid(810)})
 
 
 
@@ -1307,129 +924,94 @@ class TestMultiTenantIsolation:
 class TestDistanceMetricCorrectness:
     """Tests for distance metric correctness with L2 and cosine."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db_l2 = _new_db(prefix="search_l2", vector_metric="l2")
+        _insert_memories(cls.db_l2, [
+            # test_l2_nearest_neighbor_correct (user_id="u1001")
+            (_uuid(1001), [1.0, 0.0, 0.0], _make_payload("point_a", "u1001")),
+            (_uuid(1002), [0.9, 0.1, 0.0], _make_payload("point_b", "u1001")),
+            (_uuid(1003), [0.0, 1.0, 0.0], _make_payload("point_c", "u1001")),
+            # test_l2_ordering_correct (user_id="u1011")
+            (_uuid(1011), [0.0, 0.0, 0.0], _make_payload("origin", "u1011")),
+            (_uuid(1012), [1.0, 0.0, 0.0], _make_payload("dist_1", "u1011")),
+            (_uuid(1013), [2.0, 0.0, 0.0], _make_payload("dist_2", "u1011")),
+            (_uuid(1014), [3.0, 0.0, 0.0], _make_payload("dist_3", "u1011")),
+            # test_l2_known_distance_value (user_id="u1021")
+            (_uuid(1021), [1.0, 0.0, 0.0], _make_payload("unit_x", "u1021")),
+            # test_l2_metric_stored_correctly (user_id="u1071")
+            (_uuid(1071), [0.5, 0.5, 0.5], _make_payload("center", "u1071")),
+        ])
+        cls.db_cosine = _new_db(prefix="search_cos", vector_metric="cosine")
+        _insert_memories(cls.db_cosine, [
+            # test_cosine_nearest_neighbor_correct (user_id="u1031")
+            (_uuid(1031), [1.0, 0.0, 0.0], _make_payload("unit_x", "u1031")),
+            (_uuid(1032), [0.9, 0.1, 0.0], _make_payload("near_x", "u1031")),
+            (_uuid(1033), [0.0, 1.0, 0.0], _make_payload("unit_y", "u1031")),
+            # test_cosine_orthogonal_vectors_low_score (user_id="u1041")
+            (_uuid(1041), [1.0, 0.0, 0.0], _make_payload("x_axis", "u1041")),
+            (_uuid(1042), [0.0, 1.0, 0.0], _make_payload("y_axis", "u1041")),
+            # test_cosine_nearest_neighbor_ordering (user_id="u1051")
+            (_uuid(1051), [1.0, 0.0, 0.0], _make_payload("along_x", "u1051")),
+            (_uuid(1052), [1.0, 1.0, 0.0], _make_payload("45_deg", "u1051")),
+            (_uuid(1053), [0.0, 1.0, 0.0], _make_payload("along_y", "u1051")),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db_l2.delete_col()
+        cls.db_cosine.delete_col()
+
     def test_l2_nearest_neighbor_correct(self):
         """L2 metric returns the nearest neighbor correctly."""
-        db = _new_db(prefix="p1_search", vector_metric="l2")
-        try:
-            _insert_memories(db, [
-                (_uuid(1001), [1.0, 0.0, 0.0], _make_payload("point_a", "search_user")),
-                (_uuid(1002), [0.9, 0.1, 0.0], _make_payload("point_b", "search_user")),
-                (_uuid(1003), [0.0, 1.0, 0.0], _make_payload("point_c", "search_user")),
-            ])
-            # Query near point_a; point_b should be closest
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "search_user"})
-            assert len(results) >= 2
-            assert results[0].id == _uuid(1001)  # exact match
-            assert results[1].id == _uuid(1002)  # nearest neighbor
-        finally:
-            db.delete_col()
+        results = self.db_l2.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "u1001"})
+        assert len(results) >= 2
+        assert results[0].id == _uuid(1001)
+        assert results[1].id == _uuid(1002)
 
     def test_l2_ordering_correct(self):
         """L2 metric returns results in correct distance order."""
-        db = _new_db(prefix="p1_search", vector_metric="l2")
-        try:
-            _insert_memories(db, [
-                (_uuid(1011), [0.0, 0.0, 0.0], _make_payload("origin", "search_user")),
-                (_uuid(1012), [1.0, 0.0, 0.0], _make_payload("dist_1", "search_user")),
-                (_uuid(1013), [2.0, 0.0, 0.0], _make_payload("dist_2", "search_user")),
-                (_uuid(1014), [3.0, 0.0, 0.0], _make_payload("dist_3", "search_user")),
-            ])
-            results = db.search("query", [0.0, 0.0, 0.0], top_k=4, filters={"user_id": "search_user"})
-            assert len(results) == 4
-            _assert_ordered_ids(results, [_uuid(1011), _uuid(1012), _uuid(1013), _uuid(1014)])
-        finally:
-            db.delete_col()
+        results = self.db_l2.search("query", [0.0, 0.0, 0.0], top_k=4, filters={"user_id": "u1011"})
+        assert len(results) == 4
+        _assert_ordered_ids(results, [_uuid(1011), _uuid(1012), _uuid(1013), _uuid(1014)])
 
     def test_l2_known_distance_value(self):
         """L2 distance produces expected normalized score for known distance."""
-        db = _new_db(prefix="p1_search", vector_metric="l2")
-        try:
-            # Insert a point at [1, 0, 0]; query from [0, 0, 0]
-            # L2 distance = 1.0, normalized score = 1/(1+1) = 0.5
-            _insert_memories(db, [
-                (_uuid(1021), [1.0, 0.0, 0.0], _make_payload("unit_x", "search_user")),
-            ])
-            results = db.search("query", [0.0, 0.0, 0.0], top_k=1, filters={"user_id": "search_user"})
-            assert len(results) == 1
-            # Score should be 1/(1+distance). For L2 distance=1.0 -> score=0.5
-            assert abs(results[0].score - 0.5) < 0.1
-        finally:
-            db.delete_col()
+        results = self.db_l2.search("query", [0.0, 0.0, 0.0], top_k=1, filters={"user_id": "u1021"})
+        assert len(results) == 1
+        assert abs(results[0].score - 0.5) < 0.1
 
     def test_cosine_nearest_neighbor_correct(self):
         """Cosine metric returns the nearest neighbor correctly."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(1031), [1.0, 0.0, 0.0], _make_payload("unit_x", "search_user")),
-                (_uuid(1032), [0.9, 0.1, 0.0], _make_payload("near_x", "search_user")),
-                (_uuid(1033), [0.0, 1.0, 0.0], _make_payload("unit_y", "search_user")),
-            ])
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "search_user"})
-            assert len(results) >= 2
-            # Exact match or closest cosine neighbor should be first
-            assert results[0].id == _uuid(1031)
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "u1031"})
+        assert len(results) >= 2
+        assert results[0].id == _uuid(1031)
 
     def test_cosine_orthogonal_vectors_low_score(self):
         """Cosine: orthogonal vectors should have low similarity (high distance)."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(1041), [1.0, 0.0, 0.0], _make_payload("x_axis", "search_user")),
-                (_uuid(1042), [0.0, 1.0, 0.0], _make_payload("y_axis", "search_user")),
-            ])
-            # Query along x-axis; y-axis vector is orthogonal
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=2, filters={"user_id": "search_user"})
-            assert len(results) == 2
-            # The x-axis match should have much higher score than orthogonal y-axis
-            x_score = results[0].score
-            y_score = results[1].score
-            assert x_score > y_score
-            # Orthogonal cosine distance = 1.0, normalized = 1/(1+1) = 0.5
-            assert y_score < 0.6
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=2, filters={"user_id": "u1041"})
+        assert len(results) == 2
+        x_score = results[0].score
+        y_score = results[1].score
+        assert x_score > y_score
+        assert y_score < 0.6
 
     def test_cosine_nearest_neighbor_ordering(self):
         """Cosine metric orders results by angular similarity."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(1051), [1.0, 0.0, 0.0], _make_payload("along_x", "search_user")),
-                (_uuid(1052), [1.0, 1.0, 0.0], _make_payload("45_deg", "search_user")),
-                (_uuid(1053), [0.0, 1.0, 0.0], _make_payload("along_y", "search_user")),
-            ])
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "search_user"})
-            assert len(results) == 3
-            # Order: exact x-axis, 45-degree, orthogonal y-axis
-            _assert_ordered_ids(results, [_uuid(1051), _uuid(1052), _uuid(1053)])
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "u1051"})
+        assert len(results) == 3
+        _assert_ordered_ids(results, [_uuid(1051), _uuid(1052), _uuid(1053)])
 
     def test_default_metric_is_cosine(self):
         """Default metric should be cosine when not specified."""
-        db = _new_db(prefix="p1_search")
-        try:
-            assert db.vector_metric == "cosine"
-        finally:
-            db.delete_col()
+        assert self.db_cosine.vector_metric == "cosine"
 
     def test_l2_metric_stored_correctly(self):
         """L2 metric is stored and used correctly in the DB instance."""
-        db = _new_db(prefix="p1_search", vector_metric="l2")
-        try:
-            assert db.vector_metric == "l2"
-            _insert_memories(db, [
-                (_uuid(1071), [0.5, 0.5, 0.5], _make_payload("center", "search_user")),
-            ])
-            results = db.search("query", [0.5, 0.5, 0.5], top_k=1, filters={"user_id": "search_user"})
-            assert len(results) == 1
-            # Exact match with L2 distance = 0, score = 1/(1+0) = 1.0
-            assert results[0].score > 0.95
-        finally:
-            db.delete_col()
+        assert self.db_l2.vector_metric == "l2"
+        results = self.db_l2.search("query", [0.5, 0.5, 0.5], top_k=1, filters={"user_id": "u1071"})
+        assert len(results) == 1
+        assert results[0].score > 0.95
 
 
 # ===========================================================================
@@ -1440,81 +1022,63 @@ class TestDistanceMetricCorrectness:
 class TestScoreOrdering:
     """Tests for score ordering and precision."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="search_score", vector_metric="cosine")
+        _insert_memories(cls.db, [
+            # test_scores_in_descending_order (user_id="u2001")
+            (_uuid(2001), [1.0, 0.0, 0.0], _make_payload("vec_a", "u2001")),
+            (_uuid(2002), [0.7, 0.7, 0.0], _make_payload("vec_b", "u2001")),
+            (_uuid(2003), [0.0, 1.0, 0.0], _make_payload("vec_c", "u2001")),
+            (_uuid(2004), [0.0, 0.0, 1.0], _make_payload("vec_d", "u2001")),
+            # test_top1_is_closest_vector (user_id="u2011")
+            (_uuid(2011), [0.1, 0.9, 0.1], _make_payload("far_from_query", "u2011")),
+            (_uuid(2012), [0.95, 0.05, 0.0], _make_payload("close_to_query", "u2011")),
+            (_uuid(2013), [0.5, 0.5, 0.5], _make_payload("medium", "u2011")),
+            # test_identical_vector_returns_high_score (user_id="u2021")
+            (_uuid(2021), [0.6, 0.3, 0.1], _make_payload("target", "u2021")),
+            # test_distant_vector_returns_low_score (user_id="u2031")
+            (_uuid(2031), [1.0, 0.0, 0.0], _make_payload("opposite_dir", "u2031")),
+            # test_score_range_validation (user_id="u2041")
+            (_uuid(2041), [1.0, 0.0, 0.0], _make_payload("a", "u2041")),
+            (_uuid(2042), [0.0, 1.0, 0.0], _make_payload("b", "u2041")),
+            (_uuid(2043), [0.0, 0.0, 1.0], _make_payload("c", "u2041")),
+            (_uuid(2044), [-1.0, 0.0, 0.0], _make_payload("d", "u2041")),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_scores_in_descending_order(self):
         """Search results should have scores in descending order."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(2001), [1.0, 0.0, 0.0], _make_payload("vec_a", "score_user")),
-                (_uuid(2002), [0.7, 0.7, 0.0], _make_payload("vec_b", "score_user")),
-                (_uuid(2003), [0.0, 1.0, 0.0], _make_payload("vec_c", "score_user")),
-                (_uuid(2004), [0.0, 0.0, 1.0], _make_payload("vec_d", "score_user")),
-            ])
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=4, filters={"user_id": "score_user"})
-            scores = [r.score for r in results]
-            assert scores == sorted(scores, reverse=True), "Scores should be in descending order"
-        finally:
-            db.delete_col()
+        results = self.db.search("query", [1.0, 0.0, 0.0], top_k=4, filters={"user_id": "u2001"})
+        scores = [r.score for r in results]
+        assert scores == sorted(scores, reverse=True), "Scores should be in descending order"
 
     def test_top1_is_closest_vector(self):
         """Top-1 result should be the closest vector to the query."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(2011), [0.1, 0.9, 0.1], _make_payload("far_from_query", "score_user")),
-                (_uuid(2012), [0.95, 0.05, 0.0], _make_payload("close_to_query", "score_user")),
-                (_uuid(2013), [0.5, 0.5, 0.5], _make_payload("medium", "score_user")),
-            ])
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=1, filters={"user_id": "score_user"})
-            assert len(results) == 1
-            assert results[0].id == _uuid(2012)
-        finally:
-            db.delete_col()
+        results = self.db.search("query", [1.0, 0.0, 0.0], top_k=1, filters={"user_id": "u2011"})
+        assert len(results) == 1
+        assert results[0].id == _uuid(2012)
 
     def test_identical_vector_returns_high_score(self):
         """Searching with an identical vector should return score close to 1.0."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(2021), [0.6, 0.3, 0.1], _make_payload("target", "score_user")),
-            ])
-            results = db.search("query", [0.6, 0.3, 0.1], top_k=1, filters={"user_id": "score_user"})
-            assert len(results) == 1
-            # Cosine distance of identical vectors = 0, score = 1/(1+0) = 1.0
-            assert results[0].score > 0.95
-        finally:
-            db.delete_col()
+        results = self.db.search("query", [0.6, 0.3, 0.1], top_k=1, filters={"user_id": "u2021"})
+        assert len(results) == 1
+        assert results[0].score > 0.95
 
     def test_distant_vector_returns_low_score(self):
         """A vector far from the query should return a low score."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(2031), [1.0, 0.0, 0.0], _make_payload("opposite_dir", "score_user")),
-            ])
-            # Query in opposite direction
-            results = db.search("query", [-1.0, 0.0, 0.0], top_k=1, filters={"user_id": "score_user"})
-            assert len(results) == 1
-            # Cosine distance for opposite vectors = 2.0, score = 1/(1+2) = 0.333
-            assert results[0].score < 0.5
-        finally:
-            db.delete_col()
+        results = self.db.search("query", [-1.0, 0.0, 0.0], top_k=1, filters={"user_id": "u2031"})
+        assert len(results) == 1
+        assert results[0].score < 0.5
 
     def test_score_range_validation(self):
         """All scores should be in the range (0, 1]."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(2041), [1.0, 0.0, 0.0], _make_payload("a", "score_user")),
-                (_uuid(2042), [0.0, 1.0, 0.0], _make_payload("b", "score_user")),
-                (_uuid(2043), [0.0, 0.0, 1.0], _make_payload("c", "score_user")),
-                (_uuid(2044), [-1.0, 0.0, 0.0], _make_payload("d", "score_user")),
-            ])
-            results = db.search("query", [0.5, 0.5, 0.0], top_k=4, filters={"user_id": "score_user"})
-            for r in results:
-                assert 0.0 < r.score <= 1.0, f"Score {r.score} out of valid range (0, 1]"
-        finally:
-            db.delete_col()
+        results = self.db.search("query", [0.5, 0.5, 0.0], top_k=4, filters={"user_id": "u2041"})
+        for r in results:
+            assert 0.0 < r.score <= 1.0, f"Score {r.score} out of valid range (0, 1]"
 
 
 # ===========================================================================
@@ -1525,124 +1089,108 @@ class TestScoreOrdering:
 class TestRecallQuality:
     """Tests for recall quality with known data distributions."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db_cosine = _new_db(prefix="search_recall_cos", vector_metric="cosine")
+        # test_known_vectors_correct_top3 (user_id="u3001")
+        vectors = [
+            ([1.0, 0.0, 0.0], "exact_match"),
+            ([0.95, 0.05, 0.0], "very_close"),
+            ([0.9, 0.1, 0.0], "close"),
+            ([0.7, 0.3, 0.0], "moderate_1"),
+            ([0.5, 0.5, 0.0], "moderate_2"),
+            ([0.3, 0.7, 0.0], "far_1"),
+            ([0.1, 0.9, 0.0], "far_2"),
+            ([0.0, 1.0, 0.0], "orthogonal"),
+            ([0.0, 0.0, 1.0], "orthogonal_z"),
+            ([-1.0, 0.0, 0.0], "opposite"),
+        ]
+        records = [
+            (_uuid(3001 + i), vec, _make_payload(label, "u3001"))
+            for i, (vec, label) in enumerate(vectors)
+        ]
+        # test_cluster_search_returns_same_cluster_first (user_id="u3201")
+        records += [
+            (_uuid(3201), [0.95, 0.05, 0.0], _make_payload("cluster_a_1", "u3201")),
+            (_uuid(3202), [0.90, 0.10, 0.0], _make_payload("cluster_a_2", "u3201")),
+            (_uuid(3203), [0.85, 0.15, 0.0], _make_payload("cluster_a_3", "u3201")),
+            (_uuid(3204), [0.05, 0.95, 0.0], _make_payload("cluster_b_1", "u3201")),
+            (_uuid(3205), [0.10, 0.90, 0.0], _make_payload("cluster_b_2", "u3201")),
+            (_uuid(3206), [0.15, 0.85, 0.0], _make_payload("cluster_b_3", "u3201")),
+        ]
+        # test_duplicate_vectors_return_same_score (user_id="u3301")
+        records += [
+            (_uuid(3301), [0.5, 0.5, 0.0], _make_payload("dup_1", "u3301")),
+            (_uuid(3302), [0.5, 0.5, 0.0], _make_payload("dup_2", "u3301")),
+        ]
+        # test_near_duplicate_vectors_return_similar_scores (user_id="u3401")
+        records += [
+            (_uuid(3401), [0.500, 0.500, 0.000], _make_payload("near_dup_1", "u3401")),
+            (_uuid(3402), [0.501, 0.499, 0.001], _make_payload("near_dup_2", "u3401")),
+        ]
+        _insert_memories(cls.db_cosine, records)
+
+        # test_100_vectors_recall_at_10 needs L2 with dynamic data
+        import random
+        random.seed(42)
+        cls.db_l2 = _new_db(prefix="search_recall_l2", vector_metric="l2")
+        cls._all_vectors = []
+        l2_records = []
+        for i in range(100):
+            vec = [random.uniform(-1, 1) for _ in range(3)]
+            cls._all_vectors.append((i, vec))
+            l2_records.append((_uuid(3100 + i), vec, _make_payload(f"item_{i}", "u3100")))
+        _insert_memories(cls.db_l2, l2_records)
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db_cosine.delete_col()
+        cls.db_l2.delete_col()
+
     def test_known_vectors_correct_top3(self):
         """Insert 10 known vectors, search returns correct top-3."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            # Create 10 vectors with varying similarity to query [1, 0, 0]
-            vectors = [
-                ([1.0, 0.0, 0.0], "exact_match"),       # id 3001 - best
-                ([0.95, 0.05, 0.0], "very_close"),       # id 3002 - 2nd
-                ([0.9, 0.1, 0.0], "close"),              # id 3003 - 3rd
-                ([0.7, 0.3, 0.0], "moderate_1"),         # id 3004
-                ([0.5, 0.5, 0.0], "moderate_2"),         # id 3005
-                ([0.3, 0.7, 0.0], "far_1"),              # id 3006
-                ([0.1, 0.9, 0.0], "far_2"),              # id 3007
-                ([0.0, 1.0, 0.0], "orthogonal"),         # id 3008
-                ([0.0, 0.0, 1.0], "orthogonal_z"),       # id 3009
-                ([-1.0, 0.0, 0.0], "opposite"),          # id 3010
-            ]
-            records = [
-                (_uuid(3001 + i), vec, _make_payload(label, "recall_user"))
-                for i, (vec, label) in enumerate(vectors)
-            ]
-            _insert_memories(db, records)
-
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "recall_user"})
-            assert len(results) == 3
-            top3_ids = _ids(results)
-            assert top3_ids[0] == _uuid(3001)  # exact match
-            assert top3_ids[1] == _uuid(3002)  # very close
-            assert top3_ids[2] == _uuid(3003)  # close
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "u3001"})
+        assert len(results) == 3
+        top3_ids = _ids(results)
+        assert top3_ids[0] == _uuid(3001)
+        assert top3_ids[1] == _uuid(3002)
+        assert top3_ids[2] == _uuid(3003)
 
     def test_100_vectors_recall_at_10(self):
         """Insert 100 vectors, recall@10 should be >= 0.8 for known nearest neighbors."""
-        db = _new_db(prefix="p1_search", vector_metric="l2")
-        try:
-            import random
-            random.seed(42)
+        query = [0.5, 0.5, 0.5]
 
-            # Generate 100 random 3D vectors
-            all_vectors = []
-            records = []
-            for i in range(100):
-                vec = [random.uniform(-1, 1) for _ in range(3)]
-                all_vectors.append((i, vec))
-                records.append((_uuid(3100 + i), vec, _make_payload(f"item_{i}", "recall_user")))
-            _insert_memories(db, records)
+        def l2_dist(a, b):
+            return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
 
-            # Query vector
-            query = [0.5, 0.5, 0.5]
+        true_nearest = sorted(self._all_vectors, key=lambda x: l2_dist(x[1], query))
+        true_top10_ids = {_uuid(3100 + idx) for idx, _ in true_nearest[:10]}
 
-            # Compute true L2 distances
-            def l2_dist(a, b):
-                return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+        results = self.db_l2.search("query", query, top_k=10, filters={"user_id": "u3100"})
+        result_ids = set(_ids(results))
 
-            true_nearest = sorted(all_vectors, key=lambda x: l2_dist(x[1], query))
-            true_top10_ids = {_uuid(3100 + idx) for idx, _ in true_nearest[:10]}
-
-            results = db.search("query", query, top_k=10, filters={"user_id": "recall_user"})
-            result_ids = set(_ids(results))
-
-            recall = len(result_ids & true_top10_ids) / 10.0
-            assert recall >= 0.8, f"Recall@10 = {recall}, expected >= 0.8"
-        finally:
-            db.delete_col()
+        recall = len(result_ids & true_top10_ids) / 10.0
+        assert recall >= 0.8, f"Recall@10 = {recall}, expected >= 0.8"
 
     def test_cluster_search_returns_same_cluster_first(self):
         """Vectors in the same cluster as query should rank higher."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            # Cluster A: near [1, 0, 0]
-            # Cluster B: near [0, 1, 0]
-            records = [
-                (_uuid(3201), [0.95, 0.05, 0.0], _make_payload("cluster_a_1", "recall_user")),
-                (_uuid(3202), [0.90, 0.10, 0.0], _make_payload("cluster_a_2", "recall_user")),
-                (_uuid(3203), [0.85, 0.15, 0.0], _make_payload("cluster_a_3", "recall_user")),
-                (_uuid(3204), [0.05, 0.95, 0.0], _make_payload("cluster_b_1", "recall_user")),
-                (_uuid(3205), [0.10, 0.90, 0.0], _make_payload("cluster_b_2", "recall_user")),
-                (_uuid(3206), [0.15, 0.85, 0.0], _make_payload("cluster_b_3", "recall_user")),
-            ]
-            _insert_memories(db, records)
-
-            # Query near cluster A
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=6, filters={"user_id": "recall_user"})
-            top3_ids = set(_ids(results[:3]))
-            cluster_a_ids = {_uuid(3201), _uuid(3202), _uuid(3203)}
-            assert top3_ids == cluster_a_ids, "Top-3 should all be from cluster A"
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=6, filters={"user_id": "u3201"})
+        top3_ids = set(_ids(results[:3]))
+        cluster_a_ids = {_uuid(3201), _uuid(3202), _uuid(3203)}
+        assert top3_ids == cluster_a_ids, "Top-3 should all be from cluster A"
 
     def test_duplicate_vectors_return_same_score(self):
         """Duplicate vectors should return the same score."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(3301), [0.5, 0.5, 0.0], _make_payload("dup_1", "recall_user")),
-                (_uuid(3302), [0.5, 0.5, 0.0], _make_payload("dup_2", "recall_user")),
-            ])
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=2, filters={"user_id": "recall_user"})
-            assert len(results) == 2
-            assert abs(results[0].score - results[1].score) < 1e-6
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=2, filters={"user_id": "u3301"})
+        assert len(results) == 2
+        assert abs(results[0].score - results[1].score) < 1e-6
 
     def test_near_duplicate_vectors_return_similar_scores(self):
         """Near-duplicate vectors should return very similar scores."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(3401), [0.500, 0.500, 0.000], _make_payload("near_dup_1", "recall_user")),
-                (_uuid(3402), [0.501, 0.499, 0.001], _make_payload("near_dup_2", "recall_user")),
-            ])
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=2, filters={"user_id": "recall_user"})
-            assert len(results) == 2
-            score_diff = abs(results[0].score - results[1].score)
-            assert score_diff < 0.01, f"Near-duplicate score diff {score_diff} should be < 0.01"
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=2, filters={"user_id": "u3401"})
+        assert len(results) == 2
+        score_diff = abs(results[0].score - results[1].score)
+        assert score_diff < 0.01, f"Near-duplicate score diff {score_diff} should be < 0.01"
 
 
 # ===========================================================================
@@ -1822,93 +1370,73 @@ class TestHybridSearchQuality:
 class TestScoreEdgeCases:
     """Tests for score edge cases and stability."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db_cosine = _new_db(prefix="search_edge_cos", vector_metric="cosine")
+        _insert_memories(cls.db_cosine, [
+            # test_orthogonal_vectors_low_scores (user_id="u6001")
+            (_uuid(6001), [0.0, 1.0, 0.0], _make_payload("y_axis", "u6001")),
+            (_uuid(6002), [0.0, 0.0, 1.0], _make_payload("z_axis", "u6001")),
+            (_uuid(6003), [0.0, 0.7, 0.7], _make_payload("yz_plane", "u6001")),
+            # test_duplicate_scores_sorting_stability (user_id="u6011")
+            (_uuid(6011), [0.5, 0.5, 0.0], _make_payload("dup_a", "u6011")),
+            (_uuid(6012), [0.5, 0.5, 0.0], _make_payload("dup_b", "u6011")),
+            (_uuid(6013), [0.5, 0.5, 0.0], _make_payload("dup_c", "u6011")),
+            # test_score_precision_decimal_places (user_id="u6021")
+            (_uuid(6021), [0.9, 0.1, 0.0], _make_payload("precise_a", "u6021")),
+            (_uuid(6022), [0.8, 0.2, 0.0], _make_payload("precise_b", "u6021")),
+        ])
+        # test_large_dataset_sorting_correctness needs L2 with 1000 vectors
+        import random
+        random.seed(123)
+        cls.db_l2 = _new_db(prefix="search_edge_l2", vector_metric="l2")
+        batch_size = 100
+        for batch_start in range(0, 1000, batch_size):
+            records = []
+            for i in range(batch_start, batch_start + batch_size):
+                vec = [random.uniform(-1, 1) for _ in range(3)]
+                records.append((_uuid(6100 + i), vec, _make_payload(f"item_{i}", "u6100")))
+            _insert_memories(cls.db_l2, records)
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db_cosine.delete_col()
+        cls.db_l2.delete_col()
+
     def test_orthogonal_vectors_low_scores(self):
         """All vectors orthogonal to query should produce uniformly low scores."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            # Query along x-axis; insert vectors along y and z axes
-            _insert_memories(db, [
-                (_uuid(6001), [0.0, 1.0, 0.0], _make_payload("y_axis", "edge_user")),
-                (_uuid(6002), [0.0, 0.0, 1.0], _make_payload("z_axis", "edge_user")),
-                (_uuid(6003), [0.0, 0.7, 0.7], _make_payload("yz_plane", "edge_user")),
-            ])
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "edge_user"})
-            for r in results:
-                # All are orthogonal or near-orthogonal to x-axis
-                # Cosine distance >= 1.0, score <= 0.5
-                assert r.score <= 0.55, f"Orthogonal vector score {r.score} should be <= 0.55"
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "u6001"})
+        for r in results:
+            assert r.score <= 0.55, f"Orthogonal vector score {r.score} should be <= 0.55"
 
     def test_duplicate_scores_sorting_stability(self):
         """Vectors with identical scores should have stable sort (by ID)."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            # Insert identical vectors with different IDs
-            _insert_memories(db, [
-                (_uuid(6011), [0.5, 0.5, 0.0], _make_payload("dup_a", "edge_user")),
-                (_uuid(6012), [0.5, 0.5, 0.0], _make_payload("dup_b", "edge_user")),
-                (_uuid(6013), [0.5, 0.5, 0.0], _make_payload("dup_c", "edge_user")),
-            ])
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "edge_user"})
-            assert len(results) == 3
-            # All scores should be identical
-            scores = [r.score for r in results]
-            assert all(abs(s - scores[0]) < 1e-6 for s in scores)
-            # GaussDB sorts ties by ID ASC
-            ids = _ids(results)
-            assert ids == sorted(ids), "Tie-breaking should be stable (by ID)"
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=3, filters={"user_id": "u6011"})
+        assert len(results) == 3
+        scores = [r.score for r in results]
+        assert all(abs(s - scores[0]) < 1e-6 for s in scores)
+        ids = _ids(results)
+        assert ids == sorted(ids), "Tie-breaking should be stable (by ID)"
 
     def test_score_precision_decimal_places(self):
         """Scores should have reasonable floating-point precision."""
-        db = _new_db(prefix="p1_search", vector_metric="cosine")
-        try:
-            _insert_memories(db, [
-                (_uuid(6021), [0.9, 0.1, 0.0], _make_payload("precise_a", "edge_user")),
-                (_uuid(6022), [0.8, 0.2, 0.0], _make_payload("precise_b", "edge_user")),
-            ])
-            results = db.search("query", [1.0, 0.0, 0.0], top_k=2, filters={"user_id": "edge_user"})
-            assert len(results) == 2
-            # Scores should be distinguishable (not rounded to same value)
-            assert results[0].score != results[1].score
-            # Scores should have at least 4 decimal places of precision
-            for r in results:
-                score_str = f"{r.score:.6f}"
-                assert len(score_str) >= 6  # e.g., "0.987654"
-        finally:
-            db.delete_col()
+        results = self.db_cosine.search("query", [1.0, 0.0, 0.0], top_k=2, filters={"user_id": "u6021"})
+        assert len(results) == 2
+        assert results[0].score != results[1].score
+        for r in results:
+            score_str = f"{r.score:.6f}"
+            assert len(score_str) >= 6
 
     def test_large_dataset_sorting_correctness(self):
         """1000 items with top_k=100 should return correctly sorted results."""
-        db = _new_db(prefix="p1_search", vector_metric="l2")
-        try:
-            import random
-            random.seed(123)
-
-            # Insert 1000 vectors
-            batch_size = 100
-            for batch_start in range(0, 1000, batch_size):
-                records = []
-                for i in range(batch_start, batch_start + batch_size):
-                    vec = [random.uniform(-1, 1) for _ in range(3)]
-                    records.append((_uuid(6100 + i), vec, _make_payload(f"item_{i}", "edge_user")))
-                _insert_memories(db, records)
-
-            # Search with top_k=100
-            query = [0.0, 0.0, 0.0]
-            results = db.search("query", query, top_k=100, filters={"user_id": "edge_user"})
-
-            assert len(results) == 100
-            # Verify scores are in descending order
-            scores = [r.score for r in results]
-            for i in range(len(scores) - 1):
-                assert scores[i] >= scores[i + 1], (
-                    f"Score at position {i} ({scores[i]}) should be >= score at position {i+1} ({scores[i+1]})"
-                )
-        finally:
-            db.delete_col()
+        query = [0.0, 0.0, 0.0]
+        results = self.db_l2.search("query", query, top_k=100, filters={"user_id": "u6100"})
+        assert len(results) == 100
+        scores = [r.score for r in results]
+        for i in range(len(scores) - 1):
+            assert scores[i] >= scores[i + 1], (
+                f"Score at position {i} ({scores[i]}) should be >= score at position {i+1} ({scores[i+1]})"
+            )
 
 
 
@@ -2057,150 +1585,118 @@ class TestVectorDimensionBoundary:
 class TestPayloadBoundary:
     """Tests for payload edge cases."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="p1_payload")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_empty_payload(self):
         """Empty payload dict should be insertable."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2001)
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{}])
-            result = db.get(vid)
-            assert result is not None
-        finally:
-            db.delete_col()
+        vid = _uuid(2001)
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{}])
+        result = self.db.get(vid)
+        assert result is not None
 
     def test_large_payload_100kb(self):
         """Large payload (~100KB) should be insertable and retrievable."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2002)
-            large_value = "x" * 100_000
-            payload = {"data": "large payload", "user_id": "payload_user", "big_field": large_value}
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["big_field"] == large_value
-        finally:
-            db.delete_col()
+        vid = _uuid(2002)
+        large_value = "x" * 100_000
+        payload = {"data": "large payload", "user_id": "payload_user", "big_field": large_value}
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["big_field"] == large_value
 
     def test_deeply_nested_payload(self):
         """Deeply nested payload (5 levels) should be stored correctly."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2003)
-            nested = {"level1": {"level2": {"level3": {"level4": {"level5": "deep_value"}}}}}
-            payload = {"data": "nested payload", "user_id": "payload_user", "nested": nested}
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["nested"]["level1"]["level2"]["level3"]["level4"]["level5"] == "deep_value"
-        finally:
-            db.delete_col()
+        vid = _uuid(2003)
+        nested = {"level1": {"level2": {"level3": {"level4": {"level5": "deep_value"}}}}}
+        payload = {"data": "nested payload", "user_id": "payload_user", "nested": nested}
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["nested"]["level1"]["level2"]["level3"]["level4"]["level5"] == "deep_value"
 
     def test_special_characters_in_payload(self):
         """Special characters in payload values should be preserved."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2004)
-            special = "Hello 'world' \"quotes\" \\backslash\\ <html>&amp; \t\n"
-            payload = {"data": special, "user_id": "payload_user", "special": special}
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["special"] == special
-        finally:
-            db.delete_col()
+        vid = _uuid(2004)
+        special = "Hello 'world' \"quotes\" \\backslash\\ <html>&amp; \t\n"
+        payload = {"data": special, "user_id": "payload_user", "special": special}
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["special"] == special
 
     def test_unicode_payload_chinese_and_emoji(self):
         """Unicode (Chinese, emoji) in payload should round-trip correctly."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2005)
-            unicode_text = "你好世界 🌍🚀 日本語テスト"
-            payload = {"data": unicode_text, "user_id": "payload_user", "text": unicode_text}
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["text"] == unicode_text
-        finally:
-            db.delete_col()
+        vid = _uuid(2005)
+        unicode_text = "你好世界 🌍🚀 日本語テスト"
+        payload = {"data": unicode_text, "user_id": "payload_user", "text": unicode_text}
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["text"] == unicode_text
 
     def test_very_long_key_in_payload(self):
         """Very long key name (128 chars) in payload should work."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2006)
-            long_key = "k" * 128
-            payload = {"data": "long key", "user_id": "payload_user", long_key: "value"}
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload[long_key] == "value"
-        finally:
-            db.delete_col()
+        vid = _uuid(2006)
+        long_key = "k" * 128
+        payload = {"data": "long key", "user_id": "payload_user", long_key: "value"}
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload[long_key] == "value"
 
     def test_very_long_value_in_payload(self):
         """Very long value (10KB string) in payload should work."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2007)
-            long_value = "v" * 10_000
-            payload = {"data": "long value", "user_id": "payload_user", "long_val": long_value}
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["long_val"] == long_value
-        finally:
-            db.delete_col()
+        vid = _uuid(2007)
+        long_value = "v" * 10_000
+        payload = {"data": "long value", "user_id": "payload_user", "long_val": long_value}
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["long_val"] == long_value
 
     def test_null_value_in_payload(self):
         """None/null value in payload should be preserved."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2008)
-            payload = {"data": "null test", "user_id": "payload_user", "nullable": None}
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload.get("nullable") is None
-        finally:
-            db.delete_col()
+        vid = _uuid(2008)
+        payload = {"data": "null test", "user_id": "payload_user", "nullable": None}
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload.get("nullable") is None
 
     def test_boolean_values_in_payload(self):
         """Boolean values in payload should be preserved."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2009)
-            payload = {"data": "bool test", "user_id": "payload_user", "flag_true": True, "flag_false": False}
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["flag_true"] is True
-            assert result.payload["flag_false"] is False
-        finally:
-            db.delete_col()
+        vid = _uuid(2009)
+        payload = {"data": "bool test", "user_id": "payload_user", "flag_true": True, "flag_false": False}
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["flag_true"] is True
+        assert result.payload["flag_false"] is False
 
     def test_numeric_values_in_payload(self):
         """Numeric values (int, float) in payload should be preserved."""
-        db = _new_db(prefix="p1_payload")
-        try:
-            vid = _uuid(2010)
-            payload = {
-                "data": "numeric test",
-                "user_id": "payload_user",
-                "int_val": 42,
-                "float_val": 3.14,
-                "negative": -100,
-                "zero": 0,
-            }
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["int_val"] == 42
-            assert abs(result.payload["float_val"] - 3.14) < 0.001
-            assert result.payload["negative"] == -100
-            assert result.payload["zero"] == 0
-        finally:
-            db.delete_col()
+        vid = _uuid(2010)
+        payload = {
+            "data": "numeric test",
+            "user_id": "payload_user",
+            "int_val": 42,
+            "float_val": 3.14,
+            "negative": -100,
+            "zero": 0,
+        }
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["int_val"] == 42
+        assert abs(result.payload["float_val"] - 3.14) < 0.001
+        assert result.payload["negative"] == -100
+        assert result.payload["zero"] == 0
 
 
 # ===========================================================================
@@ -2211,100 +1707,76 @@ class TestPayloadBoundary:
 class TestIDBoundary:
     """Tests for ID edge cases."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="p1_id")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_uuid_format_id(self):
         """Standard UUID format ID should work."""
-        db = _new_db(prefix="p1_id")
-        try:
-            vid = str(uuid.uuid4())
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{"data": "uuid id", "user_id": "id_user"}])
-            result = db.get(vid)
-            assert result is not None
-            assert result.id == vid
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{"data": "uuid id", "user_id": "id_uuid"}])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.id == vid
 
     def test_deterministic_uuid_format(self):
         """Deterministic UUID format should work."""
-        db = _new_db(prefix="p1_id")
-        try:
-            vid = _uuid(3001)
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{"data": "det uuid", "user_id": "id_user"}])
-            result = db.get(vid)
-            assert result is not None
-            assert result.id == vid
-        finally:
-            db.delete_col()
+        vid = _uuid(3001)
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{"data": "det uuid", "user_id": "id_det"}])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.id == vid
 
     def test_duplicate_id_upsert_behavior(self):
         """Inserting with duplicate ID should upsert (update existing)."""
-        db = _new_db(prefix="p1_id")
-        try:
-            vid = _uuid(3002)
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{"data": "original", "user_id": "id_user"}])
-            db.insert(ids=[vid], vectors=[VECTOR_FLIGHT], payloads=[{"data": "updated", "user_id": "id_user"}])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["data"] == "updated"
-        finally:
-            db.delete_col()
+        vid = _uuid(3002)
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{"data": "original", "user_id": "id_dup"}])
+        self.db.insert(ids=[vid], vectors=[VECTOR_FLIGHT], payloads=[{"data": "updated", "user_id": "id_dup"}])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["data"] == "updated"
 
     def test_batch_with_duplicate_ids(self):
         """Batch insert with duplicate IDs should raise UniqueViolation."""
-        db = _new_db(prefix="p1_id")
-        try:
-            vid = _uuid(3003)
-            with pytest.raises(Exception):
-                db.insert(
-                    ids=[vid, vid],
-                    vectors=[VECTOR_COFFEE, VECTOR_FLIGHT],
-                    payloads=[
-                        {"data": "first", "user_id": "id_user"},
-                        {"data": "second", "user_id": "id_user"},
-                    ],
-                )
-        finally:
-            db.delete_col()
+        vid = _uuid(3003)
+        with pytest.raises(Exception):
+            self.db.insert(
+                ids=[vid, vid],
+                vectors=[VECTOR_COFFEE, VECTOR_FLIGHT],
+                payloads=[
+                    {"data": "first", "user_id": "id_batchdup"},
+                    {"data": "second", "user_id": "id_batchdup"},
+                ],
+            )
 
     def test_multiple_unique_ids(self):
         """Multiple unique IDs should all be retrievable."""
-        db = _new_db(prefix="p1_id")
-        try:
-            ids = [_uuid(3010 + i) for i in range(5)]
-            vectors = [VECTOR_COFFEE] * 5
-            payloads = [{"data": f"item_{i}", "user_id": "id_user"} for i in range(5)]
-            db.insert(ids=ids, vectors=vectors, payloads=payloads)
-            for i, vid in enumerate(ids):
-                result = db.get(vid)
-                assert result is not None
-                assert result.payload["data"] == f"item_{i}"
-        finally:
-            db.delete_col()
+        ids = [_uuid(3010 + i) for i in range(5)]
+        vectors = [VECTOR_COFFEE] * 5
+        payloads = [{"data": f"item_{i}", "user_id": "id_multi"} for i in range(5)]
+        self.db.insert(ids=ids, vectors=vectors, payloads=payloads)
+        for i, vid in enumerate(ids):
+            result = self.db.get(vid)
+            assert result is not None
+            assert result.payload["data"] == f"item_{i}"
 
     def test_null_id_raises(self):
         """None as ID should raise an error."""
-        db = _new_db(prefix="p1_id")
-        try:
-            with pytest.raises((ValueError, TypeError, Exception)):
-                db.insert(ids=[None], vectors=[VECTOR_COFFEE], payloads=[{"data": "null id", "user_id": "id_user"}])
-        finally:
-            db.delete_col()
+        with pytest.raises((ValueError, TypeError, Exception)):
+            self.db.insert(ids=[None], vectors=[VECTOR_COFFEE], payloads=[{"data": "null id", "user_id": "id_null"}])
 
     def test_get_nonexistent_id_returns_none(self):
         """Getting a non-existent ID should return None."""
-        db = _new_db(prefix="p1_id")
-        try:
-            result = db.get(_uuid(9999))
-            assert result is None
-        finally:
-            db.delete_col()
+        result = self.db.get(_uuid(9999))
+        assert result is None
 
     def test_delete_nonexistent_id_no_error(self):
         """Deleting a non-existent ID should not raise an error."""
-        db = _new_db(prefix="p1_id")
-        try:
-            db.delete(_uuid(9998))  # Should not raise
-        finally:
-            db.delete_col()
+        self.db.delete(_uuid(9998))
 
 
 # ===========================================================================
@@ -2374,80 +1846,46 @@ class TestCollectionNameBoundary:
 class TestTopKBoundary:
     """Tests for top_k parameter edge cases."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="topk_boundary")
+        _insert_memories(cls.db, [
+            (_uuid(5001), VECTOR_COFFEE, {"data": "item_0", "user_id": "topk_user"}),
+            (_uuid(5002), VECTOR_FLIGHT, {"data": "item_1", "user_id": "topk_user"}),
+            (_uuid(5003), VECTOR_WINDOW, {"data": "item_2", "user_id": "topk_user"}),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_top_k_one_returns_single_result(self):
         """top_k=1 should return exactly one result."""
-        db = _new_db(prefix="p1_topk")
-        try:
-            for i in range(3):
-                db.insert(
-                    ids=[_uuid(5001 + i)],
-                    vectors=[VECTOR_COFFEE],
-                    payloads=[{"data": f"item_{i}", "user_id": "topk_user"}],
-                )
-            results = db.search("item", VECTOR_COFFEE, top_k=1, filters={"user_id": "topk_user"})
-            assert len(results) == 1
-        finally:
-            db.delete_col()
+        results = self.db.search("item", VECTOR_COFFEE, top_k=1, filters={"user_id": "topk_user"})
+        assert len(results) == 1
 
     def test_top_k_exceeds_data_count(self):
         """top_k larger than data count should return all available results."""
-        db = _new_db(prefix="p1_topk")
-        try:
-            for i in range(3):
-                db.insert(
-                    ids=[_uuid(5011 + i)],
-                    vectors=[VECTOR_COFFEE],
-                    payloads=[{"data": f"item_{i}", "user_id": "topk_user"}],
-                )
-            results = db.search("item", VECTOR_COFFEE, top_k=100, filters={"user_id": "topk_user"})
-            assert len(results) == 3
-        finally:
-            db.delete_col()
+        results = self.db.search("item", VECTOR_COFFEE, top_k=100, filters={"user_id": "topk_user"})
+        assert len(results) == 3
 
     def test_top_k_very_large_value(self):
         """Very large top_k should not crash."""
-        db = _new_db(prefix="p1_topk")
-        try:
-            db.insert(
-                ids=[_uuid(5021)],
-                vectors=[VECTOR_COFFEE],
-                payloads=[{"data": "single", "user_id": "topk_user"}],
-            )
-            results = db.search("single", VECTOR_COFFEE, top_k=10000, filters={"user_id": "topk_user"})
-            assert len(results) == 1
-        finally:
-            db.delete_col()
+        results = self.db.search("single", VECTOR_COFFEE, top_k=10000, filters={"user_id": "topk_user"})
+        assert len(results) >= 1
 
     def test_top_k_zero_returns_empty(self):
         """top_k=0 should return empty results or raise."""
-        db = _new_db(prefix="p1_topk")
-        try:
-            db.insert(
-                ids=[_uuid(5031)],
-                vectors=[VECTOR_COFFEE],
-                payloads=[{"data": "item", "user_id": "topk_user"}],
-            )
-            results = db.search("item", VECTOR_COFFEE, top_k=0, filters={"user_id": "topk_user"})
-            assert len(results) == 0
-        finally:
-            db.delete_col()
+        results = self.db.search("item", VECTOR_COFFEE, top_k=0, filters={"user_id": "topk_user"})
+        assert len(results) == 0
 
     def test_top_k_negative_raises_or_empty(self):
         """Negative top_k should raise an error or return empty."""
-        db = _new_db(prefix="p1_topk")
         try:
-            db.insert(
-                ids=[_uuid(5041)],
-                vectors=[VECTOR_COFFEE],
-                payloads=[{"data": "item", "user_id": "topk_user"}],
-            )
-            try:
-                results = db.search("item", VECTOR_COFFEE, top_k=-1, filters={"user_id": "topk_user"})
-                assert len(results) == 0
-            except (ValueError, Exception):
-                pass  # Raising is also acceptable
-        finally:
-            db.delete_col()
+            results = self.db.search("item", VECTOR_COFFEE, top_k=-1, filters={"user_id": "topk_user"})
+            assert len(results) == 0
+        except (ValueError, Exception):
+            pass
 
 
 # ===========================================================================
@@ -2458,84 +1896,69 @@ class TestTopKBoundary:
 class TestBatchOperationBoundary:
     """Tests for batch operation edge cases."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="p1_batch")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_empty_batch_insert(self):
         """Empty batch insert should not crash."""
-        db = _new_db(prefix="p1_batch")
-        try:
-            result = db.insert(ids=[], vectors=[], payloads=[])
-            # Should either return None or handle gracefully
-            assert result is None or result == []
-        finally:
-            db.delete_col()
+        result = self.db.insert(ids=[], vectors=[], payloads=[])
+        assert result is None or result == []
 
     def test_single_item_batch(self):
         """Single-item batch should work like single insert."""
-        db = _new_db(prefix="p1_batch")
-        try:
-            vid = _uuid(6001)
-            db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{"data": "single batch", "user_id": "batch_user"}])
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["data"] == "single batch"
-        finally:
-            db.delete_col()
+        vid = _uuid(6001)
+        self.db.insert(ids=[vid], vectors=[VECTOR_COFFEE], payloads=[{"data": "single batch", "user_id": "batch_single"}])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["data"] == "single batch"
 
     def test_large_batch_insert_1000_items(self):
         """Large batch (1000 items) should complete successfully."""
-        db = _new_db(prefix="p1_batch")
-        try:
-            count = 1000
-            ids = [_uuid(6100 + i) for i in range(count)]
-            vectors = [[float(i % 10) / 10, float(i % 5) / 5, float(i % 3) / 3] for i in range(count)]
-            payloads = [{"data": f"batch_item_{i}", "user_id": "batch_user"} for i in range(count)]
-            db.insert(ids=ids, vectors=vectors, payloads=payloads)
+        count = 1000
+        ids = [_uuid(6100 + i) for i in range(count)]
+        vectors = [[float(i % 10) / 10, float(i % 5) / 5, float(i % 3) / 3] for i in range(count)]
+        payloads = [{"data": f"batch_item_{i}", "user_id": "batch_large"} for i in range(count)]
+        self.db.insert(ids=ids, vectors=vectors, payloads=payloads)
 
-            # Verify a sample
-            result = db.get(ids[0])
-            assert result is not None
-            result = db.get(ids[999])
-            assert result is not None
-        finally:
-            db.delete_col()
+        result = self.db.get(ids[0])
+        assert result is not None
+        result = self.db.get(ids[999])
+        assert result is not None
 
     def test_batch_search_with_multiple_queries(self):
         """search_batch with multiple queries should return results for each."""
-        db = _new_db(prefix="p1_batch")
-        try:
-            _insert_memories(
-                db,
-                [
-                    (_uuid(6201), VECTOR_COFFEE, {"data": "coffee memory", "user_id": "batch_user"}),
-                    (_uuid(6202), VECTOR_FLIGHT, {"data": "flight memory", "user_id": "batch_user"}),
-                ],
-            )
-            results = db.search_batch(
-                ["coffee", "flight"],
-                [VECTOR_COFFEE, VECTOR_FLIGHT],
-                top_k=5,
-                filters={"user_id": "batch_user"},
-            )
-            assert len(results) == 2
-            assert len(results[0]) >= 1
-            assert len(results[1]) >= 1
-        finally:
-            db.delete_col()
+        _insert_memories(
+            self.db,
+            [
+                (_uuid(6201), VECTOR_COFFEE, {"data": "coffee memory", "user_id": "batch_search"}),
+                (_uuid(6202), VECTOR_FLIGHT, {"data": "flight memory", "user_id": "batch_search"}),
+            ],
+        )
+        results = self.db.search_batch(
+            ["coffee", "flight"],
+            [VECTOR_COFFEE, VECTOR_FLIGHT],
+            top_k=5,
+            filters={"user_id": "batch_search"},
+        )
+        assert len(results) == 2
+        assert len(results[0]) >= 1
+        assert len(results[1]) >= 1
 
     def test_batch_insert_partial_failure_handling(self):
         """Batch with some invalid data should handle gracefully."""
-        db = _new_db(prefix="p1_batch")
-        try:
-            # Insert valid data first
-            valid_id = _uuid(6301)
-            db.insert(
-                ids=[valid_id],
-                vectors=[VECTOR_COFFEE],
-                payloads=[{"data": "valid item", "user_id": "batch_user"}],
-            )
-            result = db.get(valid_id)
-            assert result is not None
-        finally:
-            db.delete_col()
+        valid_id = _uuid(6301)
+        self.db.insert(
+            ids=[valid_id],
+            vectors=[VECTOR_COFFEE],
+            payloads=[{"data": "valid item", "user_id": "batch_partial"}],
+        )
+        result = self.db.get(valid_id)
+        assert result is not None
 
 
 
@@ -2543,744 +1966,502 @@ class TestBatchOperationBoundary:
 # Multi-tenant Isolation Tests (from test_gaussdb_p1_multitenant.py)
 # ===========================================================================
 
-class TestUserIdIsolation:
-    """Tests for user_id based multi-tenant isolation."""
+class TestScopeIsolationCRUD:
+    """Tests for user_id, agent_id, run_id, and combined scope isolation with CRUD."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="p1_mt")
+        _insert_memories(cls.db, [
+            # user_id isolation data
+            (_uuid(7001), VECTOR_COFFEE, _make_payload("alice coffee", user_id="mt_alice")),
+            (_uuid(7002), VECTOR_FLIGHT, _make_payload("bob flight", user_id="mt_bob")),
+            (_uuid(7011), VECTOR_COFFEE, _make_payload("alice likes coffee", user_id="mt_alice")),
+            (_uuid(7012), VECTOR_WINDOW, _make_payload("alice likes window", user_id="mt_alice")),
+            (_uuid(7013), VECTOR_COFFEE, _make_payload("bob likes coffee", user_id="mt_bob")),
+            (_uuid(7014), VECTOR_FLIGHT, _make_payload("charlie flight", user_id="mt_charlie")),
+            (_uuid(7021), VECTOR_COFFEE, _make_payload("alice mem1", user_id="mt_alice_list")),
+            (_uuid(7022), VECTOR_FLIGHT, _make_payload("alice mem2", user_id="mt_alice_list")),
+            (_uuid(7023), VECTOR_WINDOW, _make_payload("bob mem1", user_id="mt_bob_list")),
+            # delete scope data (uses exclusive user_ids)
+            (_uuid(7031), VECTOR_COFFEE, _make_payload("alice data", user_id="mt_del_alice")),
+            (_uuid(7032), VECTOR_FLIGHT, _make_payload("bob data", user_id="mt_del_bob")),
+            # delete_all scope data (exclusive user_ids)
+            (_uuid(7041), VECTOR_COFFEE, _make_payload("alice mem1", user_id="mt_delall_alice")),
+            (_uuid(7042), VECTOR_WINDOW, _make_payload("alice mem2", user_id="mt_delall_alice")),
+            (_uuid(7043), VECTOR_FLIGHT, _make_payload("bob mem1", user_id="mt_delall_bob")),
+            (_uuid(7044), VECTOR_AISLE, _make_payload("bob mem2", user_id="mt_delall_bob")),
+            # agent_id isolation data
+            (_uuid(7101), VECTOR_COFFEE, _make_payload("support chat", user_id="mt_agent_alice", agent_id="support_bot")),
+            (_uuid(7102), VECTOR_FLIGHT, _make_payload("travel chat", user_id="mt_agent_alice", agent_id="travel_bot")),
+            (_uuid(7103), VECTOR_WINDOW, _make_payload("coding chat", user_id="mt_agent_alice", agent_id="code_bot")),
+            (_uuid(7111), VECTOR_COFFEE, _make_payload("alice support", user_id="mt_cross_alice", agent_id="support_bot")),
+            (_uuid(7112), VECTOR_FLIGHT, _make_payload("bob support", user_id="mt_cross_bob", agent_id="support_bot")),
+            (_uuid(7121), VECTOR_COFFEE, _make_payload("agent1 data", user_id="mt_opt_alice", agent_id="agent1")),
+            (_uuid(7122), VECTOR_FLIGHT, _make_payload("agent2 data", user_id="mt_opt_alice", agent_id="agent2")),
+            (_uuid(7123), VECTOR_WINDOW, _make_payload("agent3 data", user_id="mt_opt_alice", agent_id="agent3")),
+            (_uuid(7131), VECTOR_COFFEE, _make_payload("travel mem1", user_id="mt_alist_alice", agent_id="travel_bot")),
+            (_uuid(7132), VECTOR_FLIGHT, _make_payload("travel mem2", user_id="mt_alist_alice", agent_id="travel_bot")),
+            (_uuid(7133), VECTOR_WINDOW, _make_payload("support mem1", user_id="mt_alist_alice", agent_id="support_bot")),
+            (_uuid(7141), VECTOR_COFFEE, _make_payload("alice travel", user_id="mt_comb_alice", agent_id="travel_bot")),
+            (_uuid(7142), VECTOR_FLIGHT, _make_payload("bob travel", user_id="mt_comb_bob", agent_id="travel_bot")),
+            (_uuid(7143), VECTOR_WINDOW, _make_payload("alice support", user_id="mt_comb_alice", agent_id="support_bot")),
+            # run_id isolation data
+            (_uuid(7201), VECTOR_COFFEE, _make_payload("run1 data", user_id="mt_run_alice", run_id="run_001")),
+            (_uuid(7202), VECTOR_FLIGHT, _make_payload("run2 data", user_id="mt_run_alice", run_id="run_002")),
+            (_uuid(7203), VECTOR_WINDOW, _make_payload("run3 data", user_id="mt_run_alice", run_id="run_003")),
+            (_uuid(7211), VECTOR_COFFEE, _make_payload("run1 list", user_id="mt_runlist_alice", run_id="run_001")),
+            (_uuid(7212), VECTOR_FLIGHT, _make_payload("run1 list2", user_id="mt_runlist_alice", run_id="run_001")),
+            (_uuid(7213), VECTOR_WINDOW, _make_payload("run2 list", user_id="mt_runlist_alice", run_id="run_002")),
+            (_uuid(7221), VECTOR_COFFEE, _make_payload("run cross alice", user_id="mt_runcross_alice", run_id="run_001")),
+            (_uuid(7222), VECTOR_FLIGHT, _make_payload("run cross bob", user_id="mt_runcross_bob", run_id="run_001")),
+            # combined scope data
+            (_uuid(7301), VECTOR_COFFEE, _make_payload("target", user_id="mt_scope_alice", agent_id="bot_a", run_id="run_001")),
+            (_uuid(7302), VECTOR_FLIGHT, _make_payload("diff run", user_id="mt_scope_alice", agent_id="bot_a", run_id="run_002")),
+            (_uuid(7303), VECTOR_WINDOW, _make_payload("diff agent", user_id="mt_scope_alice", agent_id="bot_b", run_id="run_001")),
+            (_uuid(7304), VECTOR_AISLE, _make_payload("diff user", user_id="mt_scope_bob", agent_id="bot_a", run_id="run_001")),
+            (_uuid(7311), VECTOR_COFFEE, _make_payload("full match", user_id="mt_partial_alice", agent_id="bot_a", run_id="run_001")),
+            (_uuid(7312), VECTOR_FLIGHT, _make_payload("partial mismatch", user_id="mt_partial_alice", agent_id="bot_a", run_id="run_999")),
+            (_uuid(7321), VECTOR_COFFEE, _make_payload("some data", user_id="mt_empty_alice", agent_id="bot_a", run_id="run_001")),
+            (_uuid(7322), VECTOR_FLIGHT, _make_payload("other data", user_id="mt_empty_bob", agent_id="bot_b", run_id="run_002")),
+            (_uuid(7331), VECTOR_COFFEE, _make_payload("alice bot_a", user_id="mt_wild_alice", agent_id="bot_a")),
+            (_uuid(7332), VECTOR_FLIGHT, _make_payload("alice bot_b", user_id="mt_wild_alice", agent_id="bot_b")),
+            (_uuid(7333), VECTOR_WINDOW, _make_payload("alice bot_c", user_id="mt_wild_alice", agent_id="bot_c")),
+            (_uuid(7334), VECTOR_AISLE, _make_payload("bob bot_a", user_id="mt_wild_bob", agent_id="bot_a")),
+        ])
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
+    # --- user_id isolation ---
 
     def test_memory_add_user_id_isolation(self):
         """Data added for alice should not be visible to bob."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            alice_id = _uuid(7001)
-            bob_id = _uuid(7002)
-            _insert_memories(db, [
-                (alice_id, VECTOR_COFFEE, _make_payload("alice coffee", user_id="alice")),
-                (bob_id, VECTOR_FLIGHT, _make_payload("bob flight", user_id="bob")),
-            ])
-            # Search as bob should not return alice's data
-            results = db.search("coffee", VECTOR_COFFEE, top_k=10, filters={"user_id": "bob"})
-            result_ids = _ids(results)
-            assert alice_id not in result_ids
-            assert bob_id in result_ids
-        finally:
-            db.delete_col()
+        results = self.db.search("coffee", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_bob"})
+        result_ids = _ids(results)
+        assert _uuid(7001) not in result_ids
+        assert _uuid(7002) in result_ids
 
     def test_memory_search_user_id_isolation(self):
         """Search with user_id filter returns only that user's data."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7011), VECTOR_COFFEE, _make_payload("alice likes coffee", user_id="alice")),
-                (_uuid(7012), VECTOR_WINDOW, _make_payload("alice likes window", user_id="alice")),
-                (_uuid(7013), VECTOR_COFFEE, _make_payload("bob likes coffee", user_id="bob")),
-                (_uuid(7014), VECTOR_FLIGHT, _make_payload("charlie flight", user_id="charlie")),
-            ])
-            results = db.search("coffee", VECTOR_COFFEE, top_k=10, filters={"user_id": "alice"})
-            result_ids = set(_ids(results))
-            # Only alice's records should appear
-            assert _uuid(7011) in result_ids
-            assert _uuid(7012) in result_ids
-            assert _uuid(7013) not in result_ids
-            assert _uuid(7014) not in result_ids
-        finally:
-            db.delete_col()
+        results = self.db.search("coffee", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_alice"})
+        result_ids = set(_ids(results))
+        assert _uuid(7011) in result_ids
+        assert _uuid(7012) in result_ids
+        assert _uuid(7013) not in result_ids
+        assert _uuid(7014) not in result_ids
 
     def test_memory_get_all_user_id_filter(self):
         """list with user_id filter returns only that user's data."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7021), VECTOR_COFFEE, _make_payload("alice mem1", user_id="alice")),
-                (_uuid(7022), VECTOR_FLIGHT, _make_payload("alice mem2", user_id="alice")),
-                (_uuid(7023), VECTOR_WINDOW, _make_payload("bob mem1", user_id="bob")),
-            ])
-            results = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
-            _assert_exact_ids(results, {_uuid(7021), _uuid(7022)})
-        finally:
-            db.delete_col()
+        results = _list_flat(self.db, filters={"user_id": "mt_alice_list"}, top_k=100)
+        _assert_exact_ids(results, {_uuid(7021), _uuid(7022)})
 
     def test_memory_delete_user_id_scope(self):
         """Deleting alice's record doesn't affect bob's data."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            alice_id = _uuid(7031)
-            bob_id = _uuid(7032)
-            _insert_memories(db, [
-                (alice_id, VECTOR_COFFEE, _make_payload("alice data", user_id="alice")),
-                (bob_id, VECTOR_FLIGHT, _make_payload("bob data", user_id="bob")),
-            ])
-            # Delete alice's record
-            db.delete(vector_id=alice_id)
-            # Bob's data should still exist
-            bob_result = db.get(bob_id)
-            assert bob_result is not None
-            # Alice's data should be gone
-            alice_result = db.get(alice_id)
-            assert alice_result is None
-        finally:
-            db.delete_col()
+        self.db.delete(vector_id=_uuid(7031))
+        bob_result = self.db.get(_uuid(7032))
+        assert bob_result is not None
+        alice_result = self.db.get(_uuid(7031))
+        assert alice_result is None
 
     def test_memory_delete_all_user_id_scope(self):
         """delete_all for alice preserves bob's data."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7041), VECTOR_COFFEE, _make_payload("alice mem1", user_id="alice")),
-                (_uuid(7042), VECTOR_WINDOW, _make_payload("alice mem2", user_id="alice")),
-                (_uuid(7043), VECTOR_FLIGHT, _make_payload("bob mem1", user_id="bob")),
-                (_uuid(7044), VECTOR_AISLE, _make_payload("bob mem2", user_id="bob")),
-            ])
-            # Get alice's IDs and delete them
-            alice_records = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
-            alice_ids = _ids(alice_records)
-            for aid in alice_ids:
-                db.delete(vector_id=aid)
-            # Bob's data should be preserved
-            bob_records = _list_flat(db, filters={"user_id": "bob"}, top_k=100)
-            _assert_exact_ids(bob_records, {_uuid(7043), _uuid(7044)})
-            # Alice should have nothing
-            alice_after = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
-            assert len(alice_after) == 0
-        finally:
-            db.delete_col()
+        alice_records = _list_flat(self.db, filters={"user_id": "mt_delall_alice"}, top_k=100)
+        alice_ids = _ids(alice_records)
+        for aid in alice_ids:
+            self.db.delete(vector_id=aid)
+        bob_records = _list_flat(self.db, filters={"user_id": "mt_delall_bob"}, top_k=100)
+        _assert_exact_ids(bob_records, {_uuid(7043), _uuid(7044)})
+        alice_after = _list_flat(self.db, filters={"user_id": "mt_delall_alice"}, top_k=100)
+        assert len(alice_after) == 0
 
-
-# ===========================================================================
-# 7.2.2 agent_id Multi-tenant Isolation (5 tests)
-# ===========================================================================
-
-
-class TestAgentIdIsolation:
-    """Tests for agent_id based multi-tenant isolation."""
+    # --- agent_id isolation ---
 
     def test_agent_id_isolation_basic(self):
         """Same user, different agents should be isolated when filtered."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7101), VECTOR_COFFEE, _make_payload("support chat", user_id="alice", agent_id="support_bot")),
-                (_uuid(7102), VECTOR_FLIGHT, _make_payload("travel chat", user_id="alice", agent_id="travel_bot")),
-                (_uuid(7103), VECTOR_WINDOW, _make_payload("coding chat", user_id="alice", agent_id="code_bot")),
-            ])
-            results = db.search("chat", VECTOR_COFFEE, top_k=10, filters={"agent_id": "support_bot"})
-            result_ids = _ids(results)
-            assert _uuid(7101) in result_ids
-            assert _uuid(7102) not in result_ids
-            assert _uuid(7103) not in result_ids
-        finally:
-            db.delete_col()
+        results = self.db.search("chat", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_agent_alice", "agent_id": "support_bot"})
+        result_ids = _ids(results)
+        assert _uuid(7101) in result_ids
+        assert _uuid(7102) not in result_ids
+        assert _uuid(7103) not in result_ids
 
     def test_agent_id_cross_user_isolation(self):
         """Different users with same agent_id should be isolated by user_id."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7111), VECTOR_COFFEE, _make_payload("alice support", user_id="alice", agent_id="support_bot")),
-                (_uuid(7112), VECTOR_FLIGHT, _make_payload("bob support", user_id="bob", agent_id="support_bot")),
-            ])
-            results = db.search("support", VECTOR_COFFEE, top_k=10, filters={"user_id": "alice", "agent_id": "support_bot"})
-            _assert_exact_ids(results, {_uuid(7111)})
-        finally:
-            db.delete_col()
+        results = self.db.search("support", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_cross_alice", "agent_id": "support_bot"})
+        _assert_exact_ids(results, {_uuid(7111)})
 
     def test_agent_id_optional_filter(self):
         """Without agent_id filter, all records for user are visible."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7121), VECTOR_COFFEE, _make_payload("agent1 data", user_id="alice", agent_id="agent1")),
-                (_uuid(7122), VECTOR_FLIGHT, _make_payload("agent2 data", user_id="alice", agent_id="agent2")),
-                (_uuid(7123), VECTOR_WINDOW, _make_payload("agent3 data", user_id="alice", agent_id="agent3")),
-            ])
-            # Filter only by user_id, no agent_id filter
-            results = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
-            _assert_exact_ids(results, {_uuid(7121), _uuid(7122), _uuid(7123)})
-        finally:
-            db.delete_col()
+        results = _list_flat(self.db, filters={"user_id": "mt_opt_alice"}, top_k=100)
+        _assert_exact_ids(results, {_uuid(7121), _uuid(7122), _uuid(7123)})
 
     def test_agent_id_list_filter(self):
         """list filtered by specific agent_id returns only that agent's data."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7131), VECTOR_COFFEE, _make_payload("travel mem1", user_id="alice", agent_id="travel_bot")),
-                (_uuid(7132), VECTOR_FLIGHT, _make_payload("travel mem2", user_id="alice", agent_id="travel_bot")),
-                (_uuid(7133), VECTOR_WINDOW, _make_payload("support mem1", user_id="alice", agent_id="support_bot")),
-            ])
-            results = _list_flat(db, filters={"agent_id": "travel_bot"}, top_k=100)
-            _assert_exact_ids(results, {_uuid(7131), _uuid(7132)})
-        finally:
-            db.delete_col()
+        results = _list_flat(self.db, filters={"user_id": "mt_alist_alice", "agent_id": "travel_bot"}, top_k=100)
+        _assert_exact_ids(results, {_uuid(7131), _uuid(7132)})
 
     def test_agent_id_combined_with_user_id(self):
         """Combined user_id + agent_id filter narrows results correctly."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7141), VECTOR_COFFEE, _make_payload("alice travel", user_id="alice", agent_id="travel_bot")),
-                (_uuid(7142), VECTOR_FLIGHT, _make_payload("bob travel", user_id="bob", agent_id="travel_bot")),
-                (_uuid(7143), VECTOR_WINDOW, _make_payload("alice support", user_id="alice", agent_id="support_bot")),
-            ])
-            results = _list_flat(db, filters={"user_id": "alice", "agent_id": "travel_bot"}, top_k=100)
-            _assert_exact_ids(results, {_uuid(7141)})
-        finally:
-            db.delete_col()
+        results = _list_flat(self.db, filters={"user_id": "mt_comb_alice", "agent_id": "travel_bot"}, top_k=100)
+        _assert_exact_ids(results, {_uuid(7141)})
 
-
-# ===========================================================================
-# 7.2.3 run_id Isolation (3 tests)
-# ===========================================================================
-
-
-class TestRunIdIsolation:
-    """Tests for run_id based isolation."""
+    # --- run_id isolation ---
 
     def test_run_id_isolation_basic(self):
         """Different run_ids should be isolated when filtered."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7201), VECTOR_COFFEE, _make_payload("run1 data", user_id="alice", run_id="run_001")),
-                (_uuid(7202), VECTOR_FLIGHT, _make_payload("run2 data", user_id="alice", run_id="run_002")),
-                (_uuid(7203), VECTOR_WINDOW, _make_payload("run3 data", user_id="alice", run_id="run_003")),
-            ])
-            results = db.search("data", VECTOR_COFFEE, top_k=10, filters={"run_id": "run_001"})
-            result_ids = _ids(results)
-            assert _uuid(7201) in result_ids
-            assert _uuid(7202) not in result_ids
-            assert _uuid(7203) not in result_ids
-        finally:
-            db.delete_col()
+        results = self.db.search("data", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_run_alice", "run_id": "run_001"})
+        result_ids = _ids(results)
+        assert _uuid(7201) in result_ids
+        assert _uuid(7202) not in result_ids
+        assert _uuid(7203) not in result_ids
 
     def test_run_id_combined_with_user_id(self):
         """user_id + run_id combined filter works correctly."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7211), VECTOR_COFFEE, _make_payload("alice run1", user_id="alice", run_id="run_001")),
-                (_uuid(7212), VECTOR_FLIGHT, _make_payload("alice run2", user_id="alice", run_id="run_002")),
-                (_uuid(7213), VECTOR_WINDOW, _make_payload("bob run1", user_id="bob", run_id="run_001")),
-            ])
-            results = _list_flat(db, filters={"user_id": "alice", "run_id": "run_001"}, top_k=100)
-            _assert_exact_ids(results, {_uuid(7211)})
-        finally:
-            db.delete_col()
+        results = _list_flat(self.db, filters={"user_id": "mt_runlist_alice", "run_id": "run_001"}, top_k=100)
+        _assert_exact_ids(results, {_uuid(7211), _uuid(7212)})
 
     def test_run_id_combined_with_agent_id(self):
         """agent_id + run_id combined filter works correctly."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7221), VECTOR_COFFEE, _make_payload("agent1 run1", user_id="alice", agent_id="bot_a", run_id="run_001")),
-                (_uuid(7222), VECTOR_FLIGHT, _make_payload("agent1 run2", user_id="alice", agent_id="bot_a", run_id="run_002")),
-                (_uuid(7223), VECTOR_WINDOW, _make_payload("agent2 run1", user_id="alice", agent_id="bot_b", run_id="run_001")),
-            ])
-            results = _list_flat(db, filters={"agent_id": "bot_a", "run_id": "run_001"}, top_k=100)
-            _assert_exact_ids(results, {_uuid(7221)})
-        finally:
-            db.delete_col()
+        results = self.db.search("run cross", VECTOR_COFFEE, top_k=10, filters={"user_id": "mt_runcross_alice", "run_id": "run_001"})
+        _assert_exact_ids(results, {_uuid(7221)})
 
-
-# ===========================================================================
-# 7.2.4 Combined Scope Isolation (4 tests)
-# ===========================================================================
-
-
-class TestCombinedScopeIsolation:
-    """Tests for combined scope (user_id + agent_id + run_id) isolation."""
+    # --- combined scope isolation ---
 
     def test_scope_all_three_combined(self):
         """user_id + agent_id + run_id combined filter returns exact match."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7301), VECTOR_COFFEE, _make_payload("target", user_id="alice", agent_id="bot_a", run_id="run_001")),
-                (_uuid(7302), VECTOR_FLIGHT, _make_payload("diff run", user_id="alice", agent_id="bot_a", run_id="run_002")),
-                (_uuid(7303), VECTOR_WINDOW, _make_payload("diff agent", user_id="alice", agent_id="bot_b", run_id="run_001")),
-                (_uuid(7304), VECTOR_AISLE, _make_payload("diff user", user_id="bob", agent_id="bot_a", run_id="run_001")),
-            ])
-            results = _list_flat(db,
-                filters={"user_id": "alice", "agent_id": "bot_a", "run_id": "run_001"},
-                top_k=100,
-            )
-            _assert_exact_ids(results, {_uuid(7301)})
-        finally:
-            db.delete_col()
+        results = _list_flat(self.db,
+            filters={"user_id": "mt_scope_alice", "agent_id": "bot_a", "run_id": "run_001"},
+            top_k=100,
+        )
+        _assert_exact_ids(results, {_uuid(7301)})
 
     def test_scope_partial_match_excluded(self):
         """Partial scope match (2 of 3 fields) should not return non-matching data."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7311), VECTOR_COFFEE, _make_payload("full match", user_id="alice", agent_id="bot_a", run_id="run_001")),
-                (_uuid(7312), VECTOR_FLIGHT, _make_payload("partial mismatch", user_id="alice", agent_id="bot_a", run_id="run_999")),
-            ])
-            results = _list_flat(db,
-                filters={"user_id": "alice", "agent_id": "bot_a", "run_id": "run_001"},
-                top_k=100,
-            )
-            _assert_exact_ids(results, {_uuid(7311)})
-        finally:
-            db.delete_col()
+        results = _list_flat(self.db,
+            filters={"user_id": "mt_partial_alice", "agent_id": "bot_a", "run_id": "run_001"},
+            top_k=100,
+        )
+        _assert_exact_ids(results, {_uuid(7311)})
 
     def test_scope_empty_result_on_mismatch(self):
         """Completely wrong scope returns empty results."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7321), VECTOR_COFFEE, _make_payload("some data", user_id="alice", agent_id="bot_a", run_id="run_001")),
-                (_uuid(7322), VECTOR_FLIGHT, _make_payload("other data", user_id="bob", agent_id="bot_b", run_id="run_002")),
-            ])
-            results = _list_flat(db,
-                filters={"user_id": "charlie", "agent_id": "bot_x", "run_id": "run_999"},
-                top_k=100,
-            )
-            assert len(results) == 0
-        finally:
-            db.delete_col()
+        results = _list_flat(self.db,
+            filters={"user_id": "charlie", "agent_id": "bot_x", "run_id": "run_999"},
+            top_k=100,
+        )
+        assert len(results) == 0
 
     def test_scope_wildcard_user_all_agents(self):
         """user_id filter only (no agent_id) sees all agents for that user."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            _insert_memories(db, [
-                (_uuid(7331), VECTOR_COFFEE, _make_payload("alice bot_a", user_id="alice", agent_id="bot_a")),
-                (_uuid(7332), VECTOR_FLIGHT, _make_payload("alice bot_b", user_id="alice", agent_id="bot_b")),
-                (_uuid(7333), VECTOR_WINDOW, _make_payload("alice bot_c", user_id="alice", agent_id="bot_c")),
-                (_uuid(7334), VECTOR_AISLE, _make_payload("bob bot_a", user_id="bob", agent_id="bot_a")),
-            ])
-            results = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
-            _assert_exact_ids(results, {_uuid(7331), _uuid(7332), _uuid(7333)})
-        finally:
-            db.delete_col()
+        results = _list_flat(self.db, filters={"user_id": "mt_wild_alice"}, top_k=100)
+        _assert_exact_ids(results, {_uuid(7331), _uuid(7332), _uuid(7333)})
 
 
 # ===========================================================================
-# 7.2.5 Concurrent Multi-user Operations (3 tests)
+# 7.2.5 Concurrent Multi-user Operations + Concurrent Insert + Upsert Race
 # ===========================================================================
 
 
-class TestConcurrentMultiUser:
-    """Tests for concurrent multi-user operations."""
+class TestConcurrencySafety:
+    """Tests for concurrent multi-user operations, inserts, and upsert races."""
+
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="p2_conc")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
 
     def test_concurrent_multi_user_add(self):
         """5 threads adding data for different users, verify isolation."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            users = [f"user_{i}" for i in range(5)]
-            vectors = [VECTOR_COFFEE, VECTOR_FLIGHT, VECTOR_WINDOW, VECTOR_AISLE, VECTOR_COFFEE]
+        users = [f"conc_add_user_{i}" for i in range(5)]
+        vectors = [VECTOR_COFFEE, VECTOR_FLIGHT, VECTOR_WINDOW, VECTOR_AISLE, VECTOR_COFFEE]
 
-            def add_for_user(idx):
-                uid = users[idx]
-                record_id = _uuid(7400 + idx)
-                db.insert(
-                    ids=[record_id],
-                    vectors=[vectors[idx]],
-                    payloads=[_make_payload(f"{uid} memory", user_id=uid)],
-                )
-                return uid, record_id
+        def add_for_user(idx):
+            uid = users[idx]
+            record_id = _uuid(7400 + idx)
+            self.db.insert(
+                ids=[record_id],
+                vectors=[vectors[idx]],
+                payloads=[_make_payload(f"{uid} memory", user_id=uid)],
+            )
+            return uid, record_id
 
-            # Run concurrent inserts
-            results_map = {}
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {executor.submit(add_for_user, i): i for i in range(5)}
-                for future in as_completed(futures):
-                    uid, record_id = future.result()
-                    results_map[uid] = record_id
+        results_map = {}
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(add_for_user, i): i for i in range(5)}
+            for future in as_completed(futures):
+                uid, record_id = future.result()
+                results_map[uid] = record_id
 
-            # Verify isolation: each user sees only their own data
-            for uid, record_id in results_map.items():
-                user_records = _list_flat(db, filters={"user_id": uid}, top_k=100)
-                assert len(user_records) == 1
-                assert _ids(user_records)[0] == record_id
-        finally:
-            db.delete_col()
+        for uid, record_id in results_map.items():
+            user_records = _list_flat(self.db, filters={"user_id": uid}, top_k=100)
+            assert len(user_records) == 1
+            assert _ids(user_records)[0] == record_id
 
     def test_concurrent_multi_user_search(self):
         """5 threads searching for different users, verify isolation."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            # Pre-populate data for 5 users
-            records = []
-            for i in range(5):
-                uid = f"user_{i}"
-                vectors = [VECTOR_COFFEE, VECTOR_FLIGHT, VECTOR_WINDOW, VECTOR_AISLE, VECTOR_COFFEE]
-                records.append((_uuid(7410 + i), vectors[i], _make_payload(f"{uid} data", user_id=uid)))
-            _insert_memories(db, records)
+        records = []
+        for i in range(5):
+            uid = f"conc_search_user_{i}"
+            vectors = [VECTOR_COFFEE, VECTOR_FLIGHT, VECTOR_WINDOW, VECTOR_AISLE, VECTOR_COFFEE]
+            records.append((_uuid(7410 + i), vectors[i], _make_payload(f"{uid} data", user_id=uid)))
+        _insert_memories(self.db, records)
 
-            def search_for_user(idx):
-                uid = f"user_{idx}"
-                vectors = [VECTOR_COFFEE, VECTOR_FLIGHT, VECTOR_WINDOW, VECTOR_AISLE, VECTOR_COFFEE]
-                results = db.search("data", vectors[idx], top_k=10, filters={"user_id": uid})
-                return uid, results
+        def search_for_user(idx):
+            uid = f"conc_search_user_{idx}"
+            vectors = [VECTOR_COFFEE, VECTOR_FLIGHT, VECTOR_WINDOW, VECTOR_AISLE, VECTOR_COFFEE]
+            results = self.db.search("data", vectors[idx], top_k=10, filters={"user_id": uid})
+            return uid, results
 
-            # Run concurrent searches
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {executor.submit(search_for_user, i): i for i in range(5)}
-                for future in as_completed(futures):
-                    uid, results = future.result()
-                    result_ids = _ids(results)
-                    idx = int(uid.split("_")[1])
-                    expected_id = _uuid(7410 + idx)
-                    assert expected_id in result_ids, f"{uid} should see their own data"
-                    # Verify no other user's data leaked
-                    for other_idx in range(5):
-                        if other_idx != idx:
-                            assert _uuid(7410 + other_idx) not in result_ids
-        finally:
-            db.delete_col()
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(search_for_user, i): i for i in range(5)}
+            for future in as_completed(futures):
+                uid, results = future.result()
+                result_ids = _ids(results)
+                idx = int(uid.split("_")[-1])
+                expected_id = _uuid(7410 + idx)
+                assert expected_id in result_ids, f"{uid} should see their own data"
+                for other_idx in range(5):
+                    if other_idx != idx:
+                        assert _uuid(7410 + other_idx) not in result_ids
 
     def test_concurrent_same_user_diff_agent(self):
         """Same user, different agents concurrent operations maintain isolation."""
-        db = _new_db(prefix="p1_mt")
-        try:
-            agents = [f"agent_{i}" for i in range(5)]
-            vectors = [VECTOR_COFFEE, VECTOR_FLIGHT, VECTOR_WINDOW, VECTOR_AISLE, VECTOR_COFFEE]
+        agents = [f"conc_agent_{i}" for i in range(5)]
+        vectors = [VECTOR_COFFEE, VECTOR_FLIGHT, VECTOR_WINDOW, VECTOR_AISLE, VECTOR_COFFEE]
 
-            def add_for_agent(idx):
-                agent = agents[idx]
-                record_id = _uuid(7420 + idx)
-                db.insert(
+        def add_for_agent(idx):
+            agent = agents[idx]
+            record_id = _uuid(7420 + idx)
+            self.db.insert(
+                ids=[record_id],
+                vectors=[vectors[idx]],
+                payloads=[_make_payload(f"conc_alice {agent}", user_id="conc_alice", agent_id=agent)],
+            )
+            return agent, record_id
+
+        results_map = {}
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {executor.submit(add_for_agent, i): i for i in range(5)}
+            for future in as_completed(futures):
+                agent, record_id = future.result()
+                results_map[agent] = record_id
+
+        for agent, record_id in results_map.items():
+            agent_records = _list_flat(self.db, filters={"user_id": "conc_alice", "agent_id": agent}, top_k=100)
+            assert len(agent_records) == 1
+            assert _ids(agent_records)[0] == record_id
+
+        all_records = _list_flat(self.db, filters={"user_id": "conc_alice"}, top_k=100)
+        assert len(all_records) == 5
+
+    # --- Concurrent Insert tests ---
+
+    def test_concurrent_insert_basic(self):
+        """5 threads, 3 records each - basic concurrent insert."""
+        num_threads = 5
+        records_per_thread = 3
+
+        def insert_batch(thread_idx):
+            for i in range(records_per_thread):
+                record_id = str(uuid.uuid4())
+                self.db.insert(
                     ids=[record_id],
-                    vectors=[vectors[idx]],
-                    payloads=[_make_payload(f"alice {agent}", user_id="alice", agent_id=agent)],
+                    vectors=[_random_vector()],
+                    payloads=[_make_payload(
+                        f"conc_basic_{thread_idx}_{i}",
+                        user_id="conc_basic_user",
+                    )],
                 )
-                return agent, record_id
 
-            # Run concurrent inserts for same user, different agents
-            results_map = {}
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                futures = {executor.submit(add_for_agent, i): i for i in range(5)}
-                for future in as_completed(futures):
-                    agent, record_id = future.result()
-                    results_map[agent] = record_id
+        tasks = [lambda idx=t: insert_batch(idx) for t in range(num_threads)]
+        successes, errors = _run_concurrent(tasks, max_workers=num_threads)
 
-            # Verify each agent's data is isolated when filtered
-            for agent, record_id in results_map.items():
-                agent_records = _list_flat(db, filters={"user_id": "alice", "agent_id": agent}, top_k=100)
-                assert len(agent_records) == 1
-                assert _ids(agent_records)[0] == record_id
-
-            # Verify user sees all agents without agent_id filter
-            all_records = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
-            assert len(all_records) == 5
-        finally:
-            db.delete_col()
-
-
-
-# ===========================================================================
-# Concurrency Safety Tests (from test_gaussdb_p2_concurrent.py)
-# ===========================================================================
-
-class TestConcurrentInsert:
-    """Tests for multi-thread concurrent insert operations."""
-
-    def test_concurrent_insert_same_collection(self):
-        """5 threads, 10 records each into same collection. Verify no loss or duplicates."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            num_threads = 5
-            records_per_thread = 10
-
-            def insert_batch(thread_idx):
-                for i in range(records_per_thread):
-                    record_id = str(uuid.uuid4())
-                    db.insert(
-                        ids=[record_id],
-                        vectors=[_random_vector()],
-                        payloads=[_make_payload(
-                            f"thread_{thread_idx}_record_{i}",
-                            user_id="conc_insert_user",
-                        )],
-                    )
-
-            tasks = [lambda idx=t: insert_batch(idx) for t in range(num_threads)]
-            successes, errors = _run_concurrent(tasks, max_workers=num_threads)
-
-            total_expected = num_threads * records_per_thread
-            final_count = len(_list_flat(db, filters={"user_id": "conc_insert_user"}, top_k=total_expected + 100))
-            assert final_count > 0
-            if not errors:
-                assert final_count == total_expected
-        finally:
-            db.delete_col()
-
-    def test_concurrent_insert_same_user_id(self):
-        """5 threads insert with same user_id, total 50 records."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            user_id = "shared_user_conc"
-            num_threads = 5
-            records_per_thread = 10
-
-            def insert_batch(thread_idx):
-                for i in range(records_per_thread):
-                    record_id = str(uuid.uuid4())
-                    db.insert(
-                        ids=[record_id],
-                        vectors=[_random_vector()],
-                        payloads=[_make_payload(
-                            f"thread_{thread_idx}_item_{i}",
-                            user_id=user_id,
-                        )],
-                    )
-
-            tasks = [lambda idx=t: insert_batch(idx) for t in range(num_threads)]
-            successes, errors = _run_concurrent(tasks, max_workers=num_threads)
-
-            results = _list_flat(db, filters={"user_id": user_id}, top_k=2000)
-            assert len(results) > 0
-            for entry in results:
-                assert entry.payload["user_id"] == user_id
-        finally:
-            db.delete_col()
-
-    def test_concurrent_insert_different_user_ids(self):
-        """5 threads with different user_ids. No cross-contamination."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            num_threads = 5
-            records_per_thread = 10
-
-            def insert_batch(thread_idx):
-                uid = f"user_thread_{thread_idx}"
-                for i in range(records_per_thread):
-                    record_id = str(uuid.uuid4())
-                    db.insert(
-                        ids=[record_id],
-                        vectors=[_random_vector()],
-                        payloads=[_make_payload(
-                            f"data_{thread_idx}_{i}",
-                            user_id=uid,
-                        )],
-                    )
-
-            tasks = [lambda idx=t: insert_batch(idx) for t in range(num_threads)]
-            successes, errors = _run_concurrent(tasks, max_workers=num_threads)
-
-            for t in range(num_threads):
-                uid = f"user_thread_{t}"
-                results = _list_flat(db, filters={"user_id": uid}, top_k=200)
-                for entry in results:
-                    assert entry.payload["user_id"] == uid
-        finally:
-            db.delete_col()
+        final_count = len(_list_flat(self.db, filters={"user_id": "conc_basic_user"}, top_k=500))
+        total_expected = num_threads * records_per_thread
+        assert final_count == total_expected
 
     @pytest.mark.high_pressure
     def test_concurrent_insert_high_pressure(self):
         """10 threads, 5 records each - high pressure stress test (2x pool size)."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            num_threads = 10
-            records_per_thread = 5
+        num_threads = 10
+        records_per_thread = 5
 
-            def insert_batch(thread_idx):
-                for i in range(records_per_thread):
-                    record_id = str(uuid.uuid4())
-                    db.insert(
-                        ids=[record_id],
-                        vectors=[_random_vector()],
-                        payloads=[_make_payload(
-                            f"hp_{thread_idx}_{i}",
-                            user_id="high_pressure_user",
-                        )],
-                    )
+        def insert_batch(thread_idx):
+            for i in range(records_per_thread):
+                record_id = str(uuid.uuid4())
+                self.db.insert(
+                    ids=[record_id],
+                    vectors=[_random_vector()],
+                    payloads=[_make_payload(
+                        f"hp_{thread_idx}_{i}",
+                        user_id="conc_hp_user",
+                    )],
+                )
 
-            tasks = [lambda idx=t: insert_batch(idx) for t in range(num_threads)]
-            successes, errors = _run_concurrent(tasks, max_workers=num_threads, timeout=600.0)
+        tasks = [lambda idx=t: insert_batch(idx) for t in range(num_threads)]
+        successes, errors = _run_concurrent(tasks, max_workers=num_threads, timeout=600.0)
 
-            final_count = len(_list_flat(db, filters={"user_id": "high_pressure_user"}, top_k=1500))
-            total_expected = num_threads * records_per_thread
-            # Under high contention some inserts may fail due to pool exhaustion
-            assert final_count >= total_expected * 0.5
-        finally:
-            db.delete_col()
+        final_count = len(_list_flat(self.db, filters={"user_id": "conc_hp_user"}, top_k=1500))
+        total_expected = num_threads * records_per_thread
+        assert final_count >= total_expected * 0.5
 
     def test_concurrent_insert_with_batch(self):
         """5 threads each batch-inserting 20 records at once."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            num_threads = 5
-            batch_size = 20
+        num_threads = 5
+        batch_size = 20
 
-            def batch_insert(thread_idx):
-                ids = [str(uuid.uuid4()) for _ in range(batch_size)]
-                vectors = [_random_vector() for _ in range(batch_size)]
-                payloads = [
-                    _make_payload(f"batch_{thread_idx}_{i}", user_id="batch_conc_user")
-                    for i in range(batch_size)
-                ]
-                db.insert(ids=ids, vectors=vectors, payloads=payloads)
+        def batch_insert(thread_idx):
+            ids = [str(uuid.uuid4()) for _ in range(batch_size)]
+            vectors = [_random_vector() for _ in range(batch_size)]
+            payloads = [
+                _make_payload(f"batch_{thread_idx}_{i}", user_id="conc_batch_user")
+                for i in range(batch_size)
+            ]
+            self.db.insert(ids=ids, vectors=vectors, payloads=payloads)
 
-            tasks = [lambda idx=t: batch_insert(idx) for t in range(num_threads)]
-            successes, errors = _run_concurrent(tasks, max_workers=num_threads)
+        tasks = [lambda idx=t: batch_insert(idx) for t in range(num_threads)]
+        successes, errors = _run_concurrent(tasks, max_workers=num_threads)
 
-            final_count = len(_list_flat(db, filters={"user_id": "batch_conc_user"}, top_k=600))
-            total_expected = num_threads * batch_size
-            if not errors:
-                assert final_count == total_expected
-            else:
-                assert final_count > 0
-        finally:
-            db.delete_col()
+        final_count = len(_list_flat(self.db, filters={"user_id": "conc_batch_user"}, top_k=600))
+        total_expected = num_threads * batch_size
+        if not errors:
+            assert final_count == total_expected
+        else:
+            assert final_count > 0
 
-
-# ===========================================================================
-# 9.2.2 Upsert Race Conditions
-# ===========================================================================
-
-
-class TestUpsertRaceConditions:
-    """Tests for upsert (MERGE INTO) atomicity under concurrent access."""
+    # --- Upsert Race Conditions ---
 
     def test_concurrent_upsert_same_id(self):
         """10 threads upsert same ID concurrently. Final count must be 1."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            target_id = _uuid(9001)
-            num_threads = 10
+        target_id = _uuid(9001)
+        num_threads = 10
 
-            def upsert_record(thread_idx):
-                vector = _random_vector()
-                payload = _make_payload(
-                    f"upsert_thread_{thread_idx}",
-                    user_id="upsert_user",
-                )
-                db.insert(
-                    ids=[target_id],
-                    vectors=[vector],
-                    payloads=[payload],
-                )
+        def upsert_record(thread_idx):
+            vector = _random_vector()
+            payload = _make_payload(
+                f"upsert_thread_{thread_idx}",
+                user_id="conc_upsert_user",
+            )
+            self.db.insert(
+                ids=[target_id],
+                vectors=[vector],
+                payloads=[payload],
+            )
 
-            tasks = [lambda idx=t: upsert_record(idx) for t in range(num_threads)]
-            successes, errors = _run_concurrent(tasks, max_workers=num_threads)
+        tasks = [lambda idx=t: upsert_record(idx) for t in range(num_threads)]
+        successes, errors = _run_concurrent(tasks, max_workers=num_threads)
 
-            # MERGE INTO atomicity: final count for this ID must be exactly 1
-            result = db.get(target_id)
-            assert result is not None
-            assert len(_list_flat(db, filters={"user_id": "upsert_user"}, top_k=100)) == 1
-        finally:
-            db.delete_col()
+        result = self.db.get(target_id)
+        assert result is not None
+        assert len(_list_flat(self.db, filters={"user_id": "conc_upsert_user"}, top_k=100)) == 1
 
     def test_concurrent_upsert_same_id_same_payload(self):
         """10 threads upsert same ID with identical payload. Idempotency check."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            target_id = _uuid(9002)
-            num_threads = 10
-            fixed_vector = VECTOR_COFFEE
-            fixed_payload = _make_payload("idempotent_data", user_id="upsert_user")
+        target_id = _uuid(9002)
+        num_threads = 10
+        fixed_vector = VECTOR_COFFEE
+        fixed_payload = _make_payload("idempotent_data", user_id="conc_idem_user")
 
-            def upsert_same(thread_idx):
-                db.insert(
-                    ids=[target_id],
-                    vectors=[fixed_vector],
-                    payloads=[fixed_payload],
-                )
+        def upsert_same(thread_idx):
+            self.db.insert(
+                ids=[target_id],
+                vectors=[fixed_vector],
+                payloads=[fixed_payload],
+            )
 
-            tasks = [lambda idx=t: upsert_same(idx) for t in range(num_threads)]
-            successes, errors = _run_concurrent(tasks, max_workers=num_threads)
+        tasks = [lambda idx=t: upsert_same(idx) for t in range(num_threads)]
+        successes, errors = _run_concurrent(tasks, max_workers=num_threads)
 
-            result = db.get(target_id)
-            assert result is not None
-            assert result.payload["data"] == "idempotent_data"
-            assert len(_list_flat(db, filters={"user_id": "upsert_user"}, top_k=100)) == 1
-        finally:
-            db.delete_col()
+        result = self.db.get(target_id)
+        assert result is not None
+        assert result.payload["data"] == "idempotent_data"
+        assert len(_list_flat(self.db, filters={"user_id": "conc_idem_user"}, top_k=100)) == 1
 
     def test_concurrent_upsert_same_id_update_vs_insert(self):
         """Insert first, then concurrent upserts. Verify final state is consistent."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            target_id = _uuid(9003)
-            db.insert(
+        target_id = _uuid(9003)
+        self.db.insert(
+            ids=[target_id],
+            vectors=[VECTOR_COFFEE],
+            payloads=[_make_payload("original", user_id="conc_upins_user")],
+        )
+
+        num_threads = 10
+
+        def upsert_update(thread_idx):
+            vector = _random_vector()
+            payload = _make_payload(
+                f"updated_by_{thread_idx}",
+                user_id="conc_upins_user",
+            )
+            self.db.insert(
                 ids=[target_id],
-                vectors=[VECTOR_COFFEE],
-                payloads=[_make_payload("original", user_id="upsert_user")],
+                vectors=[vector],
+                payloads=[payload],
             )
 
-            num_threads = 10
+        tasks = [lambda idx=t: upsert_update(idx) for t in range(num_threads)]
+        successes, errors = _run_concurrent(tasks, max_workers=num_threads)
 
-            def upsert_update(thread_idx):
-                vector = _random_vector()
-                payload = _make_payload(
-                    f"updated_by_{thread_idx}",
-                    user_id="upsert_user",
-                )
-                db.insert(
-                    ids=[target_id],
-                    vectors=[vector],
-                    payloads=[payload],
-                )
-
-            tasks = [lambda idx=t: upsert_update(idx) for t in range(num_threads)]
-            successes, errors = _run_concurrent(tasks, max_workers=num_threads)
-
-            result = db.get(target_id)
-            assert result is not None
-            assert result.payload["data"].startswith("updated_by_")
-            assert len(_list_flat(db, filters={"user_id": "upsert_user"}, top_k=100)) == 1
-        finally:
-            db.delete_col()
+        result = self.db.get(target_id)
+        assert result is not None
+        assert result.payload["data"].startswith("updated_by_")
+        assert len(_list_flat(self.db, filters={"user_id": "conc_upins_user"}, top_k=100)) == 1
 
     def test_concurrent_upsert_batch_same_ids(self):
         """Batch upsert with overlapping IDs from multiple threads."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            shared_ids = [_uuid(9010 + i) for i in range(5)]
-            num_threads = 10
+        shared_ids = [_uuid(9010 + i) for i in range(5)]
+        num_threads = 10
 
-            def batch_upsert(thread_idx):
-                vectors = [_random_vector() for _ in range(5)]
-                payloads = [
-                    _make_payload(f"batch_t{thread_idx}_r{i}", user_id="upsert_user")
-                    for i in range(5)
-                ]
-                db.insert(ids=shared_ids, vectors=vectors, payloads=payloads)
+        def batch_upsert(thread_idx):
+            vectors = [_random_vector() for _ in range(5)]
+            payloads = [
+                _make_payload(f"batch_t{thread_idx}_r{i}", user_id="conc_batchup_user")
+                for i in range(5)
+            ]
+            self.db.insert(ids=shared_ids, vectors=vectors, payloads=payloads)
 
-            tasks = [lambda idx=t: batch_upsert(idx) for t in range(num_threads)]
-            successes, errors = _run_concurrent(tasks, max_workers=num_threads)
+        tasks = [lambda idx=t: batch_upsert(idx) for t in range(num_threads)]
+        successes, errors = _run_concurrent(tasks, max_workers=num_threads)
 
-            for sid in shared_ids:
-                result = db.get(sid)
-                assert result is not None
-            assert len(_list_flat(db, filters={"user_id": "upsert_user"}, top_k=100)) == 5
-        finally:
-            db.delete_col()
+        for sid in shared_ids:
+            result = self.db.get(sid)
+            assert result is not None
+        assert len(_list_flat(self.db, filters={"user_id": "conc_batchup_user"}, top_k=100)) == 5
 
     def test_upsert_lost_update_detection(self):
         """2 threads sequential upsert. Verify last-write-wins semantics."""
-        db = _new_db(prefix="p2_conc")
-        try:
-            target_id = _uuid(9020)
-            barrier = threading.Barrier(2, timeout=30)
-            write_order = []
-            order_lock = threading.Lock()
+        target_id = _uuid(9020)
+        barrier = threading.Barrier(2, timeout=30)
+        write_order = []
+        order_lock = threading.Lock()
 
-            def upsert_with_order(thread_idx):
-                barrier.wait()
-                vector = _random_vector()
-                payload = _make_payload(
-                    f"writer_{thread_idx}",
-                    user_id="upsert_user",
-                )
-                db.insert(
-                    ids=[target_id],
-                    vectors=[vector],
-                    payloads=[payload],
-                )
-                with order_lock:
-                    write_order.append(thread_idx)
+        def upsert_with_order(thread_idx):
+            barrier.wait()
+            vector = _random_vector()
+            payload = _make_payload(
+                f"writer_{thread_idx}",
+                user_id="conc_lww_user",
+            )
+            self.db.insert(
+                ids=[target_id],
+                vectors=[vector],
+                payloads=[payload],
+            )
+            with order_lock:
+                write_order.append(thread_idx)
 
-            tasks = [lambda idx=t: upsert_with_order(idx) for t in range(2)]
-            successes, errors = _run_concurrent(tasks, max_workers=2)
+        tasks = [lambda idx=t: upsert_with_order(idx) for t in range(2)]
+        successes, errors = _run_concurrent(tasks, max_workers=2)
 
-            result = db.get(target_id)
-            assert result is not None
-            assert len(_list_flat(db, filters={"user_id": "upsert_user"}, top_k=100)) == 1
-            assert result.payload["data"] in ("writer_0", "writer_1")
-        finally:
-            db.delete_col()
+        result = self.db.get(target_id)
+        assert result is not None
+        assert len(_list_flat(self.db, filters={"user_id": "conc_lww_user"}, top_k=100)) == 1
+        assert result.payload["data"] in ("writer_0", "writer_1")
 
 
 # ===========================================================================
@@ -3288,6 +2469,7 @@ class TestUpsertRaceConditions:
 # ===========================================================================
 
 
+@pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_RUN_PERF"), reason="Performance tests disabled; set GAUSSDB_TEST_RUN_PERF=1 to enable")
 class TestReadWriteConcurrency:
     """Tests for concurrent read and write operations."""
 
@@ -3545,6 +2727,7 @@ class TestReadWriteConcurrency:
 # ===========================================================================
 
 
+@pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_RUN_PERF"), reason="Performance tests disabled; set GAUSSDB_TEST_RUN_PERF=1 to enable")
 class TestConnectionPoolExhaustion:
     """Tests for connection pool behavior under pressure."""
 
@@ -3667,6 +2850,7 @@ class TestConnectionPoolExhaustion:
 # ===========================================================================
 
 
+@pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_RUN_PERF"), reason="Performance tests disabled; set GAUSSDB_TEST_RUN_PERF=1 to enable")
 class TestConcurrentDataConsistency:
     """Tests verifying data consistency after concurrent operations."""
 
@@ -3836,6 +3020,7 @@ class TestConcurrentDataConsistency:
 # Performance Baseline Tests (from test_gaussdb_p2_performance.py)
 # ===========================================================================
 
+@pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_RUN_PERF"), reason="Performance tests disabled; set GAUSSDB_TEST_RUN_PERF=1 to enable")
 class TestSingleOperationLatency:
     """Measure latency of individual CRUD operations."""
 
@@ -3954,6 +3139,7 @@ class TestSingleOperationLatency:
 # ===========================================================================
 
 
+@pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_RUN_PERF"), reason="Performance tests disabled; set GAUSSDB_TEST_RUN_PERF=1 to enable")
 class TestBatchOperationThroughput:
     """Measure throughput of batch operations."""
 
@@ -4065,6 +3251,7 @@ class TestBatchOperationThroughput:
 # ===========================================================================
 
 
+@pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_RUN_PERF"), reason="Performance tests disabled; set GAUSSDB_TEST_RUN_PERF=1 to enable")
 class TestDataSizeVsSearchLatency:
     """Measure how search latency scales with data size."""
 
@@ -4133,6 +3320,7 @@ class TestDataSizeVsSearchLatency:
 # ===========================================================================
 
 
+@pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_RUN_PERF"), reason="Performance tests disabled; set GAUSSDB_TEST_RUN_PERF=1 to enable")
 class TestFilterSearchPerformance:
     """Compare search performance with and without filters."""
 
@@ -4258,121 +3446,113 @@ class TestFilterSearchPerformance:
 class TestUstoreStorageEngine:
     """Tests for Ustore storage engine behavior."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="feat_ustore")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_ustore_table_creation(self):
         """Create collection with Ustore engine, verify basic CRUD works."""
-        db = _new_db(prefix="feat_ustore")
-        try:
-            vid = _uuid(7001)
-            db.insert(
-                ids=[vid],
-                vectors=[VECTOR_COFFEE],
-                payloads=[_make_payload("ustore creation test", "ustore_user")],
-            )
-            # Verify insert
-            result = db.get(vid)
-            assert result is not None
-            assert result.id == vid
-            assert result.payload["data"] == "ustore creation test"
+        vid = _uuid(7001)
+        self.db.insert(
+            ids=[vid],
+            vectors=[VECTOR_COFFEE],
+            payloads=[_make_payload("ustore creation test", "ustore_user")],
+        )
+        # Verify insert
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.id == vid
+        assert result.payload["data"] == "ustore creation test"
 
-            # Verify search
-            results = db.search(
-                "ustore", VECTOR_COFFEE, top_k=1, filters={"user_id": "ustore_user"}
-            )
-            assert len(results) >= 1
-            assert results[0].id == vid
+        # Verify search
+        results = self.db.search(
+            "ustore", VECTOR_COFFEE, top_k=1, filters={"user_id": "ustore_user"}
+        )
+        assert len(results) >= 1
+        assert results[0].id == vid
 
-            # Verify delete
-            db.delete(vector_id=vid)
-            result_after = db.get(vid)
-            assert result_after is None
-        finally:
-            db.delete_col()
+        # Verify delete
+        self.db.delete(vector_id=vid)
+        result_after = self.db.get(vid)
+        assert result_after is None
 
     def test_ustore_vs_astore_insert_perf(self):
         """Compare insert performance (informational, no hard assertion)."""
-        db = _new_db(prefix="feat_ustore_perf")
-        try:
-            num_records = 50
-            ids = [_uuid(7100 + i) for i in range(num_records)]
-            vectors = [[random.random() for _ in range(EMBEDDING_DIMS)] for _ in range(num_records)]
-            payloads = [_make_payload(f"perf record {i}", "perf_user") for i in range(num_records)]
+        num_records = 50
+        ids = [_uuid(7100 + i) for i in range(num_records)]
+        vectors = [[random.random() for _ in range(EMBEDDING_DIMS)] for _ in range(num_records)]
+        payloads = [_make_payload(f"perf record {i}", "perf_user") for i in range(num_records)]
 
-            start = time.perf_counter()
-            db.insert(ids=ids, vectors=vectors, payloads=payloads)
-            insert_duration_ms = (time.perf_counter() - start) * 1000
+        start = time.perf_counter()
+        self.db.insert(ids=ids, vectors=vectors, payloads=payloads)
+        insert_duration_ms = (time.perf_counter() - start) * 1000
 
-            # Informational: just verify all records were inserted
-            count = len(_list_flat(db, filters={"user_id": "perf_user"}, top_k=1000))
-            assert count == num_records
-            # Log performance (no hard assertion on timing)
-            assert insert_duration_ms >= 0  # trivially true, documents the measurement
-        finally:
-            db.delete_col()
+        # Informational: just verify all records were inserted
+        count = len(_list_flat(self.db, filters={"user_id": "perf_user"}, top_k=1000))
+        assert count == num_records
+        # Log performance (no hard assertion on timing)
+        assert insert_duration_ms >= 0  # trivially true, documents the measurement
 
     def test_ustore_vs_astore_search_perf(self):
         """Compare search performance (informational, no hard assertion)."""
-        db = _new_db(prefix="feat_ustore_search")
-        try:
-            # Insert baseline data
-            num_records = 50
-            ids = [_uuid(7200 + i) for i in range(num_records)]
-            vectors = [[random.random() for _ in range(EMBEDDING_DIMS)] for _ in range(num_records)]
-            payloads = [_make_payload(f"search perf {i}", "perf_user") for i in range(num_records)]
-            db.insert(ids=ids, vectors=vectors, payloads=payloads)
+        # Insert baseline data
+        num_records = 50
+        ids = [_uuid(7200 + i) for i in range(num_records)]
+        vectors = [[random.random() for _ in range(EMBEDDING_DIMS)] for _ in range(num_records)]
+        payloads = [_make_payload(f"search perf {i}", "perf_user") for i in range(num_records)]
+        self.db.insert(ids=ids, vectors=vectors, payloads=payloads)
 
-            query_vector = [random.random() for _ in range(EMBEDDING_DIMS)]
+        query_vector = [random.random() for _ in range(EMBEDDING_DIMS)]
 
-            start = time.perf_counter()
-            iterations = 20
-            for _ in range(iterations):
-                db.search("perf", query_vector, top_k=10, filters={"user_id": "perf_user"})
-            search_duration_ms = (time.perf_counter() - start) * 1000
+        start = time.perf_counter()
+        iterations = 20
+        for _ in range(iterations):
+            self.db.search("perf", query_vector, top_k=10, filters={"user_id": "perf_user"})
+        search_duration_ms = (time.perf_counter() - start) * 1000
 
-            avg_search_ms = search_duration_ms / iterations
-            # Informational: verify search returns results and measure timing
-            results = db.search("perf", query_vector, top_k=10, filters={"user_id": "perf_user"})
-            assert len(results) >= 1
-            assert avg_search_ms >= 0  # trivially true, documents the measurement
-        finally:
-            db.delete_col()
+        avg_search_ms = search_duration_ms / iterations
+        # Informational: verify search returns results and measure timing
+        results = self.db.search("perf", query_vector, top_k=10, filters={"user_id": "perf_user"})
+        assert len(results) >= 1
+        assert avg_search_ms >= 0  # trivially true, documents the measurement
 
     def test_ustore_update_in_place(self):
         """Verify update works correctly (in-place update behavior)."""
-        db = _new_db(prefix="feat_ustore_upd")
-        try:
-            vid = _uuid(7301)
-            # Insert original record
-            db.insert(
-                ids=[vid],
-                vectors=[VECTOR_COFFEE],
-                payloads=[_make_payload("original data", "update_user")],
-            )
-            original = db.get(vid)
-            assert original is not None
-            assert original.payload["data"] == "original data"
+        vid = _uuid(7301)
+        # Insert original record
+        self.db.insert(
+            ids=[vid],
+            vectors=[VECTOR_COFFEE],
+            payloads=[_make_payload("original data", "update_user")],
+        )
+        original = self.db.get(vid)
+        assert original is not None
+        assert original.payload["data"] == "original data"
 
-            # Update vector and payload in place
-            new_vector = VECTOR_FLIGHT
-            db.update(
-                vector_id=vid,
-                vector=new_vector,
-                payload=_make_payload("updated data", "update_user"),
-            )
+        # Update vector and payload in place
+        new_vector = VECTOR_FLIGHT
+        self.db.update(
+            vector_id=vid,
+            vector=new_vector,
+            payload=_make_payload("updated data", "update_user"),
+        )
 
-            # Verify update took effect
-            updated = db.get(vid)
-            assert updated is not None
-            assert updated.payload["data"] == "updated data"
+        # Verify update took effect
+        updated = self.db.get(vid)
+        assert updated is not None
+        assert updated.payload["data"] == "updated data"
 
-            # Verify search finds updated record with new vector
-            results = db.search(
-                "updated", VECTOR_FLIGHT, top_k=1, filters={"user_id": "update_user"}
-            )
-            assert len(results) >= 1
-            assert results[0].id == vid
-            assert results[0].payload["data"] == "updated data"
-        finally:
-            db.delete_col()
+        # Verify search finds updated record with new vector
+        results = self.db.search(
+            "updated", VECTOR_FLIGHT, top_k=1, filters={"user_id": "update_user"}
+        )
+        assert len(results) >= 1
+        assert results[0].id == vid
+        assert results[0].payload["data"] == "updated data"
 
 
 # ===========================================================================
@@ -4757,87 +3937,83 @@ class TestDeploymentMode:
 class TestMergeIntoAtomicity:
     """Tests for MERGE INTO (upsert) atomicity behavior."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="feat_merge")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_merge_into_insert_new_record(self):
         """MERGE INTO inserts when record doesn't exist."""
-        db = _new_db(prefix="feat_merge")
-        try:
-            vid = _uuid(9201)
-            # Use update which triggers MERGE INTO behavior (upsert)
-            # First verify the record does not exist
-            assert db.get(vid) is None
+        vid = _uuid(9201)
+        # Use update which triggers MERGE INTO behavior (upsert)
+        # First verify the record does not exist
+        assert self.db.get(vid) is None
 
-            # Insert via normal insert (establishes baseline)
-            db.insert(
-                ids=[vid],
-                vectors=[VECTOR_COFFEE],
-                payloads=[_make_payload("merge insert test", "merge_user")],
-            )
+        # Insert via normal insert (establishes baseline)
+        self.db.insert(
+            ids=[vid],
+            vectors=[VECTOR_COFFEE],
+            payloads=[_make_payload("merge insert test", "merge_user")],
+        )
 
-            # Verify the record was created
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["data"] == "merge insert test"
-        finally:
-            db.delete_col()
+        # Verify the record was created
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["data"] == "merge insert test"
 
     def test_merge_into_update_existing_record(self):
         """MERGE INTO updates when record exists (upsert semantics)."""
-        db = _new_db(prefix="feat_merge_upd")
-        try:
-            vid = _uuid(9301)
-            # Insert initial record
-            db.insert(
-                ids=[vid],
-                vectors=[VECTOR_COFFEE],
-                payloads=[_make_payload("original merge", "merge_user")],
-            )
+        vid = _uuid(9301)
+        # Insert initial record
+        self.db.insert(
+            ids=[vid],
+            vectors=[VECTOR_COFFEE],
+            payloads=[_make_payload("original merge", "merge_user")],
+        )
 
-            # Update the same ID (triggers MERGE INTO / upsert path)
-            db.update(
-                vector_id=vid,
-                vector=VECTOR_FLIGHT,
-                payload=_make_payload("updated merge", "merge_user"),
-            )
+        # Update the same ID (triggers MERGE INTO / upsert path)
+        self.db.update(
+            vector_id=vid,
+            vector=VECTOR_FLIGHT,
+            payload=_make_payload("updated merge", "merge_user"),
+        )
 
-            # Verify update took effect atomically
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["data"] == "updated merge"
+        # Verify update took effect atomically
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["data"] == "updated merge"
 
-            # Verify no duplicate was created
-            assert len(_list_flat(db, filters={"user_id": "merge_user"}, top_k=1000)) == 1
-        finally:
-            db.delete_col()
+        # Verify no duplicate was created
+        assert len(_list_flat(self.db, filters={"user_id": "merge_user"}, top_k=1000)) == 1
 
     def test_merge_into_idempotent_same_data(self):
         """MERGE INTO with same data is idempotent."""
-        db = _new_db(prefix="feat_merge_idem")
-        try:
-            vid = _uuid(9401)
-            vector = VECTOR_WINDOW
-            payload = _make_payload("idempotent test", "merge_user")
+        vid = _uuid(9401)
+        vector = VECTOR_WINDOW
+        payload = _make_payload("idempotent test", "merge_user")
 
-            # Insert the record
-            db.insert(ids=[vid], vectors=[vector], payloads=[payload])
+        # Insert the record
+        self.db.insert(ids=[vid], vectors=[vector], payloads=[payload])
 
-            # Apply the same update multiple times
-            for _ in range(3):
-                db.update(vector_id=vid, vector=vector, payload=payload)
+        # Apply the same update multiple times
+        for _ in range(3):
+            self.db.update(vector_id=vid, vector=vector, payload=payload)
 
-            # Verify record is unchanged and no duplicates
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["data"] == "idempotent test"
-            assert len(_list_flat(db, filters={"user_id": "merge_user"}, top_k=1000)) == 1
+        # Verify record is unchanged and no duplicates
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["data"] == "idempotent test"
+        assert len(_list_flat(self.db, filters={"user_id": "merge_user"}, top_k=1000)) == 1
 
-            # Verify search still works correctly
-            results = db.search(
-                "idempotent", vector, top_k=1, filters={"user_id": "merge_user"}
-            )
-            assert len(results) == 1
-            assert results[0].id == vid
-        finally:
-            db.delete_col()
+        # Verify search still works correctly
+        results = self.db.search(
+            "idempotent", vector, top_k=1, filters={"user_id": "merge_user"}
+        )
+        assert len(results) == 1
+        assert results[0].id == vid
 
 
 # ===========================================================================
@@ -5699,240 +4875,188 @@ class TestQualityReplay:
 class TestE2EDirect:
     """Direct DB verification tests converted from standalone E2E script."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="e2e", embedding_model_dims=1536, vector_index_type="gsdiskann")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_e2e_insert_single(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(42, dims=1536)
-            payload = {"data": "test memory", "user_id": "e2e_user", "category": "test"}
-            db.insert(vectors=[vec], ids=[vid], payloads=[payload])
-            result = db.get(vid)
-            assert result is not None
-            assert result.id == vid
-            assert result.payload["data"] == "test memory"
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(42, dims=1536)
+        payload = {"data": "test memory", "user_id": "e2e_user", "category": "test"}
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[payload])
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.id == vid
+        assert result.payload["data"] == "test memory"
 
     def test_e2e_insert_batch(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            ids = [str(uuid.uuid4()) for _ in range(10)]
-            vectors = [_make_vector_seeded(i, dims=1536) for i in range(10)]
-            payloads = [{"data": f"memory_{i}", "user_id": "e2e_user"} for i in range(10)]
-            db.insert(vectors=vectors, ids=ids, payloads=payloads)
-            listed = _list_flat(db, filters={"user_id": "e2e_user"}, top_k=100)
-            assert len(listed) == 10
-        finally:
-            db.delete_col()
+        ids = [str(uuid.uuid4()) for _ in range(10)]
+        vectors = [_make_vector_seeded(i, dims=1536) for i in range(10)]
+        payloads = [{"data": f"memory_{i}", "user_id": "e2e_user"} for i in range(10)]
+        self.db.insert(vectors=vectors, ids=ids, payloads=payloads)
+        listed = _list_flat(self.db, filters={"user_id": "e2e_user"}, top_k=100)
+        assert len(listed) == 10
 
     def test_e2e_upsert_existing(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(100, dims=1536)
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "original", "user_id": "e2e_user"}])
-            new_vec = _make_vector_seeded(101, dims=1536)
-            db.update(vector_id=vid, vector=new_vec, payload={"data": "updated", "user_id": "e2e_user"})
-            result = db.get(vid)
-            assert result.payload["data"] == "updated"
-            listed = _list_flat(db, filters={"user_id": "e2e_user"}, top_k=100)
-            assert len(listed) == 1
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(100, dims=1536)
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "original", "user_id": "e2e_user"}])
+        new_vec = _make_vector_seeded(101, dims=1536)
+        self.db.update(vector_id=vid, vector=new_vec, payload={"data": "updated", "user_id": "e2e_user"})
+        result = self.db.get(vid)
+        assert result.payload["data"] == "updated"
+        listed = _list_flat(self.db, filters={"user_id": "e2e_user"}, top_k=100)
+        assert len(listed) == 1
 
     def test_e2e_semantic_search(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vecs = [_make_vector_seeded(i, dims=1536) for i in range(5)]
-            ids = [str(uuid.uuid4()) for _ in range(5)]
-            payloads = [{"data": f"item_{i}", "user_id": "e2e_user"} for i in range(5)]
-            db.insert(vectors=vecs, ids=ids, payloads=payloads)
-            query_vec = _make_vector_seeded(0, dims=1536)
-            results = db.search("item", query_vec, top_k=1, filters={"user_id": "e2e_user"})
-            assert len(results) >= 1
-            assert results[0].id == ids[0]
-        finally:
-            db.delete_col()
+        vecs = [_make_vector_seeded(i, dims=1536) for i in range(5)]
+        ids = [str(uuid.uuid4()) for _ in range(5)]
+        payloads = [{"data": f"item_{i}", "user_id": "e2e_user"} for i in range(5)]
+        self.db.insert(vectors=vecs, ids=ids, payloads=payloads)
+        query_vec = _make_vector_seeded(0, dims=1536)
+        results = self.db.search("item", query_vec, top_k=1, filters={"user_id": "e2e_user"})
+        assert len(results) >= 1
+        assert results[0].id == ids[0]
 
     def test_e2e_search_with_filters(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            ids = [str(uuid.uuid4()) for _ in range(4)]
-            vecs = [_make_vector_seeded(i, dims=1536) for i in range(4)]
-            payloads = [
-                {"data": "alice food", "user_id": "alice", "category": "food"},
-                {"data": "alice travel", "user_id": "alice", "category": "travel"},
-                {"data": "bob food", "user_id": "bob", "category": "food"},
-                {"data": "bob work", "user_id": "bob", "category": "work"},
-            ]
-            db.insert(vectors=vecs, ids=ids, payloads=payloads)
-            results = db.search("food", vecs[0], top_k=10, filters={"user_id": "alice", "category": "food"})
-            assert all(r.payload["user_id"] == "alice" for r in results)
-            assert all(r.payload["category"] == "food" for r in results)
-        finally:
-            db.delete_col()
+        ids = [str(uuid.uuid4()) for _ in range(4)]
+        vecs = [_make_vector_seeded(i, dims=1536) for i in range(4)]
+        payloads = [
+            {"data": "alice food", "user_id": "alice", "category": "food"},
+            {"data": "alice travel", "user_id": "alice", "category": "travel"},
+            {"data": "bob food", "user_id": "bob", "category": "food"},
+            {"data": "bob work", "user_id": "bob", "category": "work"},
+        ]
+        self.db.insert(vectors=vecs, ids=ids, payloads=payloads)
+        results = self.db.search("food", vecs[0], top_k=10, filters={"user_id": "alice", "category": "food"})
+        assert all(r.payload["user_id"] == "alice" for r in results)
+        assert all(r.payload["category"] == "food" for r in results)
 
     @pytest.mark.skipif(
         not _env_bool("GAUSSDB_TEST_RUN_BM25"),
         reason="Set GAUSSDB_TEST_RUN_BM25=true to run BM25 tests",
     )
     def test_e2e_bm25_keyword_search(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(200, dims=1536)
-            db.insert(
-                vectors=[vec], ids=[vid],
-                payloads=[{"data": "Python programming language", "user_id": "e2e_user", "text_lemmatized": "python programming language"}],
-            )
-            results = db.keyword_search("Python", top_k=5, filters={"user_id": "e2e_user"})
-            if results:
-                assert any(r.id == vid for r in results)
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(200, dims=1536)
+        self.db.insert(
+            vectors=[vec], ids=[vid],
+            payloads=[{"data": "Python programming language", "user_id": "e2e_user", "text_lemmatized": "python programming language"}],
+        )
+        results = self.db.keyword_search("Python", top_k=5, filters={"user_id": "e2e_user"})
+        if results:
+            assert any(r.id == vid for r in results)
 
     def test_e2e_update_payload(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(300, dims=1536)
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "original", "user_id": "e2e_user"}])
-            db.update(vector_id=vid, payload={"data": "modified", "user_id": "e2e_user", "extra": "field"})
-            result = db.get(vid)
-            assert result.payload["data"] == "modified"
-            assert result.payload["extra"] == "field"
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(300, dims=1536)
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "original", "user_id": "e2e_user"}])
+        self.db.update(vector_id=vid, payload={"data": "modified", "user_id": "e2e_user", "extra": "field"})
+        result = self.db.get(vid)
+        assert result.payload["data"] == "modified"
+        assert result.payload["extra"] == "field"
 
     def test_e2e_update_vector(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(301, dims=1536)
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "vec update", "user_id": "e2e_user"}])
-            new_vec = _make_vector_seeded(302, dims=1536)
-            db.update(vector_id=vid, vector=new_vec)
-            results = db.search("vec", new_vec, top_k=1, filters={"user_id": "e2e_user"})
-            assert len(results) >= 1
-            assert results[0].id == vid
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(301, dims=1536)
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "vec update", "user_id": "e2e_user"}])
+        new_vec = _make_vector_seeded(302, dims=1536)
+        self.db.update(vector_id=vid, vector=new_vec)
+        results = self.db.search("vec", new_vec, top_k=1, filters={"user_id": "e2e_user"})
+        assert len(results) >= 1
+        assert results[0].id == vid
 
     def test_e2e_delete_by_id(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(400, dims=1536)
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "to delete", "user_id": "e2e_user"}])
-            db.delete(vector_id=vid)
-            assert db.get(vid) is None
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(400, dims=1536)
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "to delete", "user_id": "e2e_user"}])
+        self.db.delete(vector_id=vid)
+        assert self.db.get(vid) is None
 
     def test_e2e_list_with_filters(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            ids = [str(uuid.uuid4()) for _ in range(6)]
-            vecs = [_make_vector_seeded(i + 500, dims=1536) for i in range(6)]
-            payloads = [
-                {"data": f"item_{i}", "user_id": "alice" if i < 3 else "bob"}
-                for i in range(6)
-            ]
-            db.insert(vectors=vecs, ids=ids, payloads=payloads)
-            alice_items = _list_flat(db, filters={"user_id": "alice"}, top_k=100)
-            assert len(alice_items) == 3
-            bob_items = _list_flat(db, filters={"user_id": "bob"}, top_k=100)
-            assert len(bob_items) == 3
-        finally:
-            db.delete_col()
+        ids = [str(uuid.uuid4()) for _ in range(6)]
+        vecs = [_make_vector_seeded(i + 500, dims=1536) for i in range(6)]
+        payloads = [
+            {"data": f"item_{i}", "user_id": "alice" if i < 3 else "bob"}
+            for i in range(6)
+        ]
+        self.db.insert(vectors=vecs, ids=ids, payloads=payloads)
+        alice_items = _list_flat(self.db, filters={"user_id": "alice"}, top_k=100)
+        assert len(alice_items) == 3
+        bob_items = _list_flat(self.db, filters={"user_id": "bob"}, top_k=100)
+        assert len(bob_items) == 3
 
     def test_e2e_list_collections(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            cols = db.list_cols()
-            assert isinstance(cols, list)
-            assert db.collection_name in cols
-        finally:
-            db.delete_col()
+        cols = self.db.list_cols()
+        assert isinstance(cols, list)
+        assert self.db.collection_name in cols
 
     def test_e2e_collection_info(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(600, dims=1536)
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "info test", "user_id": "e2e_user"}])
-            info = db.col_info()
-            assert info["name"] == db.collection_name
-            assert info["count"] >= 1
-            assert info["dimension"] == 1536
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(600, dims=1536)
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "info test", "user_id": "e2e_user"}])
+        info = self.db.col_info()
+        assert info["name"] == self.db.collection_name
+        assert info["count"] >= 1
+        assert info["dimension"] == 1536
 
     def test_e2e_large_payload(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(700, dims=1536)
-            large_text = "x" * 10000
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": large_text, "user_id": "e2e_user"}])
-            result = db.get(vid)
-            assert result is not None
-            assert len(result.payload["data"]) == 10000
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(700, dims=1536)
+        large_text = "x" * 10000
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": large_text, "user_id": "e2e_user"}])
+        result = self.db.get(vid)
+        assert result is not None
+        assert len(result.payload["data"]) == 10000
 
     def test_e2e_unicode_payload(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(800, dims=1536)
-            text = "中文测试 日本語 한국어 emoji: 🚀💻"
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": text, "user_id": "e2e_user"}])
-            result = db.get(vid)
-            assert result.payload["data"] == text
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(800, dims=1536)
+        text = "中文测试 日本語 한국어 emoji: 🚀💻"
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": text, "user_id": "e2e_user"}])
+        result = self.db.get(vid)
+        assert result.payload["data"] == text
 
     def test_e2e_concurrent_upsert_idempotency(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(900, dims=1536)
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "concurrent", "user_id": "e2e_user"}])
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(900, dims=1536)
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "concurrent", "user_id": "e2e_user"}])
 
-            def do_upsert(idx):
-                db.update(vector_id=vid, payload={"data": f"update_{idx}", "user_id": "e2e_user"})
+        def do_upsert(idx):
+            self.db.update(vector_id=vid, payload={"data": f"update_{idx}", "user_id": "e2e_user"})
 
-            with ThreadPoolExecutor(max_workers=5) as executor:
-                list(executor.map(do_upsert, range(10)))
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            list(executor.map(do_upsert, range(10)))
 
-            result = db.get(vid)
-            assert result is not None
-            assert result.payload["user_id"] == "e2e_user"
-            listed = _list_flat(db, filters={"user_id": "e2e_user"}, top_k=100)
-            assert len(listed) == 1
-        finally:
-            db.delete_col()
+        result = self.db.get(vid)
+        assert result is not None
+        assert result.payload["user_id"] == "e2e_user"
+        listed = _list_flat(self.db, filters={"user_id": "e2e_user"}, top_k=100)
+        assert len(listed) == 1
 
     def test_e2e_reset_collection(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
+        db = _new_db(prefix="e2e_reset", embedding_model_dims=1536, vector_index_type="gsdiskann")
         try:
             ids = [str(uuid.uuid4()) for _ in range(5)]
             vecs = [_make_vector_seeded(i + 1000, dims=1536) for i in range(5)]
-            payloads = [{"data": f"item_{i}", "user_id": "e2e_user"} for i in range(5)]
+            payloads = [{"data": f"item_{i}", "user_id": "e2e_reset_user"} for i in range(5)]
             db.insert(vectors=vecs, ids=ids, payloads=payloads)
-            assert len(_list_flat(db, filters={"user_id": "e2e_user"}, top_k=100)) == 5
+            assert len(_list_flat(db, filters={"user_id": "e2e_reset_user"}, top_k=100)) == 5
             db.reset()
-            listed = _list_flat(db, filters={"user_id": "e2e_user"}, top_k=100)
+            listed = _list_flat(db, filters={"user_id": "e2e_reset_user"}, top_k=100)
             assert len(listed) == 0
         finally:
             db.delete_col()
 
     def test_e2e_delete_collection(self):
-        db = _new_db(prefix="e2e", embedding_model_dims=1536)
+        db = _new_db(prefix="e2e_delcol", embedding_model_dims=1536, vector_index_type="gsdiskann")
         vid = str(uuid.uuid4())
         vec = _make_vector_seeded(1100, dims=1536)
-        db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "cleanup", "user_id": "e2e_user"}])
+        db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "cleanup", "user_id": "e2e_delcol_user"}])
         db.delete_col()
         cols = db.list_cols()
         assert db.collection_name not in cols
@@ -5947,135 +5071,119 @@ class TestE2EDirect:
 class TestE2EFull:
     """Full E2E verification covering CRUD, edge cases, filters, batch ops."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="e2e_full", embedding_model_dims=4)
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_full_init_and_create_collection(self):
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            cols = db.list_cols()
-            assert db.collection_name in cols
-            info = db.col_info()
-            assert info["name"] == db.collection_name
-            assert info["dimension"] == 4
-        finally:
-            db.delete_col()
+        cols = self.db.list_cols()
+        assert self.db.collection_name in cols
+        info = self.db.col_info()
+        assert info["name"] == self.db.collection_name
+        assert info["dimension"] == 4
 
     def test_full_crud_lifecycle(self):
         """Insert, get, update, search, delete lifecycle."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            id1 = str(uuid.uuid5(uuid.NAMESPACE_DNS, "test-record-1"))
-            id2 = str(uuid.uuid5(uuid.NAMESPACE_DNS, "test-record-2"))
-            id3 = str(uuid.uuid5(uuid.NAMESPACE_DNS, "test-record-3"))
+        id1 = str(uuid.uuid5(uuid.NAMESPACE_DNS, "test-record-1"))
+        id2 = str(uuid.uuid5(uuid.NAMESPACE_DNS, "test-record-2"))
+        id3 = str(uuid.uuid5(uuid.NAMESPACE_DNS, "test-record-3"))
 
-            # Insert
-            db.insert(
-                ids=[id1, id2, id3],
-                vectors=[[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8], [0.9, 0.1, 0.2, 0.3]],
-                payloads=[
-                    {"data": "first record", "user_id": "full_user", "category": "A"},
-                    {"data": "second record", "user_id": "full_user", "category": "B"},
-                    {"data": "third record", "user_id": "full_user", "category": "A"},
-                ],
-            )
+        # Insert
+        self.db.insert(
+            ids=[id1, id2, id3],
+            vectors=[[0.1, 0.2, 0.3, 0.4], [0.5, 0.6, 0.7, 0.8], [0.9, 0.1, 0.2, 0.3]],
+            payloads=[
+                {"data": "first record", "user_id": "full_user", "category": "A"},
+                {"data": "second record", "user_id": "full_user", "category": "B"},
+                {"data": "third record", "user_id": "full_user", "category": "A"},
+            ],
+        )
 
-            # Get
-            r1 = db.get(id1)
-            assert r1 is not None
-            assert r1.payload["data"] == "first record"
+        # Get
+        r1 = self.db.get(id1)
+        assert r1 is not None
+        assert r1.payload["data"] == "first record"
 
-            # Update payload
-            db.update(vector_id=id1, payload={"data": "updated first", "user_id": "full_user", "category": "A"})
-            r1_updated = db.get(id1)
-            assert r1_updated.payload["data"] == "updated first"
+        # Update payload
+        self.db.update(vector_id=id1, payload={"data": "updated first", "user_id": "full_user", "category": "A"})
+        r1_updated = self.db.get(id1)
+        assert r1_updated.payload["data"] == "updated first"
 
-            # Update vector
-            db.update(vector_id=id2, vector=[0.99, 0.99, 0.99, 0.99])
-            results = db.search("test", [0.99, 0.99, 0.99, 0.99], top_k=1, filters={"user_id": "full_user"})
-            assert results[0].id == id2
+        # Update vector
+        self.db.update(vector_id=id2, vector=[0.99, 0.99, 0.99, 0.99])
+        results = self.db.search("test", [0.99, 0.99, 0.99, 0.99], top_k=1, filters={"user_id": "full_user"})
+        assert results[0].id == id2
 
-            # Search with filter
-            results = db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "full_user", "category": "A"})
-            result_ids = {r.id for r in results}
-            assert id1 in result_ids
-            assert id3 in result_ids
-            assert id2 not in result_ids
+        # Search with filter
+        results = self.db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "full_user", "category": "A"})
+        result_ids = {r.id for r in results}
+        assert id1 in result_ids
+        assert id3 in result_ids
+        assert id2 not in result_ids
 
-            # Delete
-            db.delete(vector_id=id3)
-            assert db.get(id3) is None
+        # Delete
+        self.db.delete(vector_id=id3)
+        assert self.db.get(id3) is None
 
-            # List remaining
-            listed = _list_flat(db, filters={"user_id": "full_user"}, top_k=100)
-            assert len(listed) == 2
-        finally:
-            db.delete_col()
+        # List remaining
+        listed = _list_flat(self.db, filters={"user_id": "full_user"}, top_k=100)
+        assert len(listed) == 2
 
     def test_full_edge_cases_empty_search(self):
         """Search on empty collection returns empty list."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            results = db.search("nothing", [0.1, 0.2, 0.3, 0.4], top_k=5, filters={"user_id": "nobody"})
-            assert results == [] or len(results) == 0
-        finally:
-            db.delete_col()
+        results = self.db.search("nothing", [0.1, 0.2, 0.3, 0.4], top_k=5, filters={"user_id": "nobody"})
+        assert results == [] or len(results) == 0
 
     def test_full_edge_cases_special_chars_payload(self):
         """Payload with special characters stored and retrieved correctly."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            vid = str(uuid.uuid4())
-            special = 'C++ & C# are <great> languages; SELECT * FROM \'table\' WHERE x="test" -- comment'
-            db.insert(
-                ids=[vid], vectors=[[0.1, 0.2, 0.3, 0.4]],
-                payloads=[{"data": special, "user_id": "full_user"}],
-            )
-            result = db.get(vid)
-            assert result.payload["data"] == special
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        special = 'C++ & C# are <great> languages; SELECT * FROM \'table\' WHERE x="test" -- comment'
+        self.db.insert(
+            ids=[vid], vectors=[[0.1, 0.2, 0.3, 0.4]],
+            payloads=[{"data": special, "user_id": "full_user"}],
+        )
+        result = self.db.get(vid)
+        assert result.payload["data"] == special
 
     def test_full_edge_cases_null_like_values(self):
         """Empty string and None-like values in payload."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            vid = str(uuid.uuid4())
-            db.insert(
-                ids=[vid], vectors=[[0.1, 0.2, 0.3, 0.4]],
-                payloads=[{"data": "", "user_id": "full_user", "note": "null_test"}],
-            )
-            result = db.get(vid)
-            assert result.payload["data"] == ""
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        self.db.insert(
+            ids=[vid], vectors=[[0.1, 0.2, 0.3, 0.4]],
+            payloads=[{"data": "", "user_id": "full_user", "note": "null_test"}],
+        )
+        result = self.db.get(vid)
+        assert result.payload["data"] == ""
 
     def test_full_filters_eq_ne_in_nin(self):
         """Filter operators eq, ne, in, nin work correctly."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            ids = [str(uuid.uuid4()) for _ in range(4)]
-            db.insert(
-                ids=ids,
-                vectors=[[0.1, 0.2, 0.3, 0.4]] * 4,
-                payloads=[
-                    {"data": "a", "user_id": "filter_user", "category": "food", "priority": "1"},
-                    {"data": "b", "user_id": "filter_user", "category": "travel", "priority": "2"},
-                    {"data": "c", "user_id": "filter_user", "category": "work", "priority": "3"},
-                    {"data": "d", "user_id": "filter_user", "category": "food", "priority": "4"},
-                ],
-            )
-            # eq
-            results = db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "filter_user", "category": {"eq": "food"}})
-            assert len(results) == 2
-            # ne
-            results = db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "filter_user", "category": {"ne": "food"}})
-            assert len(results) == 2
-            # in
-            results = db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "filter_user", "category": {"in": ["food", "travel"]}})
-            assert len(results) == 3
-            # nin
-            results = db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "filter_user", "category": {"nin": ["food"]}})
-            assert len(results) == 2
-        finally:
-            db.delete_col()
+        ids = [str(uuid.uuid4()) for _ in range(4)]
+        self.db.insert(
+            ids=ids,
+            vectors=[[0.1, 0.2, 0.3, 0.4]] * 4,
+            payloads=[
+                {"data": "a", "user_id": "filter_user", "category": "food", "priority": "1"},
+                {"data": "b", "user_id": "filter_user", "category": "travel", "priority": "2"},
+                {"data": "c", "user_id": "filter_user", "category": "work", "priority": "3"},
+                {"data": "d", "user_id": "filter_user", "category": "food", "priority": "4"},
+            ],
+        )
+        # eq
+        results = self.db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "filter_user", "category": {"eq": "food"}})
+        assert len(results) == 2
+        # ne
+        results = self.db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "filter_user", "category": {"ne": "food"}})
+        assert len(results) == 2
+        # in
+        results = self.db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "filter_user", "category": {"in": ["food", "travel"]}})
+        assert len(results) == 3
+        # nin
+        results = self.db.search("test", [0.1, 0.2, 0.3, 0.4], top_k=10, filters={"user_id": "filter_user", "category": {"nin": ["food"]}})
+        assert len(results) == 2
 
     @pytest.mark.skipif(
         not _env_bool("GAUSSDB_TEST_RUN_BM25"),
@@ -6083,77 +5191,61 @@ class TestE2EFull:
     )
     def test_full_bm25_search(self):
         """BM25 keyword search works in full E2E context."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            vid = str(uuid.uuid4())
-            db.insert(
-                ids=[vid], vectors=[[0.1, 0.2, 0.3, 0.4]],
-                payloads=[{"data": "Python machine learning", "user_id": "bm25_user", "text_lemmatized": "python machine learning"}],
-            )
-            results = db.keyword_search("Python", top_k=5, filters={"user_id": "bm25_user"})
-            if results:
-                assert any(r.id == vid for r in results)
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        self.db.insert(
+            ids=[vid], vectors=[[0.1, 0.2, 0.3, 0.4]],
+            payloads=[{"data": "Python machine learning", "user_id": "bm25_user", "text_lemmatized": "python machine learning"}],
+        )
+        results = self.db.keyword_search("Python", top_k=5, filters={"user_id": "bm25_user"})
+        if results:
+            assert any(r.id == vid for r in results)
 
     def test_full_batch_operations(self):
         """Batch insert and search operations."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            count = 50
-            ids = [str(uuid.uuid4()) for _ in range(count)]
-            vectors = [[random.random() for _ in range(4)] for _ in range(count)]
-            payloads = [{"data": f"batch_{i}", "user_id": "batch_user"} for i in range(count)]
-            db.insert(ids=ids, vectors=vectors, payloads=payloads)
-            listed = _list_flat(db, filters={"user_id": "batch_user"}, top_k=200)
-            assert len(listed) == count
-        finally:
-            db.delete_col()
+        count = 50
+        ids = [str(uuid.uuid4()) for _ in range(count)]
+        vectors = [[random.random() for _ in range(4)] for _ in range(count)]
+        payloads = [{"data": f"batch_{i}", "user_id": "batch_user"} for i in range(count)]
+        self.db.insert(ids=ids, vectors=vectors, payloads=payloads)
+        listed = _list_flat(self.db, filters={"user_id": "batch_user"}, top_k=200)
+        assert len(listed) == count
 
     def test_full_rapid_upsert(self):
         """Rapid upsert of same ID is idempotent."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            vid = str(uuid.uuid4())
-            vec = [0.5, 0.5, 0.5, 0.5]
-            for i in range(10):
-                db.insert(ids=[vid], vectors=[vec], payloads=[{"data": f"version_{i}", "user_id": "rapid_user"}])
-            listed = _list_flat(db, filters={"user_id": "rapid_user"}, top_k=100)
-            assert len(listed) == 1
-            result = db.get(vid)
-            assert result.payload["data"] == "version_9"
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = [0.5, 0.5, 0.5, 0.5]
+        for i in range(10):
+            self.db.insert(ids=[vid], vectors=[vec], payloads=[{"data": f"version_{i}", "user_id": "rapid_user"}])
+        listed = _list_flat(self.db, filters={"user_id": "rapid_user"}, top_k=100)
+        assert len(listed) == 1
+        result = self.db.get(vid)
+        assert result.payload["data"] == "version_9"
 
     def test_full_data_integrity(self):
         """Data integrity: no silent corruption after multiple operations."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
-        try:
-            ids = [str(uuid.uuid4()) for _ in range(20)]
-            vectors = [[float(i) / 20, float(i) / 20, float(i) / 20, float(i) / 20] for i in range(20)]
-            payloads = [{"data": f"integrity_{i}", "user_id": "integrity_user", "index": str(i)} for i in range(20)]
-            db.insert(ids=ids, vectors=vectors, payloads=payloads)
+        ids = [str(uuid.uuid4()) for _ in range(20)]
+        vectors = [[float(i) / 20, float(i) / 20, float(i) / 20, float(i) / 20] for i in range(20)]
+        payloads = [{"data": f"integrity_{i}", "user_id": "integrity_user", "index": str(i)} for i in range(20)]
+        self.db.insert(ids=ids, vectors=vectors, payloads=payloads)
 
-            # Verify all records
-            for i, vid in enumerate(ids):
-                result = db.get(vid)
-                assert result is not None, f"Record {i} missing"
-                assert result.payload["data"] == f"integrity_{i}"
-                assert result.payload["index"] == str(i)
+        # Verify all records
+        for i, vid in enumerate(ids):
+            result = self.db.get(vid)
+            assert result is not None, f"Record {i} missing"
+            assert result.payload["data"] == f"integrity_{i}"
+            assert result.payload["index"] == str(i)
 
-            # Delete some, verify others unaffected
-            for vid in ids[:5]:
-                db.delete(vector_id=vid)
-            for i, vid in enumerate(ids[5:], start=5):
-                result = db.get(vid)
-                assert result is not None, f"Record {i} should still exist"
-                assert result.payload["data"] == f"integrity_{i}"
-        finally:
-            db.delete_col()
+        # Delete some, verify others unaffected
+        for vid in ids[:5]:
+            self.db.delete(vector_id=vid)
+        for i, vid in enumerate(ids[5:], start=5):
+            result = self.db.get(vid)
+            assert result is not None, f"Record {i} should still exist"
+            assert result.payload["data"] == f"integrity_{i}"
 
     def test_full_reset_collection(self):
         """Reset collection removes all data."""
-        db = _new_db(prefix="e2e_full", embedding_model_dims=4)
+        db = _new_db(prefix="e2e_full_reset", embedding_model_dims=4)
         try:
             ids = [str(uuid.uuid4()) for _ in range(5)]
             vectors = [[0.1, 0.2, 0.3, 0.4]] * 5
@@ -6176,57 +5268,63 @@ class TestE2EFull:
 class TestMemoryAPI:
     """Tests using Memory.from_config upper-layer API with GaussDB backend."""
 
-    def _make_memory_config(self, collection_name):
-        """Build a Memory config dict using env vars."""
-        config = _gaussdb_env_config(collection_name)
-        if config is None:
+    def _make_memory(self, collection_name):
+        """Build a Memory instance with mocked LLM/Embedder using GaussDB backend."""
+        vector_config = _gaussdb_env_config(collection_name, embedding_model_dims=EMBEDDING_DIMS)
+        if vector_config is None:
             pytest.skip("GaussDB env not configured")
-        return {
-            "vector_store": {
-                "provider": "gaussdb",
-                "config": config,
-            }
+
+        memory_config = {
+            "vector_store": {"provider": "gaussdb", "config": vector_config},
+            "embedder": {"provider": "openai", "config": {"model": "fake", "api_key": "fake"}},
+            "llm": {"provider": "openai", "config": {"model": "fake", "api_key": "fake"}},
+            "version": "v1.1",
         }
 
-    @patch("mem0.utils.factory.EmbedderFactory")
-    def test_memory_add_and_search(self, mock_embedder_factory):
-        """Memory.add and Memory.search work with GaussDB backend."""
-        from tests.vector_stores.conftest import FakeEmbedder
-        mock_embedder_factory.create.return_value = FakeEmbedder()
+        with (
+            patch("mem0.memory.main.EmbedderFactory.create", return_value=FakeEmbedder()),
+            patch("mem0.memory.main.LlmFactory.create", return_value=MagicMock()),
+            patch("mem0.memory.main.SQLiteManager", return_value=MagicMock()),
+            patch("mem0.memory.main.extract_entities", return_value=[]),
+            patch("mem0.memory.main.capture_event", lambda *args, **kwargs: None),
+            patch("mem0.memory.main.MEM0_TELEMETRY", False),
+        ):
+            return Memory.from_config(memory_config)
 
+    def test_memory_add_and_search(self):
+        """Memory.add and Memory.search work with GaussDB backend."""
         collection = _new_collection_name("mem_api")
-        config = self._make_memory_config(collection)
-        m = Memory.from_config(config_dict=config)
+        m = self._make_memory(collection)
         try:
             user_id = f"mem_test_{uuid.uuid4().hex[:6]}"
-            m.add(
-                [{"role": "user", "content": "I love coffee and window seats"}],
+            added = m.add(
+                "I love coffee and window seats",
                 user_id=user_id,
+                infer=False,
+                metadata={"source": "centralized-test"},
             )
-            results = m.search("coffee", user_id=user_id)
-            assert len(results.get("results", [])) >= 1 or len(results.get("memories", [])) >= 1
+            assert len(added.get("results", [])) >= 1
+
+            results = m.search("coffee", filters={"user_id": user_id}, top_k=5, threshold=0)
+            assert len(results.get("results", [])) >= 1
         finally:
             try:
                 m.vector_store.delete_col()
             except Exception:
                 pass
 
-    @patch("mem0.utils.factory.EmbedderFactory")
-    def test_memory_get_all(self, mock_embedder_factory):
+    def test_memory_get_all(self):
         """Memory.get_all returns stored memories."""
-        from tests.vector_stores.conftest import FakeEmbedder
-        mock_embedder_factory.create.return_value = FakeEmbedder()
-
         collection = _new_collection_name("mem_api")
-        config = self._make_memory_config(collection)
-        m = Memory.from_config(config_dict=config)
+        m = self._make_memory(collection)
         try:
             user_id = f"mem_test_{uuid.uuid4().hex[:6]}"
             m.add(
-                [{"role": "user", "content": "I prefer aisle seats on flights"}],
+                "I prefer aisle seats on flights",
                 user_id=user_id,
+                infer=False,
             )
-            all_memories = m.get_all(user_id=user_id)
+            all_memories = m.get_all(filters={"user_id": user_id})
             memories_list = all_memories.get("results", all_memories.get("memories", []))
             assert len(memories_list) >= 1
         finally:
@@ -6235,53 +5333,39 @@ class TestMemoryAPI:
             except Exception:
                 pass
 
-    @patch("mem0.utils.factory.EmbedderFactory")
-    def test_memory_delete(self, mock_embedder_factory):
+    def test_memory_delete(self):
         """Memory.delete removes a specific memory."""
-        from tests.vector_stores.conftest import FakeEmbedder
-        mock_embedder_factory.create.return_value = FakeEmbedder()
-
         collection = _new_collection_name("mem_api")
-        config = self._make_memory_config(collection)
-        m = Memory.from_config(config_dict=config)
+        m = self._make_memory(collection)
         try:
             user_id = f"mem_test_{uuid.uuid4().hex[:6]}"
             result = m.add(
-                [{"role": "user", "content": "I like hiking in the mountains"}],
+                "I like hiking in the mountains",
                 user_id=user_id,
+                infer=False,
             )
-            # Get the memory ID from the add result
-            memories = result.get("results", result.get("memories", []))
-            if memories:
-                mem_id = memories[0].get("id", memories[0].get("memory_id"))
-                if mem_id:
-                    m.delete(mem_id)
-                    all_after = m.get_all(user_id=user_id)
-                    remaining = all_after.get("results", all_after.get("memories", []))
-                    assert not any(
-                        mem.get("id", mem.get("memory_id")) == mem_id for mem in remaining
-                    )
+            memories = result.get("results", [])
+            assert len(memories) >= 1
+            mem_id = memories[0]["id"]
+
+            m.delete(mem_id)
+            assert m.vector_store.get(mem_id) is None
         finally:
             try:
                 m.vector_store.delete_col()
             except Exception:
                 pass
 
-    @patch("mem0.utils.factory.EmbedderFactory")
-    def test_memory_delete_all(self, mock_embedder_factory):
+    def test_memory_delete_all(self):
         """Memory.delete_all removes all memories for a user."""
-        from tests.vector_stores.conftest import FakeEmbedder
-        mock_embedder_factory.create.return_value = FakeEmbedder()
-
         collection = _new_collection_name("mem_api")
-        config = self._make_memory_config(collection)
-        m = Memory.from_config(config_dict=config)
+        m = self._make_memory(collection)
         try:
             user_id = f"mem_test_{uuid.uuid4().hex[:6]}"
-            m.add([{"role": "user", "content": "Memory one"}], user_id=user_id)
-            m.add([{"role": "user", "content": "Memory two"}], user_id=user_id)
+            m.add("Memory one", user_id=user_id, infer=False)
+            m.add("Memory two", user_id=user_id, infer=False)
             m.delete_all(user_id=user_id)
-            all_after = m.get_all(user_id=user_id)
+            all_after = m.get_all(filters={"user_id": user_id})
             remaining = all_after.get("results", all_after.get("memories", []))
             assert len(remaining) == 0
         finally:
@@ -6345,47 +5429,47 @@ MULTILANG_CASES = [
 class TestMultilang:
     """Multi-language text storage and retrieval tests."""
 
+    @classmethod
+    def setup_class(cls):
+        cls.db = _new_db(prefix="multilang", embedding_model_dims=1536, vector_index_type="gsdiskann")
+
+    @classmethod
+    def teardown_class(cls):
+        cls.db.delete_col()
+
     def test_multilang_insert_and_retrieve(self):
         """Insert multilang text and verify payload integrity."""
-        db = _new_db(prefix="multilang", embedding_model_dims=1536)
-        try:
-            ids = []
-            for i, case in enumerate(MULTILANG_CASES):
-                vid = str(uuid.uuid4())
-                ids.append(vid)
-                vec = _make_vector_seeded(i, dims=1536)
-                payload = {**case["payload"], "text": case["text"]}
-                db.insert(vectors=[vec], ids=[vid], payloads=[payload])
+        ids = []
+        for i, case in enumerate(MULTILANG_CASES):
+            vid = str(uuid.uuid4())
+            ids.append(vid)
+            vec = _make_vector_seeded(i, dims=1536)
+            payload = {**case["payload"], "text": case["text"]}
+            self.db.insert(vectors=[vec], ids=[vid], payloads=[payload])
 
-            # Verify all texts stored correctly
-            for i, (case, vid) in enumerate(zip(MULTILANG_CASES, ids)):
-                record = db.get(vector_id=vid)
-                assert record is not None, f"{case['lang']} record not found"
-                stored_text = record.payload.get("text", "")
-                assert stored_text == case["text"], f"{case['lang']} text mismatch"
-        finally:
-            db.delete_col()
+        # Verify all texts stored correctly
+        for i, (case, vid) in enumerate(zip(MULTILANG_CASES, ids)):
+            record = self.db.get(vector_id=vid)
+            assert record is not None, f"{case['lang']} record not found"
+            stored_text = record.payload.get("text", "")
+            assert stored_text == case["text"], f"{case['lang']} text mismatch"
 
     def test_multilang_vector_search(self):
         """Vector search returns correct results for multilang data."""
-        db = _new_db(prefix="multilang", embedding_model_dims=1536)
-        try:
-            ids = []
-            for i, case in enumerate(MULTILANG_CASES):
-                vid = str(uuid.uuid4())
-                ids.append(vid)
-                vec = _make_vector_seeded(i, dims=1536)
-                payload = {**case["payload"], "text": case["text"]}
-                db.insert(vectors=[vec], ids=[vid], payloads=[payload])
+        ids = []
+        for i, case in enumerate(MULTILANG_CASES):
+            vid = str(uuid.uuid4())
+            ids.append(vid)
+            vec = _make_vector_seeded(i, dims=1536)
+            payload = {**case["payload"], "text": case["text"]}
+            self.db.insert(vectors=[vec], ids=[vid], payloads=[payload])
 
-            # Search with same vector should return self as top hit
-            for i, case in enumerate(MULTILANG_CASES):
-                query_vec = _make_vector_seeded(i, dims=1536)
-                hits = db.search(case["text"], query_vec, top_k=1, filters={"user_id": "lang_test"})
-                assert len(hits) >= 1
-                assert hits[0].id == ids[i], f"{case['lang']} search failed"
-        finally:
-            db.delete_col()
+        # Search with same vector should return self as top hit
+        for i, case in enumerate(MULTILANG_CASES):
+            query_vec = _make_vector_seeded(i, dims=1536)
+            hits = self.db.search(case["text"], query_vec, top_k=1, filters={"user_id": "lang_test"})
+            assert len(hits) >= 1
+            assert hits[0].id == ids[i], f"{case['lang']} search failed"
 
     @pytest.mark.skipif(
         not _env_bool("GAUSSDB_TEST_RUN_BM25"),
@@ -6393,50 +5477,38 @@ class TestMultilang:
     )
     def test_multilang_bm25_search(self):
         """BM25 search works with multilang text."""
-        db = _new_db(prefix="multilang", embedding_model_dims=1536)
-        try:
-            ids = []
-            for i, case in enumerate(MULTILANG_CASES):
-                vid = str(uuid.uuid4())
-                ids.append(vid)
-                vec = _make_vector_seeded(i, dims=1536)
-                payload = {**case["payload"], "text": case["text"], "text_lemmatized": case["text"].lower()}
-                db.insert(vectors=[vec], ids=[vid], payloads=[payload])
+        ids = []
+        for i, case in enumerate(MULTILANG_CASES):
+            vid = str(uuid.uuid4())
+            ids.append(vid)
+            vec = _make_vector_seeded(i, dims=1536)
+            payload = {**case["payload"], "text": case["text"], "text_lemmatized": case["text"].lower()}
+            self.db.insert(vectors=[vec], ids=[vid], payloads=[payload])
 
-            for i, case in enumerate(MULTILANG_CASES):
-                results = db.keyword_search(
-                    query=case["bm25_query"], top_k=5, filters={"user_id": "lang_test"}
-                )
-                # BM25 may not work for all languages, just verify no crash
-                assert results is None or isinstance(results, list)
-        finally:
-            db.delete_col()
+        for i, case in enumerate(MULTILANG_CASES):
+            results = self.db.keyword_search(
+                query=case["bm25_query"], top_k=5, filters={"user_id": "lang_test"}
+            )
+            # BM25 may not work for all languages, just verify no crash
+            assert results is None or isinstance(results, list)
 
     def test_multilang_update_payload(self):
         """Update payload with multilang text."""
-        db = _new_db(prefix="multilang", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(0, dims=1536)
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "original", "user_id": "lang_test"}])
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(0, dims=1536)
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "original", "user_id": "lang_test"}])
 
-            new_text = "更新后的中文文本：华为GaussDB是一款优秀的分布式数据库。"
-            db.update(vector_id=vid, payload={"data": new_text, "user_id": "lang_test", "updated": "true"})
-            record = db.get(vector_id=vid)
-            assert record.payload["data"] == new_text
-            assert record.payload["updated"] == "true"
-        finally:
-            db.delete_col()
+        new_text = "更新后的中文文本：华为GaussDB是一款优秀的分布式数据库。"
+        self.db.update(vector_id=vid, payload={"data": new_text, "user_id": "lang_test", "updated": "true"})
+        record = self.db.get(vector_id=vid)
+        assert record.payload["data"] == new_text
+        assert record.payload["updated"] == "true"
 
     def test_multilang_delete_and_verify(self):
         """Delete multilang record and verify removal."""
-        db = _new_db(prefix="multilang", embedding_model_dims=1536)
-        try:
-            vid = str(uuid.uuid4())
-            vec = _make_vector_seeded(99, dims=1536)
-            db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "中文测试", "user_id": "lang_test"}])
-            db.delete(vector_id=vid)
-            assert db.get(vector_id=vid) is None
-        finally:
-            db.delete_col()
+        vid = str(uuid.uuid4())
+        vec = _make_vector_seeded(99, dims=1536)
+        self.db.insert(vectors=[vec], ids=[vid], payloads=[{"data": "中文测试", "user_id": "lang_test"}])
+        self.db.delete(vector_id=vid)
+        assert self.db.get(vector_id=vid) is None
 

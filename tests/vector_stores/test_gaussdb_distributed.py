@@ -1134,6 +1134,7 @@ class TestDistributedMultitenant:
 # ===========================================================================
 
 
+@pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_RUN_PERF"), reason="Performance tests disabled; set GAUSSDB_TEST_RUN_PERF=1 to enable")
 class TestDistributedConcurrency:
     """Concurrency safety across distributed nodes."""
 
@@ -1365,6 +1366,7 @@ class TestDistributedConcurrency:
 # ===========================================================================
 
 
+@pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_RUN_PERF"), reason="Performance tests disabled; set GAUSSDB_TEST_RUN_PERF=1 to enable")
 class TestDistributedPerformance:
     """Performance baseline measurements for distributed mode."""
 

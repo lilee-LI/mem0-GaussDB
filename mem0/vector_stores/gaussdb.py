@@ -36,19 +36,6 @@ _RETRYABLE_ERROR_FRAGMENTS = (
     "terminating connection",
 )
 
-_METADATA_MODE_MAP = {
-    "jsonb": ("jsonb", "json_expression"),
-    "redundant_columns": ("jsonb", "redundant_columns"),
-    "compatible": ("text", "redundant_columns"),
-    "text": ("text", "redundant_columns"),
-}
-
-_BM25_MODE_MAP = {
-    "auto": (True, False),
-    "required": (True, True),
-    "disabled": (False, False),
-}
-
 
 def _first_env(*names: str) -> Optional[str]:
     for name in names:
@@ -95,7 +82,6 @@ class GaussDB(VectorStoreBase):
     def __init__(
         self,
         database: str = "postgres",
-        dbname: Optional[str] = None,
         collection_name: str = "mem0",
         embedding_model_dims: int = 1536,
         user: Optional[str] = None,
@@ -103,51 +89,17 @@ class GaussDB(VectorStoreBase):
         host: Optional[str] = None,
         port: Optional[int] = None,
         connection_string: Optional[str] = None,
-        dsn: Optional[str] = None,
-        url: Optional[str] = None,
-        connection_pool: Optional[Any] = None,
         minconn: int = 1,
         maxconn: int = 5,
         sslmode: Optional[str] = None,
         sslrootcert: Optional[str] = None,
-        client_encoding: Optional[str] = "UTF8",
-        schema: str = "public",
-        table_storage: str = "ustore",
-        compatibility_mode: str = "A",
         deployment_mode: str = "centralized",
-        distribution_mode: str = "auto",
-        gaussdb_version_baseline: str = "506",
-        id_column_type: str = "uuid",
         vector_index_type: str = "gsdiskann",
         vector_metric: str = "cosine",
-        gsdiskann_subgraph_count: int = 1,
-        vector_index_maintenance_work_mem: Optional[str] = "128MB",
-        bm25_enabled: bool = True,
-        bm25_fail_fast: bool = False,
-        bm25_ranking_metric: int = 0,
-        bm25_ncandidates: int = 128,
-        bm25_dictionary: Optional[str] = None,
-        bm25_mode: Optional[str] = None,
-        metadata_column_mode: str = "jsonb",
-        metadata_mode: Optional[str] = "auto",
-        payload_storage_mode: Optional[str] = None,
-        filter_storage_mode: Optional[str] = None,
-        allowed_filter_keys: Optional[List[str]] = None,
-        require_scoped_filters: bool = True,
-        scope_filter_keys: Optional[List[str]] = None,
-        enable_capability_probe: bool = True,
-        enable_observability: bool = True,
-        slow_query_ms: int = 1000,
-        retry_attempts: int = 2,
-        retry_backoff_seconds: float = 0.1,
         auto_create: bool = True,
-        profile: str = "commercial",
-        max_embedding_dims: int = 4096,
     ):
-        connection_string = (
-            connection_string or dsn or url or _first_env("GAUSSDB_CONNECTION_STRING", "GAUSSDB_DSN", "GAUSSDB_URL")
-        )
-        database = dbname or _first_env("GAUSSDB_DATABASE", "GAUSSDB_DBNAME") or database
+        connection_string = connection_string or _first_env("GAUSSDB_CONNECTION_STRING", "GAUSSDB_DSN", "GAUSSDB_URL")
+        database = _first_env("GAUSSDB_DATABASE", "GAUSSDB_DBNAME") or database
         user = user or _first_env("GAUSSDB_USER")
         password = password or _first_env("GAUSSDB_PASSWORD")
         host = host or _first_env("GAUSSDB_HOST")
@@ -158,14 +110,6 @@ class GaussDB(VectorStoreBase):
         self.database = database
         self.collection_name = self._validate_identifier(collection_name, "collection_name")
         self.embedding_model_dims = self._validate_positive_int(embedding_model_dims, "embedding_model_dims")
-        self.max_embedding_dims = self._validate_positive_int(max_embedding_dims, "max_embedding_dims")
-        if self.embedding_model_dims > self.max_embedding_dims:
-            raise ValueError(
-                f"GaussDB vector dimension limit: embedding_model_dims={self.embedding_model_dims} "
-                f"exceeds max_embedding_dims={self.max_embedding_dims}. "
-                f"Set your embedder's embedding_dims<={self.max_embedding_dims} "
-                f"or increase max_embedding_dims if your server supports higher dimensions."
-            )
         self.user = user
         self.password = password
         self.host = host
@@ -173,85 +117,55 @@ class GaussDB(VectorStoreBase):
         self.connection_string = connection_string
         self.minconn = self._validate_positive_int(minconn, "minconn")
         self.maxconn = self._validate_positive_int(maxconn, "maxconn")
+        if self.maxconn < self.minconn:
+            raise ValueError("maxconn must be >= minconn")
         self.sslmode = sslmode
         self.sslrootcert = sslrootcert
-        self.client_encoding = client_encoding
-        self.schema = self._validate_identifier(schema, "schema")
-        self.table_storage = self._validate_choice(table_storage.lower(), "table_storage", {"ustore"})
-        self.compatibility_mode = self._validate_choice(compatibility_mode.upper(), "compatibility_mode", {"A"})
         self.deployment_mode = self._validate_choice(
             str(deployment_mode).lower(), "deployment_mode", {"centralized", "distributed"}
         )
-        self.distribution_mode = self._resolve_distribution_mode(distribution_mode)
-        self.gaussdb_version_baseline = gaussdb_version_baseline
-        self.profile = self._validate_choice(str(profile).lower(), "profile", {"commercial", "compatibility"})
-        self.id_column_type = self._validate_choice(id_column_type.lower(), "id_column_type", {"uuid", "varchar"})
         self.vector_index_type = self._validate_choice(
             vector_index_type.lower(), "vector_index_type", {"gsdiskann", "gsivfflat"}
         )
         self.vector_metric = self._validate_choice(vector_metric.lower(), "vector_metric", {"cosine", "l2"})
-        self.gsdiskann_subgraph_count = gsdiskann_subgraph_count
-        self.vector_index_maintenance_work_mem = vector_index_maintenance_work_mem
-        if self.deployment_mode == "distributed" and self.embedding_model_dims > 1024:
+
+        # Derived from deployment_mode
+        max_embedding_dims = 1024 if self.deployment_mode == "distributed" else 4096
+        if self.embedding_model_dims > max_embedding_dims:
             raise ValueError(
-                f"GaussDB distributed mode only supports embedding dimensions <= 1024, "
-                f"but embedding_model_dims={self.embedding_model_dims}. "
-                f"Solutions: (1) Use an embedding model with <= 1024 dimensions "
-                f"(e.g. BGE-M3, Cohere embed-v3, text-embedding-3-small with dims=1024); "
-                f"(2) Set embedder embedding_dims=1024 (OpenAI text-embedding-3 supports MRL truncation); "
-                f"(3) Switch to deployment_mode='centralized' which supports up to 4096 dimensions."
+                f"GaussDB {self.deployment_mode} mode supports embedding dimensions <= {max_embedding_dims}, "
+                f"but embedding_model_dims={self.embedding_model_dims}."
             )
-        if self.embedding_model_dims > 1024:
-            if self.vector_index_type != "gsdiskann":
-                raise ValueError(
-                    f"embedding_model_dims={self.embedding_model_dims} exceeds 1024; "
-                    f"only GsDiskANN supports >1024 dimensions. "
-                    f"Set vector_index_type='gsdiskann' or reduce embedding_model_dims<=1024."
-                )
-            if self.gsdiskann_subgraph_count <= 0:
-                raise ValueError(
-                    f"embedding_model_dims={self.embedding_model_dims} exceeds 1024; "
-                    f"GsDiskANN requires subgraph_count>0 (with enable_vector_copy=false) "
-                    f"for high-dimensional indexes."
-                )
-        self.bm25_enabled, self.bm25_fail_fast, self.bm25_mode = self._resolve_bm25_mode(
-            bm25_mode=bm25_mode,
-            bm25_enabled=bm25_enabled,
-            bm25_fail_fast=bm25_fail_fast,
-        )
-        if self.deployment_mode == "distributed" and self.bm25_enabled:
-            if self.bm25_fail_fast:
-                raise ValueError("bm25_mode='required' is incompatible with deployment_mode='distributed'")
-            logger.info("BM25 disabled: not supported in distributed deployment mode")
-            self.bm25_enabled = False
-        self.bm25_ranking_metric = int(bm25_ranking_metric)
-        self.bm25_ncandidates = self._validate_positive_int(bm25_ncandidates, "bm25_ncandidates")
-        self.bm25_dictionary = bm25_dictionary
-        requested_metadata_mode = metadata_mode.lower() if isinstance(metadata_mode, str) else metadata_mode
-        if (
-            self.profile == "compatibility"
-            and requested_metadata_mode == "auto"
-            and payload_storage_mode is None
-            and filter_storage_mode is None
-            and metadata_column_mode.lower() == "jsonb"
-        ):
-            requested_metadata_mode = "compatible"
-        self.metadata_mode = requested_metadata_mode
-        self.payload_storage_mode, self.filter_storage_mode, self.metadata_column_mode = self._resolve_metadata_modes(
-            metadata_mode=self.metadata_mode,
-            metadata_column_mode=metadata_column_mode,
-            payload_storage_mode=payload_storage_mode,
-            filter_storage_mode=filter_storage_mode,
-        )
-        self.allowed_filter_keys = set(allowed_filter_keys) if allowed_filter_keys else None
-        self.require_scoped_filters = require_scoped_filters
-        self.scope_filter_keys = tuple(scope_filter_keys or ["user_id", "agent_id", "run_id"])
-        self.enable_capability_probe = enable_capability_probe
-        self.enable_observability = enable_observability
-        self.slow_query_ms = self._validate_positive_int(slow_query_ms, "slow_query_ms")
-        self.retry_attempts = self._validate_positive_int(retry_attempts, "retry_attempts")
-        self.retry_backoff_seconds = retry_backoff_seconds
-        self.connection_pool = connection_pool
+        if self.embedding_model_dims > 1024 and self.vector_index_type != "gsdiskann":
+            raise ValueError(
+                f"embedding_model_dims={self.embedding_model_dims} exceeds 1024; "
+                f"only GsDiskANN supports >1024 dimensions. Set vector_index_type='gsdiskann'."
+            )
+        self.distribution_mode = "hash" if self.deployment_mode == "distributed" else "none"
+
+        # Hardcoded internal defaults
+        self.client_encoding = "UTF8"
+        self.schema = "public"
+        self.table_storage = "ustore"
+        self.id_column_type = "uuid"
+        self.gsdiskann_subgraph_count = 1
+        self.vector_index_maintenance_work_mem = "128MB"
+        self.bm25_enabled = self.deployment_mode != "distributed"
+        self.bm25_ranking_metric = 0
+        self.bm25_ncandidates = 128
+        self.bm25_dictionary = None
+        self.payload_storage_mode = "jsonb"
+        self.filter_storage_mode = "json_expression"
+        self.metadata_column_mode = "jsonb"
+        self.require_scoped_filters = True
+        self.scope_filter_keys = ("user_id", "agent_id", "run_id")
+        self.allowed_filter_keys = None
+        self.enable_observability = True
+        self.slow_query_ms = 1000
+        self.retry_attempts = 2
+        self.retry_backoff_seconds = 0.1
+        self.gaussdb_version_baseline = "506"
+
         self.capabilities = CapabilityReport(
             baseline=self.gaussdb_version_baseline,
             payload_storage_mode=self.payload_storage_mode,
@@ -267,16 +181,8 @@ class GaussDB(VectorStoreBase):
         self.table_name = f'{self._schema_prefix}{self._quote_identifier(self.collection_name)}'
         self.schema_meta_table_name = f'{self._schema_prefix}{self._quote_identifier(f"{self.collection_name}_schema_meta")}'
 
-        if self.maxconn < self.minconn:
-            raise ValueError("maxconn must be greater than or equal to minconn")
-        for key in self.scope_filter_keys:
-            self._validate_filter_key(key)
-
-        if self.connection_pool is None:
-            self.connection_pool = self._create_connection_pool()
-
-        if self.enable_capability_probe:
-            self._probe_capabilities()
+        self.connection_pool = self._create_connection_pool()
+        self._probe_capabilities()
 
         if auto_create:
             collections = self.list_cols()
@@ -290,79 +196,6 @@ class GaussDB(VectorStoreBase):
         if value < 0:
             raise ValueError(f"{field_name} must be non-negative")
         return value
-
-    @staticmethod
-    def _resolve_metadata_modes(
-        metadata_mode: Optional[str],
-        metadata_column_mode: str,
-        payload_storage_mode: Optional[str],
-        filter_storage_mode: Optional[str],
-    ) -> Tuple[str, str, str]:
-        if metadata_mode is not None:
-            metadata_mode = GaussDB._validate_choice(
-                metadata_mode.lower(),
-                "metadata_mode",
-                {"auto", "jsonb", "redundant_columns", "compatible", "text"},
-            )
-        legacy_mode = GaussDB._validate_choice(
-            metadata_column_mode.lower(), "metadata_column_mode", {"jsonb", "text", "redundant_columns"}
-        )
-
-        if metadata_mode not in (None, "auto") and payload_storage_mode is None and filter_storage_mode is None:
-            payload_storage_mode, filter_storage_mode = _METADATA_MODE_MAP[metadata_mode]
-
-        if payload_storage_mode is None:
-            payload_mode = "text" if legacy_mode == "text" else "jsonb"
-        else:
-            payload_mode = GaussDB._validate_choice(
-                payload_storage_mode.lower(), "payload_storage_mode", {"jsonb", "text"}
-            )
-
-        if filter_storage_mode is None:
-            if payload_mode == "text" or legacy_mode in {"text", "redundant_columns"}:
-                filter_mode = "redundant_columns"
-            else:
-                filter_mode = "json_expression"
-        else:
-            filter_mode = GaussDB._validate_choice(
-                filter_storage_mode.lower(), "filter_storage_mode", {"json_expression", "redundant_columns"}
-            )
-
-        if payload_mode == "text" and filter_mode == "json_expression":
-            raise ValueError("filter_storage_mode='json_expression' requires payload_storage_mode='jsonb'")
-
-        if payload_mode == "text":
-            resolved_legacy_mode = "text"
-        elif filter_mode == "redundant_columns":
-            resolved_legacy_mode = "redundant_columns"
-        else:
-            resolved_legacy_mode = "jsonb"
-        return payload_mode, filter_mode, resolved_legacy_mode
-
-    @staticmethod
-    def _resolve_bm25_mode(
-        bm25_mode: Optional[str],
-        bm25_enabled: bool,
-        bm25_fail_fast: bool,
-    ) -> Tuple[bool, bool, Optional[str]]:
-        if bm25_mode is None:
-            return bm25_enabled, bm25_fail_fast, None
-        mode = GaussDB._validate_choice(bm25_mode.lower(), "bm25_mode", {"auto", "required", "disabled"})
-        enabled, fail_fast = _BM25_MODE_MAP[mode]
-        return enabled, fail_fast, mode
-
-    def _resolve_distribution_mode(self, distribution_mode: str) -> str:
-        distribution_mode = "auto" if distribution_mode is None else distribution_mode
-        mode = self._validate_choice(
-            str(distribution_mode).lower(),
-            "distribution_mode",
-            {"auto", "none", "hash"},
-        )
-        if mode == "auto":
-            return "hash" if self.deployment_mode == "distributed" else "none"
-        if self.deployment_mode == "centralized" and mode != "none":
-            raise ValueError("distribution_mode can only be enabled when deployment_mode='distributed'")
-        return mode
 
     @staticmethod
     def _validate_choice(value: str, field_name: str, choices: set[str]) -> str:
@@ -684,8 +517,6 @@ class GaussDB(VectorStoreBase):
                                 cur.execute(f"RELEASE SAVEPOINT {savepoint}")
                             except Exception:
                                 logger.debug("Failed to roll back BM25 score probe savepoint", exc_info=True)
-                            if self.bm25_fail_fast:
-                                raise
                             logger.warning("BM25 score probe failed; keyword_search will be disabled: %s", exc)
                             self.bm25_enabled = False
                             self._increment_metric("gaussdb_fallback_count")
@@ -722,7 +553,7 @@ class GaussDB(VectorStoreBase):
                 report.metadata_column_mode = self.metadata_column_mode
                 report.jsonb = False
                 report.expression_index = False
-            elif self.bm25_enabled and "bm25" in str(exc).lower() and not self.bm25_fail_fast:
+            elif self.bm25_enabled and "bm25" in str(exc).lower():
                 logger.warning("BM25 probe failed; keyword_search will be disabled: %s", exc)
                 self.bm25_enabled = False
                 self._increment_metric("gaussdb_fallback_count")
@@ -852,8 +683,6 @@ class GaussDB(VectorStoreBase):
                 cur.execute(f"RELEASE SAVEPOINT {savepoint}")
             except Exception:
                 logger.debug("Failed to roll back optional BM25 index savepoint", exc_info=True)
-            if self.bm25_fail_fast:
-                raise
             self.bm25_enabled = False
             self._increment_metric("gaussdb_fallback_count")
             logger.warning("BM25 index creation failed; keyword_search disabled", exc_info=True)
@@ -1013,8 +842,6 @@ class GaussDB(VectorStoreBase):
                 ]
             except Exception:
                 self._increment_metric("gaussdb_fallback_count")
-                if self.bm25_fail_fast:
-                    raise
                 logger.debug("GaussDB BM25 keyword search failed", exc_info=True)
                 return None
 
@@ -1191,8 +1018,6 @@ class GaussDB(VectorStoreBase):
                 "count": row_count,
                 "dimension": self.embedding_model_dims,
                 "schema_version": schema_version,
-                "profile": self.profile,
-                "metadata_mode": self.metadata_mode,
                 "metadata_column_mode": self.metadata_column_mode,
                 "payload_storage_mode": self.payload_storage_mode,
                 "filter_storage_mode": self.filter_storage_mode,
@@ -1200,7 +1025,6 @@ class GaussDB(VectorStoreBase):
                 "distribution_mode": self.distribution_mode,
                 "vector_index_type": self.vector_index_type,
                 "vector_metric": self.vector_metric,
-                "bm25_mode": self.bm25_mode,
                 "bm25_enabled": self.bm25_enabled,
                 "indexes": indexes,
             }
@@ -1261,8 +1085,6 @@ class GaussDB(VectorStoreBase):
         return {
             "collection_name": self.collection_name,
             "schema_version": 1,
-            "profile": self.profile,
-            "metadata_mode": self.metadata_mode,
             "payload_storage_mode": self.payload_storage_mode,
             "filter_storage_mode": self.filter_storage_mode,
             "deployment_mode": self.deployment_mode,
