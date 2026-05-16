@@ -1,20 +1,20 @@
-# mem0 + GaussDB + MiniMax 使用手册
+# mem0 + GaussDB 用户手册
 
-本文面向想手工验证 mem0 使用 GaussDB 作为记忆数据库的开发者。示例使用 GaussDB 集中式 A 模式 Ustore 作为 vector store，使用 MiniMax 作为真实 LLM，embedding 可以选择 OpenAI-compatible embedding 服务或本地 `fastembed`。
+## 1. 概述
 
-## 1. mem0 是什么
+### 1.1 mem0 是什么
 
-mem0 是面向 AI Agent/助手的长期记忆层。它不是普通聊天历史表，而是把用户对话抽取成可检索的“记忆”，并在后续 query 时做多信号召回。
+mem0 是面向 AI Agent/助手的长期记忆层。它不是普通聊天历史表，而是把用户对话抽取成可检索的”记忆”，并在后续 query 时做多信号召回。
 
-在当前代码里，一次典型 `Memory.add()` 会走这条链路：
+一次典型 `Memory.add()` 的处理链路：
 
 1. 接收用户/助手 messages。
 2. 用 LLM 从对话里抽取结构化 memory。
 3. 用 embedding 模型把 memory 文本转成向量。
-4. 写入 vector store，这里就是 GaussDB。
+4. 写入 vector store（GaussDB）。
 5. 同时写入本地 SQLite history，用于 add 阶段上下文。
 
-一次典型 `Memory.search()` 会走这条链路：
+一次典型 `Memory.search()` 的处理链路：
 
 1. 对 query 做 embedding。
 2. 在 GaussDB 中做向量召回。
@@ -22,305 +22,646 @@ mem0 是面向 AI Agent/助手的长期记忆层。它不是普通聊天历史�
 4. 做 entity boost、BM25 score、semantic score 融合排序。
 5. 返回和当前 `user_id`、`agent_id`、`run_id` scope 匹配的记忆。
 
-## 2. 当前 GaussDB 适配能力
+### 1.2 GaussDB provider 的定位
 
-GaussDB provider 已接入 mem0 的标准 vector store 工厂：
+GaussDB provider 是 mem0 的企业级向量存储后端，专为华为 GaussDB 数据库设计。相比社区版 pgvector provider，它提供：
 
-```python
-from mem0 import Memory
+- 原生 `FLOATVECTOR` 类型支持，无需安装扩展
+- 服务端 BM25 关键词索引，无需客户端分词
+- 强制多租户 scope 隔离，防止跨租户数据泄露
+- 运行时能力探测与自动降级，适应不同 GaussDB 版本和部署模式
+- 集中式（A 模式）和分布式双模式支持
 
-memory = Memory.from_config({
-    "vector_store": {
-        "provider": "gaussdb",
-        "config": {...}
-    }
-})
+### 1.3 核心能力一览
+
+| 能力 | 说明 |
+|------|------|
+| 语义搜索 | FLOATVECTOR 向量检索，支持 cosine/l2 距离 |
+| BM25 关键词搜索 | GaussDB 原生 BM25 索引，服务端计算 |
+| 混合排序 | semantic score + BM25 score + entity boost 融合 |
+| 多租户隔离 | user_id / agent_id / run_id 三级 scope 强制过滤 |
+| 能力探测降级 | 初始化时自动探测，不可用能力自动降级 |
+| 批量操作 | CTE 单次往返 upsert，window function 批量搜索 |
+| 可观测性 | 慢查询日志、操作延迟指标、fallback 计数 |
+
+## 2. 环境准备
+
+### 2.1 GaussDB 服务端要求
+
+- **版本**：GaussDB 506 及以上（集中式 A 模式）
+- **向量功能**：需要开启 `enable_vectordb`
+
+```bash
+# 开启向量功能（需要 DBA 权限）
+gs_guc reload -D <datadir> -c "enable_vectordb=on"
+# 重启数据库实例使配置生效
 ```
 
-已适配能力：
+- **字符集**：推荐 UTF-8 编码数据库，避免中文乱码
 
-- 建表：Ustore 表，`FLOATVECTOR` 向量列，payload，`memory`，`text_lemmatized`，schema meta；支持集中式默认建表，也支持分布式兼容建表。
-- 向量检索：支持 `cosine` 和 `l2`，默认 `cosine`。
-- 向量索引：支持 `gsdiskann` 和 `gsivfflat`，默认商业 profile 使用 `gsdiskann`。
-- 关键词检索：支持 GaussDB BM25，`keyword_search()` 使用 `text_lemmatized ### query`。
-- 混合召回：mem0 上层会融合 semantic + BM25 + entity boost。
-- 多租户隔离：默认要求 read/search 路径必须带 `user_id`、`agent_id`、`run_id` 至少一个有效 scope。
-- metadata 兼容：支持 JSONB payload，也支持 TEXT payload + 冗余 scope 列 fallback。
-- 批量写入：使用 CTE set-based update/insert，不依赖 PostgreSQL `ON CONFLICT`。
-- 批量检索：使用 A 模式兼容的 window function 实现，不使用 `LATERAL`。
-- 分布式兼容：`deployment_mode="distributed"` 时，主表按 `id` hash 分布，schema meta 表按 `collection_name` hash 分布。
-- 可观测：慢查询日志、fallback 计数、`col_info()`。
+```sql
+-- 创建 UTF-8 数据库
+CREATE DATABASE mem0_db ENCODING 'UTF8' LC_COLLATE 'en_US.UTF-8' LC_CTYPE 'en_US.UTF-8';
+```
 
-## 3. 准备环境
+- **集中式 vs 分布式**：
 
-在仓库根目录：
+| 特性 | 集中式（A 模式） | 分布式 |
+|------|----------------|--------|
+| 最大向量维度 | 4096（gsdiskann） | 1024 |
+| BM25 搜索 | 支持 | 不支持 |
+| 表存储引擎 | Ustore（原地更新） | 分布式 hash |
+| 推荐场景 | 生产环境，功能完整 | 大规模水平扩展 |
 
-```powershell
-cd D:\lxm\code\mem0-GaussDB\mem0_codex\mem0
-python -m pip install -e ".[vector_stores,llms,nlp]"
+### 2.2 Python 客户端安装
+
+```bash
+# 安装 mem0 及 GaussDB 相关依赖
+pip install mem0ai
+
+# 或从源码安装（开发模式）
+cd mem0
+pip install -e ".[vector_stores,llms,nlp]"
+
+# GaussDB psycopg2 驱动（使用官方 wheel，不要用社区版 psycopg2）
+# 从华为 GaussDB 官方渠道获取对应版本的 wheel 文件
+pip install gaussdb_psycopg2-<version>-<platform>.whl
+
+# spaCy 英文模型（用于 text_lemmatized 分词）
 python -m spacy download en_core_web_sm
+
+# fastembed（可选，用于本地 embedding，无需外部 API）
+pip install fastembed
 ```
 
-如果想完全不用外部 embedding 服务，可以装本地 embedding：
+### 2.3 环境变量配置
 
-```powershell
-python -m pip install fastembed
+推荐通过环境变量传递敏感信息，不要硬编码在代码中。
+
+**GaussDB 连接参数：**
+
+```bash
+export GAUSSDB_HOST="your-gaussdb-host"
+export GAUSSDB_PORT="5432"
+export GAUSSDB_DATABASE="mem0_db"
+export GAUSSDB_USER="your_user"
+export GAUSSDB_PASSWORD="your_password"
+
+# 或使用 DSN 格式连接字符串（优先级高于独立参数）
+export GAUSSDB_CONNECTION_STRING="host=your-host port=5432 dbname=mem0_db user=your_user password=your_password"
+
+# SSL 配置（生产环境推荐）
+export GAUSSDB_SSLMODE="verify-full"
+export GAUSSDB_SSLROOTCERT="/path/to/ca.crt"
 ```
 
-说明：
+**LLM 配置：**
 
-- MiniMax 只负责 LLM 抽取记忆。
-- mem0 还需要 embedding 模型。你可以用 OpenAI-compatible embedding 服务，也可以用本地 `fastembed`。
-- 如果你的 MiniMax 账号也提供 OpenAI-compatible embedding endpoint，可以把它配置到 `EMBEDDING_BASE_URL` 和 `EMBEDDING_MODEL`。
+```bash
+# OpenAI
+export OPENAI_API_KEY="sk-..."
 
-## 4. 配置环境变量
-
-不要把密码或 API key 写进代码。PowerShell 示例：
-
-```powershell
-$env:GAUSSDB_HOST='<your-gaussdb-host>'
-$env:GAUSSDB_PORT='19995'
-$env:GAUSSDB_DATABASE='<your-database>'
-$env:GAUSSDB_USER='<your-user>'
-$env:GAUSSDB_PASSWORD='<your-password>'
+# MiniMax
+export MINIMAX_API_KEY="your-minimax-key"
+export MINIMAX_BASE_URL="https://api.minimax.io/v1"
+export MINIMAX_MODEL="MiniMax-M2.7"
 ```
 
-如果验证 GaussDB 分布式库，再加：
+**Embedding 配置：**
 
-```powershell
-$env:GAUSSDB_DEPLOYMENT_MODE='distributed'
-$env:GAUSSDB_DISTRIBUTION_MODE='auto'
+```bash
+# OpenAI embedding
+export OPENAI_API_KEY="sk-..."
+
+# 自定义 OpenAI-compatible embedding 服务
+export EMBEDDING_API_KEY="your-key"
+export EMBEDDING_BASE_URL="https://your-embedding-service/v1"
+export EMBEDDING_MODEL="text-embedding-3-small"
+export EMBEDDING_DIMS="1536"
 ```
 
-`auto` 在集中式下等价于不追加分布式子句，在分布式下等价于 `hash`。当前分布式适配是兼容模式：主表 `DISTRIBUTE BY HASH ("id")`，schema meta 表 `DISTRIBUTE BY HASH ("collection_name")`。它优先保证 mem0 标准接口能在分布式库上创建和运行，不把 `user_id/agent_id/run_id` 做分布键；如果目标是大规模多租户性能优化，需要后续引入 `scope_hash` 或映射表设计。
+## 3. 快速开始
 
-MiniMax：
-
-```powershell
-$env:MINIMAX_API_KEY='<your-minimax-api-key>'
-$env:MINIMAX_MODEL='MiniMax-M2.7'
-$env:MINIMAX_MAX_TOKENS='2000'
-
-# 国际站常用：
-$env:MINIMAX_BASE_URL='https://api.minimax.io/v1'
-
-# 如果你的账号/网络使用国内 endpoint，可改成：
-# $env:MINIMAX_BASE_URL='https://api.minimaxi.com/v1'
-```
-
-OpenAI-compatible embedding 示例：
-
-```powershell
-$env:EMBEDDING_API_KEY='<your-embedding-api-key>'
-$env:EMBEDDING_BASE_URL='<your-openai-compatible-embedding-base-url>'
-$env:EMBEDDING_MODEL='<your-embedding-model>'
-$env:EMBEDDING_DIMS='1536'
-```
-
-如果用本地 `fastembed`：
-
-```powershell
-$env:MEM0_EMBEDDER='fastembed'
-$env:EMBEDDING_MODEL='thenlper/gte-large'
-$env:EMBEDDING_DIMS='1024'
-```
-
-## 5. 一键手工验证
-
-仓库里提供了脚本：
-
-[examples/misc/gaussdb_minimax_memory.py](../examples/misc/gaussdb_minimax_memory.py)
-
-第一次建议重置 demo collection：
-
-```powershell
-python examples\misc\gaussdb_minimax_memory.py --reset --details
-```
-
-使用本地 fastembed：
-
-```powershell
-python examples\misc\gaussdb_minimax_memory.py --embedder fastembed --reset --details
-```
-
-脚本会做四件事：
-
-1. 初始化 `Memory.from_config()`。
-2. 直接调用 MiniMax 做 JSON smoke test，确认 LLM 真的连通。
-3. 调用 `memory.add()` 写入中文/英文混合对话记忆。
-4. 调用 `memory.search()` 检索“咖啡/座位偏好”和“季度报销审批”。
-
-成功时你应该看到：
-
-- `MiniMax LLM smoke response` 返回 JSON 内容。
-- `memory.add result` 中出现新增 memory。
-- `memory.search result` 中召回包含“拿铁/靠窗座位/报销审批”等记忆。
-- `GaussDB collection info` 显示 `bm25_enabled`、`vector_metric`、`indexes` 等信息。
-
-## 6. 最小 Python 示例
+### 3.1 最小配置示例
 
 ```python
 from mem0 import Memory
 
 config = {
-    "version": "v1.1",
-    "llm": {
-        "provider": "minimax",
-        "config": {
-            "model": "MiniMax-M2.7",
-            "api_key": "<read-from-env-in-real-code>",
-            "minimax_base_url": "https://api.minimax.io/v1",
-            "reasoning_split": True,
-        },
-    },
-    "embedder": {
-        "provider": "openai",
-        "config": {
-            "model": "<embedding-model>",
-            "api_key": "<read-from-env-in-real-code>",
-            "openai_base_url": "<embedding-base-url>",
-            "embedding_dims": 1536,
-        },
-    },
     "vector_store": {
         "provider": "gaussdb",
         "config": {
-            "host": "<gaussdb-host>",
-            "port": 19995,
-            "database": "<database>",
-            "user": "<user>",
-            "password": "<password>",
-            "collection_name": "mem0_manual_demo",
+            "host": "your-gaussdb-host",
+            "port": 5432,
+            "database": "mem0_db",
+            "user": "your_user",
+            "password": "your_password",
+            "collection_name": "memories",
             "embedding_model_dims": 1536,
-            "profile": "commercial",
-            "metadata_mode": "auto",
-            "bm25_mode": "auto",
-            "deployment_mode": "centralized",
-            "distribution_mode": "auto",
-            "require_scoped_filters": True,
-        },
+        }
     },
+    "llm": {
+        "provider": "openai",
+        "config": {"model": "gpt-4o-mini"}
+    },
+    "embedder": {
+        "provider": "openai",
+        "config": {"model": "text-embedding-3-small"}
+    }
 }
 
-memory = Memory.from_config(config)
+m = Memory.from_config(config)
+```
 
-memory.add(
+### 3.2 添加记忆
+
+```python
+# 添加单条消息
+m.add("我喜欢喝咖啡，每天早上必须来一杯", user_id="alice")
+
+# 添加对话历史
+m.add(
     [
-        {"role": "user", "content": "我喜欢早晨喝拿铁，出差时更喜欢安静靠窗座位。"},
-        {"role": "assistant", "content": "好的，我会记住这些偏好。"},
+        {"role": "user", "content": "下周三有个重要会议，需要准备季度报告"},
+        {"role": "assistant", "content": "好的，我会帮你记住这个安排"},
     ],
     user_id="alice",
-    agent_id="travel_agent",
-    run_id="manual_test",
+    agent_id="assistant_bot"
 )
+```
 
-result = memory.search(
-    "我下次出差时有什么座位和饮品偏好？",
-    filters={"user_id": "alice", "agent_id": "travel_agent", "run_id": "manual_test"},
-    top_k=5,
+### 3.3 搜索记忆
+
+```python
+# 语义搜索
+results = m.search("早上的习惯", user_id="alice")
+for r in results:
+    print(r["memory"], r["score"])
+
+# 带 agent 范围的搜索
+results = m.search(
+    "会议安排",
+    user_id="alice",
+    agent_id="assistant_bot"
 )
-print(result)
 ```
 
-## 7. Scope 隔离怎么用
-
-GaussDB provider 默认 `require_scoped_filters=True`。这意味着 search/list/keyword_search 必须带至少一个有效 scope：
+### 3.4 更新和删除
 
 ```python
-memory.search("咖啡偏好", filters={"user_id": "alice"})
+# 获取所有记忆
+all_memories = m.get_all(user_id="alice")
+memory_id = all_memories[0]["id"]
+
+# 更新记忆
+m.update(memory_id, "我现在改喝茶了")
+
+# 删除单条记忆
+m.delete(memory_id)
+
+# 删除用户所有记忆
+m.delete_all(user_id="alice")
 ```
 
-不建议这么做：
+## 4. 配置详解
+
+### 4.1 完整配置参数表
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `host` | str | `"localhost"` | GaussDB 服务器地址 |
+| `port` | int | `5432` | GaussDB 端口 |
+| `database` | str | `"postgres"` | 数据库名 |
+| `user` | str | `"postgres"` | 用户名 |
+| `password` | str | `""` | 密码 |
+| `connection_string` | str | `None` | DSN 格式连接字符串，优先级高于独立参数 |
+| `collection_name` | str | `"mem0"` | 向量表名（collection） |
+| `embedding_model_dims` | int | `1536` | embedding 向量维度，必须与 embedding 模型一致 |
+| `index_type` | str | `"gsdiskann"` | 向量索引类型：`gsdiskann` 或 `gsivfflat` |
+| `distance_metric` | str | `"cosine"` | 距离度量：`cosine` 或 `l2` |
+| `deployment_mode` | str | `"centralized"` | 部署模式：`centralized` 或 `distributed` |
+| `distribution_mode` | str | `"auto"` | 分布式建表策略：`auto`、`hash`、`none` |
+| `profile` | str | `"commercial"` | 能力 profile：`commercial`（默认）或 `community` |
+| `metadata_mode` | str | `"auto"` | payload 存储模式：`auto`、`jsonb`、`text` |
+| `bm25_mode` | str | `"auto"` | BM25 模式：`auto`（自动探测）、`required`（强制）、`disabled`（禁用） |
+| `require_scoped_filters` | bool | `True` | 是否强制要求 scope 过滤（user_id/agent_id/run_id） |
+| `sslmode` | str | `None` | SSL 模式：`disable`、`require`、`verify-ca`、`verify-full` |
+| `sslrootcert` | str | `None` | SSL CA 证书路径 |
+| `minconn` | int | `1` | 连接池最小连接数 |
+| `maxconn` | int | `10` | 连接池最大连接数 |
+| `slow_query_threshold_ms` | int | `1000` | 慢查询日志阈值（毫秒） |
+
+### 4.2 连接方式
+
+**方式一：独立参数**
 
 ```python
-memory.search("咖啡偏好", filters=None)
-```
-
-商用场景建议固定带：
-
-```python
-filters = {
-    "user_id": "<tenant-or-user-id>",
-    "agent_id": "<agent-id>",
-    "run_id": "<session-or-workflow-id>",
+config = {
+    "vector_store": {
+        "provider": "gaussdb",
+        "config": {
+            "host": "192.168.1.100",
+            "port": 5432,
+            "database": "mem0_db",
+            "user": "mem0_user",
+            "password": "your_password",
+        }
+    }
 }
 ```
 
-当前 GaussDB provider 不提供 `gt/gte/lt/lte` range 过滤语义。为了和多数 mem0 provider 保持一致，这类 dict filter 会按普通 metadata 字面值等值过滤处理，并记录 warning；不要把它用于“最近时间”“分数大于”等商用范围召回。需要范围召回时，应等后续 typed metadata range 能力，或在业务层先维护可等值过滤的分桶/标签字段。
-
-## 8. 常见问题
-
-### 8.1 分布式库怎么配置
-
-直接在 GaussDB vector store config 中增加：
+**方式二：连接字符串（DSN 格式）**
 
 ```python
-"deployment_mode": "distributed",
-"distribution_mode": "auto",
+config = {
+    "vector_store": {
+        "provider": "gaussdb",
+        "config": {
+            "connection_string": "host=192.168.1.100 port=5432 dbname=mem0_db user=mem0_user password=your_password",
+        }
+    }
+}
 ```
 
-创建出来的表会追加：
+**SSL 配置：**
+
+```python
+config = {
+    "vector_store": {
+        "provider": "gaussdb",
+        "config": {
+            "host": "your-host",
+            "sslmode": "verify-full",
+            "sslrootcert": "/etc/ssl/certs/gaussdb-ca.crt",
+        }
+    }
+}
+```
+
+### 4.3 向量索引选择
+
+**gsdiskann（默认，推荐生产环境）：**
+
+- 基于 DiskANN 算法，支持高维向量（最高 4096 维）
+- 召回率高，适合大规模数据集
+- 建索引时间较长，但查询性能优秀
+- 仅集中式模式支持
+
+**gsivfflat（适合开发测试）：**
+
+- 基于 IVFFlat 算法，建索引速度快
+- 维度上限较低（通常 2000 维以内）
+- 适合快速验证和小规模数据
+
+```python
+# 使用 gsivfflat（开发测试）
+config["vector_store"]["config"]["index_type"] = "gsivfflat"
+
+# 使用 gsdiskann（生产环境，默认）
+config["vector_store"]["config"]["index_type"] = "gsdiskann"
+```
+
+### 4.4 距离度量
+
+```python
+# cosine（默认）：适合文本 embedding，归一化向量
+config["vector_store"]["config"]["distance_metric"] = "cosine"
+
+# l2：欧氏距离，适合图像特征等欧氏空间场景
+config["vector_store"]["config"]["distance_metric"] = "l2"
+```
+
+### 4.5 部署模式
+
+```python
+# 集中式（默认）：功能完整，支持 BM25，最高 4096 维
+config["vector_store"]["config"]["deployment_mode"] = "centralized"
+
+# 分布式：水平扩展，维度上限 1024，BM25 不可用
+config["vector_store"]["config"]["deployment_mode"] = "distributed"
+config["vector_store"]["config"]["distribution_mode"] = "auto"
+```
+
+## 5. 多租户隔离
+
+### 5.1 Scope 机制
+
+GaussDB provider 通过 `user_id`、`agent_id`、`run_id` 三级 scope 实现多租户隔离。默认配置下（`require_scoped_filters=True`），所有读取操作（search、list、keyword_search）必须携带至少一个有效 scope，否则抛出异常。
+
+这个设计防止了跨租户数据泄露：一个用户的记忆不会出现在另一个用户的搜索结果中。
+
+### 5.2 使用示例
+
+```python
+# 添加时指定 scope
+m.add(“我喜欢喝咖啡”, user_id=”alice”, agent_id=”support_bot”)
+m.add(“我喜欢喝茶”, user_id=”bob”, agent_id=”support_bot”)
+
+# 搜索时必须指定 scope（只返回 alice 的记忆）
+results = m.search(“饮品偏好”, user_id=”alice”)
+
+# 跨 agent 搜索（alice 在 support_bot 下的记忆）
+results = m.search(“饮品偏好”, user_id=”alice”, agent_id=”support_bot”)
+
+# 按 run_id 隔离（同一用户不同会话）
+m.add(“今天讨论了项目进度”, user_id=”alice”, run_id=”session_001”)
+results = m.search(“项目”, user_id=”alice”, run_id=”session_001”)
+```
+
+### 5.3 安全说明
+
+**为什么强制 scope：**
+
+- 防止跨租户数据泄露，符合企业安全合规要求
+- 避免误操作导致全表扫描，保护性能
+- 明确数据归属，便于审计和数据治理
+
+**如何关闭（不推荐）：**
+
+```python
+# 仅在开发测试或单租户场景下使用
+config[“vector_store”][“config”][“require_scoped_filters”] = False
+```
+
+关闭后，search/list 操作不再强制要求 scope，可能返回所有租户的数据。生产环境不建议关闭。
+
+## 6. BM25 关键词搜索
+
+### 6.1 工作原理
+
+GaussDB provider 利用 GaussDB 原生 BM25 索引实现关键词搜索：
+
+1. 写入记忆时，`text_lemmatized` 列存储经过词形还原（lemmatization）处理的文本
+2. BM25 索引建立在 `text_lemmatized` 列上
+3. 搜索时使用 `###` 运算符计算 BM25 相关性分数
 
 ```sql
-WITH (storage_type=ustore)
-DISTRIBUTE BY HASH ("id")
+-- GaussDB BM25 搜索示例（内部实现）
+SELECT id, text_lemmatized ### 'coffee morning' AS bm25_score
+FROM memories
+WHERE user_id = 'alice'
+ORDER BY bm25_score DESC
+LIMIT 10;
 ```
 
-这个方案适合先验证分布式库的语法兼容和 mem0 基础链路。它不是最终性能最优模型，因为 mem0 的主要查询通常是 `user_id/agent_id/run_id + vector top-k`，而不是只按 `id` 查询。生产级分布式优化建议继续评估 `scope_hash` 分布、批量检索全局 top-k 代价、BM25 分布式 ranking 一致性和数据倾斜。
+### 6.2 mem0 融合排序
 
-### 8.2 MiniMax smoke test 成功，但 `memory.add result` 为空
+mem0 上层会自动融合多路召回结果：
 
-这通常是 LLM 没抽取出 memory。先看 MiniMax 返回是否是合法 JSON。也可以用：
+- **semantic score**：向量余弦相似度（0~1）
+- **BM25 score**：关键词相关性分数（归一化后）
+- **entity boost**：实体匹配加权
 
-```powershell
-python examples\misc\gaussdb_minimax_memory.py --no-infer --reset
+融合是自动的，无需手动配置。最终排序综合考虑语义相似度和关键词匹配度，对于精确关键词查询效果更好。
+
+### 6.3 BM25 不可用时的行为
+
+以下情况会自动禁用 BM25：
+
+- 分布式模式（`deployment_mode="distributed"`）
+- GaussDB 版本不支持 BM25 索引
+- 能力探测阶段 BM25 测试失败
+
+禁用后：
+
+- `keyword_search()` 返回 `None`
+- mem0 上层自动降级为纯语义搜索
+- 不影响 `search()` 的正常使用，只是少了关键词召回路径
+
+查看 BM25 状态：
+
+```python
+from mem0.vector_stores.gaussdb import GaussDB
+
+db = GaussDB(host="...", port=5432, database="...", user="...", password="...",
+             collection_name="memories", embedding_model_dims=1536)
+print(f"BM25 enabled: {db.bm25_enabled}")
 ```
 
-`--no-infer` 会跳过 LLM 抽取，把原始 message 直接写入 GaussDB，用于确认 DB 和 embedding 链路。
+## 7. 能力探测与降级
 
-### 8.3 embedding 维度不匹配
+### 7.1 探测流程
 
-GaussDB collection 的 `embedding_model_dims` 必须和 embedding 模型输出维度一致。换 embedding 模型后，建议换 collection 或执行：
+GaussDB provider 在初始化时自动执行能力探测：
 
-```powershell
-python examples\misc\gaussdb_minimax_memory.py --reset --embedding-dims <dims>
+1. 创建临时探测表（`_probe_<uuid>`）
+2. 测试 JSONB 类型是否可用
+3. 测试表达式索引是否可用
+4. 测试 BM25 索引是否可用
+5. 测试完成后自动清理临时表
+
+探测结果缓存在实例中，不会重复执行。
+
+### 7.2 降级路径
+
+| 能力 | 正常模式 | 降级模式 | 触发条件 |
+|------|----------|----------|----------|
+| Payload 存储 | JSONB | TEXT + 冗余列 | JSONB 类型不可用 |
+| Filter 索引 | 表达式索引 | 冗余 scope 列 | 表达式索引不可用 |
+| BM25 | 启用 | 禁用 | BM25 索引不可用 |
+| 向量索引 | gsdiskann | gsivfflat | gsdiskann 不可用 |
+
+### 7.3 查看当前能力
+
+```python
+from mem0.vector_stores.gaussdb import GaussDB
+
+db = GaussDB(
+    host=”your-host”,
+    port=5432,
+    database=”mem0_db”,
+    user=”your_user”,
+    password=”your_password”,
+    collection_name=”memories”,
+    embedding_model_dims=1536,
+)
+
+# 查看所有能力
+print(db.capabilities)
+
+# 查看 payload 存储模式（jsonb 或 text）
+print(db.payload_storage_mode)
+
+# 查看 filter 存储模式（expression_index 或 redundant_columns）
+print(db.filter_storage_mode)
+
+# 查看 BM25 是否启用
+print(db.bm25_enabled)
+
+# 查看 collection 详细信息
+info = db.col_info()
+print(info)
 ```
 
-### 8.4 search 报 scope 相关错误
+## 8. 可观测性
 
-确认 search 时传了 `filters={"user_id": "..."}`，或者脚本没有误加 `--allow-unscoped`。
+### 8.1 慢查询日志
 
-### 8.5 BM25 不可用
+GaussDB provider 内置慢查询日志，超过阈值的查询会自动记录：
 
-如果 `col_info()` 里 `bm25_enabled=false`，说明当前库 BM25 建索引或 score probe 没通过。你仍然可以用向量召回；若要强制 BM25 必须可用：
+```python
+import logging
+logging.basicConfig(level=logging.WARNING)
 
-```powershell
-$env:GAUSSDB_BM25_MODE='required'
-python examples\misc\gaussdb_minimax_memory.py --reset
+# 配置慢查询阈值（毫秒）
+config["vector_store"]["config"]["slow_query_threshold_ms"] = 500
+
+# 超过 500ms 的查询会输出类似：
+# WARNING:mem0.vector_stores.gaussdb:Slow query (1234ms): SELECT ...
 ```
 
-### 8.6 MiniMax endpoint
+### 8.2 操作延迟指标
 
-当前 provider 支持：
+```python
+# 获取操作统计
+stats = db.get_stats()
+print(stats)
+# {
+#   "insert_count": 42,
+#   "search_count": 156,
+#   "avg_insert_ms": 12.3,
+#   "avg_search_ms": 8.7,
+#   "fallback_count": 0,
+# }
+```
 
-- `MINIMAX_BASE_URL`
-- `MINIMAX_API_BASE`
-- config 中的 `minimax_base_url`
+### 8.3 Fallback 计数
 
-默认是 `https://api.minimax.io/v1`。
+当 BM25 或其他能力降级时，fallback 计数会增加：
 
-### 8.7 MiniMax 返回空内容或只有解释文本
+```python
+print(f"Fallback count: {db.fallback_count}")
+```
 
-优先确认：
+### 8.4 Collection 信息
 
-- `MINIMAX_MAX_TOKENS` 不要太小，建议先用 `2000`。
-- `MINIMAX_REASONING_SPLIT` 默认开启；如果你的网关不支持，可设为 `false`。
-- `MINIMAX_MODEL` 建议先用 `MiniMax-M2.7` 做 smoke test，再替换成你的目标模型。
+```python
+info = db.col_info()
+# {
+#   "collection_name": "memories",
+#   "vector_dims": 1536,
+#   "vector_metric": "cosine",
+#   "bm25_enabled": True,
+#   "payload_mode": "jsonb",
+#   "filter_mode": "expression_index",
+#   "indexes": ["gsdiskann_idx", "bm25_idx"],
+#   "row_count": 1024,
+# }
+```
 
-## 9. 推荐验证顺序
+## 9. 常见问题排查
 
-1. `--no-infer --reset --details`：先验证 GaussDB + embedding 写入/检索。
-2. 去掉 `--no-infer`：验证 MiniMax 抽取记忆。
-3. 多跑几条中文、中英混合、业务相近样例：看 semantic/BM25 融合效果。
-4. 换不同 `user_id`：验证 tenant 隔离。
-5. 用 `scripts/compare_gaussdb_pgvector.py --scenario complex --details`：对比 GaussDB 与 pgvector provider-level 召回效果。
+### 9.1 连接失败
+
+**症状：** `psycopg2.OperationalError: could not connect to server`
+
+**排查步骤：**
+
+1. 确认 GaussDB 服务正在运行
+2. 确认 host/port 可达（`telnet your-host 5432`）
+3. 确认用户名密码正确
+4. 确认数据库存在（`psql -h your-host -U your_user -l`）
+5. 检查防火墙规则
+
+```python
+# 测试连接
+import psycopg2
+conn = psycopg2.connect(
+    host="your-host", port=5432, database="mem0_db",
+    user="your_user", password="your_password"
+)
+print("Connection OK")
+conn.close()
+```
+
+### 9.2 向量维度不匹配
+
+**症状：** `ERROR: vector dimension mismatch`
+
+**原因：** `embedding_model_dims` 配置与实际 embedding 模型输出维度不一致，或者 collection 已用不同维度创建。
+
+**解决：**
+
+```python
+# 方法一：修改配置与模型一致
+config["vector_store"]["config"]["embedding_model_dims"] = 1536  # 与模型一致
+
+# 方法二：删除旧 collection 重建
+db.delete_col()  # 删除旧表
+# 重新初始化 Memory 会自动创建新表
+```
+
+### 9.3 BM25 索引创建失败
+
+**症状：** 初始化时 warning `BM25 probe failed, disabling BM25`
+
+**原因：** GaussDB 版本不支持 BM25，或 `enable_vectordb` 未开启。
+
+**解决：**
+
+```bash
+# 检查 GaussDB 版本
+SELECT version();
+
+# 确认向量功能已开启
+SHOW enable_vectordb;
+
+# 如果未开启，联系 DBA 开启
+gs_guc reload -D <datadir> -c "enable_vectordb=on"
+```
+
+如果确认不需要 BM25，可以显式禁用避免 warning：
+
+```python
+config["vector_store"]["config"]["bm25_mode"] = "disabled"
+```
+
+### 9.4 Scope 过滤错误
+
+**症状：** `ValueError: At least one scope filter (user_id/agent_id/run_id) is required`
+
+**原因：** `require_scoped_filters=True`（默认），但 search/list 调用没有传 scope。
+
+**解决：**
+
+```python
+# 正确：传入 scope
+results = m.search("query", user_id="alice")
+
+# 或者关闭强制 scope（不推荐生产环境）
+config["vector_store"]["config"]["require_scoped_filters"] = False
+```
+
+### 9.5 分布式模式下 BM25 不可用
+
+分布式模式（`deployment_mode="distributed"`）不支持 BM25，这是已知限制。
+
+```python
+# 分布式模式下自动禁用 BM25
+config["vector_store"]["config"]["deployment_mode"] = "distributed"
+# bm25_mode 会自动设为 disabled，无需手动配置
+```
+
+### 9.6 内存不足（大规模数据）
+
+**症状：** 批量写入时 OOM 或超时
+
+**解决：**
+
+```python
+# 减小批量写入大小
+config["vector_store"]["config"]["batch_size"] = 50  # 默认 100
+
+# 增加连接池大小
+config["vector_store"]["config"]["maxconn"] = 20
+```
+
+### 9.7 中文搜索效果差
+
+**原因：** BM25 的 `text_lemmatized` 列使用 spaCy 英文模型处理，对中文效果有限。
+
+**建议：**
+
+- 对于中文场景，主要依赖语义搜索（向量召回）
+- 确保 embedding 模型支持中文（如 `text-embedding-3-small` 支持多语言）
+- 中英混合内容会同时走语义和 BM25 两路召回，融合后效果通常较好
