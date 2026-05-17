@@ -1,94 +1,260 @@
-# mem0 GaussDB 适配技术设计
+# mem0 GaussDB 适配技术设计文档
 
-> 更新时间: 2026-05-16  
-> 设计对象: `mem0.vector_stores.gaussdb.GaussDB`  
-> 对应代码: `mem0/mem0/vector_stores/gaussdb.py`
+> 更新时间: 2026-05-17  
+> 设计对象: `mem0.vector_stores.gaussdb.GaussDB`、`mem0.configs.vector_stores.gaussdb.GaussDBConfig`  
+> 对应代码:
+>
+> - `mem0/mem0/vector_stores/gaussdb.py`
+> - `mem0/mem0/configs/vector_stores/gaussdb.py`
 
-## 1. 设计原则
+---
 
-GaussDB provider 的设计遵循以下原则:
+## 1. 设计目标
 
-1. 以 mem0 现有 provider 契约为边界，不发明新的公共接口。
-2. 以商用正确性优先，不为了表面兼容而返回错误结果。
-3. 能力探测和降级必须可解释。
-4. 集中式优先保证完整体验，分布式优先保证兼容与可验证。
-5. 过滤语义和索引能力分离。
-6. 单实例绑定单 collection，不做隐式切表。
+本设计文档回答的是“GaussDB provider 现在到底是如何工作的”。
 
-## 2. 整体架构
+它覆盖以下内容:
+
+1. provider 在 mem0 中的角色边界
+2. 配置、连接、能力探测、建表、索引、CRUD、检索、过滤、降级、观测等完整逻辑
+3. 每一个关键适配点为什么这样设计
+4. 与其他 provider 相比，GaussDB 当前的主要差异和取舍是什么
+5. 哪些能力已经稳定，哪些是明确边界
+
+本文档不按提交逐条记录，而按当前真实代码结构做整体归纳。
+
+---
+
+## 2. 设计原则
+
+GaussDB provider 当前遵循以下原则:
+
+1. **公共契约优先**  
+   不改 mem0 现有 `VectorStoreBase` 契约，所有适配都在 provider 内完成。
+
+2. **正确性优先于表面兼容**  
+   对数据库不稳定支持或语义不明确的能力，宁可显式降级，也不返回看似兼容但实际错误的结果。
+
+3. **集中式优先做完整体验，分布式优先做边界清晰**  
+   集中式承载更完整的能力集合；分布式优先确保主链路成立和边界可验证。
+
+4. **过滤语义与索引能力分离**  
+   索引创建失败不应直接导致过滤语义消失，最多只影响性能。
+
+5. **单实例绑定单 collection**  
+   provider 实例一旦初始化，就绑定唯一 `collection_name`，不做隐式切表。
+
+6. **商用默认值优先**  
+   配置面尽量收敛，默认行为尽量安全、可解释、可交付。
+
+---
+
+## 3. 在 mem0 架构中的位置
+
+### 3.1 整体架构
 
 ```text
-Memory.from_config
-  -> VectorStoreFactory.create("gaussdb", config)
-  -> GaussDB.__init__
-     -> _create_connection_pool()
-     -> _probe_capabilities()
-     -> auto_create -> list_cols() / create_col()
-
-运行期主链路:
-  add    -> insert()
-  search -> search() + keyword_search()
-  batch  -> search_batch()
-  admin  -> col_info() / list_cols() / reset() / analyze()
++-------------------------------------------------------------------+
+|                         mem0 Memory Layer                         |
+|   Memory.add / search / update / delete / get_all / reset        |
++------------------------------+------------------------------------+
+                               |
+                               v
++-------------------------------------------------------------------+
+|                      VectorStoreFactory Layer                     |
+|       provider="gaussdb" -> GaussDBConfig -> GaussDB              |
++------------------------------+------------------------------------+
+                               |
+                               v
++-------------------------------------------------------------------+
+|                       GaussDB Provider Layer                      |
+| config | pool | capability probe | DDL | CRUD | search | filter  |
++------------------------------+------------------------------------+
+                               |
+                               v
++-------------------------------------------------------------------+
+|                            GaussDB DB                             |
+| FLOATVECTOR | GsDiskANN/GSIVFFlat | JSONB/TEXT | BM25 | Ustore    |
++-------------------------------------------------------------------+
 ```
 
-GaussDB provider 只负责向量存储与检索层，不负责:
+### 3.2 provider 的职责边界
 
-- LLM memory 提取
+GaussDB provider 负责:
+
+- 向量记录存取
+- metadata 过滤
+- 语义向量检索
+- 可选关键词检索
+- collection 生命周期管理
+- 模式探测与能力降级
+- 连接与执行可靠性
+
+GaussDB provider 不负责:
+
+- 记忆提取
 - embedding 生成
-- semantic/BM25/entity 融合排序
 - 上层鉴权
+- 跨 provider score 对齐
+- semantic/BM25/entity 的最终融合排序
 
-这些逻辑仍在 mem0 的 `Memory` 层完成。
+这些职责仍在 `Memory` 层或业务上层。
 
-## 3. 配置设计
+---
 
-### 3.1 当前真实配置项
+## 4. mem0 主链路走读
 
-当前 `GaussDBConfig` 只支持以下字段:
+### 4.1 初始化链路
+
+```text
+Memory.from_config(...)
+  -> VectorStoreFactory.create("gaussdb", config)
+  -> GaussDBConfig 校验
+  -> GaussDB(...)
+     -> 读取环境变量 / 参数
+     -> 校验 deployment / dims / index type / pool size
+     -> 创建连接池
+     -> probe 数据库能力
+     -> auto_create 时检测并创建 collection
+```
+
+### 4.2 写入链路
+
+```text
+Memory.add(...)
+  -> embedding 已由上层生成
+  -> vector_store.insert(vectors, payloads, ids)
+  -> GaussDB MERGE INTO 原子 upsert
+```
+
+### 4.3 检索链路
+
+```text
+Memory.search(...)
+  -> vector_store.search(...)
+  -> 如 provider 支持 keyword_search，则额外调用 keyword_search(...)
+  -> 上层 score_and_rank 进行融合排序
+```
+
+注意:
+
+- semantic search 永远是主链路
+- `keyword_search()` 是可选增强能力
+- provider 返回的 `score` 会继续被 mem0 上层消费
+
+### 4.4 更新与删除链路
+
+```text
+Memory.update(...) -> vector_store.update(id, ...)
+Memory.delete(...) -> vector_store.delete(id)
+Memory.get(...)    -> vector_store.get(id)
+Memory.get_all()   -> vector_store.list(...)
+```
+
+当前 `get/update/delete` 均按 `id` 直操作，不带 scope filter，这一点与多数现有 provider 保持一致。
+
+---
+
+## 5. 模块划分
+
+| 模块 | 位置 | 职责 |
+|---|---|---|
+| 配置模型 | `configs/vector_stores/gaussdb.py` | 参数校验、默认值、环境变量兼容 |
+| provider 主体 | `vector_stores/gaussdb.py` | 运行时逻辑总入口 |
+| 连接池管理 | `gaussdb.py` 内部 | 建立连接池、借还连接、事务/回滚 |
+| 能力探测 | `_probe_capabilities()` | 判断 JSONB / BM25 / 向量索引等能力 |
+| collection DDL | `create_col()` 等 | 建表、建索引、schema meta |
+| CRUD 模块 | `insert/get/update/delete/list` | 数据读写与管理 |
+| 搜索模块 | `search/keyword_search/search_batch` | 检索执行 |
+| 过滤模块 | `_build_where_clause()` 等 | filter 解析与 scope guard |
+| 可靠性模块 | `_run_with_retry()` 等 | 重试、延迟记录、慢查询告警 |
+
+---
+
+## 6. 配置系统设计
+
+### 6.1 正式公开的配置项
+
+当前 `GaussDBConfig` 暴露以下字段:
 
 | 分类 | 字段 |
 |---|---|
-| 连接 | `database`, `user`, `password`, `host`, `port`, `connection_string`, `sslmode`, `sslrootcert` |
+| 连接 | `database`, `host`, `port`, `user`, `password`, `connection_string`, `sslmode`, `sslrootcert` |
 | collection | `collection_name`, `embedding_model_dims` |
 | 连接池 | `minconn`, `maxconn` |
 | 部署 | `deployment_mode` |
-| 向量 | `vector_index_type`, `vector_metric` |
-| 运维 | `auto_create`, `require_scoped_filters` |
+| 向量索引 | `vector_index_type`, `vector_metric` |
+| 运行策略 | `auto_create`, `require_scoped_filters` |
 
-说明:
+### 6.2 基础项与高阶项
 
-- 默认 `minconn=1`, `maxconn=5`
-- 默认 `deployment_mode="centralized"`
-- 默认 `vector_index_type="gsdiskann"`
-- 默认 `vector_metric="cosine"`
-- 默认 `require_scoped_filters=True`
+#### 基础项
 
-建议对外按两层理解这些配置:
+建议接入时显式填写:
 
-- 基础项: 连接信息、`collection_name`、`embedding_model_dims`、`deployment_mode`
-- 高阶项: `sslmode`、`sslrootcert`、`minconn`、`maxconn`、`vector_index_type`、`vector_metric`、`auto_create`、`require_scoped_filters`
+- `connection_string` 或 `host/port/database/user/password`
+- `collection_name`
+- `embedding_model_dims`
+- `deployment_mode`
 
-这里的“基础项”当前是文档层约定，不是运行时强制必填。也就是说，代码仍然保留默认值，但商用接入建议显式填写这些关键字段，避免隐式落到默认 collection、默认维度或默认部署模式。
+这些字段决定了连接目标、业务表、向量维度和部署模式。
 
-### 3.2 为什么不暴露更多高阶配置
+#### 高阶项
 
-当前实现里，`payload_storage_mode`、`filter_storage_mode`、`bm25_enabled` 等行为参数仍然是 provider 内部默认值；`require_scoped_filters` 已作为高级安全配置正式暴露，默认保持开启。
+可以先吃默认值:
 
-原因:
+- `sslmode`
+- `sslrootcert`
+- `minconn`
+- `maxconn`
+- `vector_index_type`
+- `vector_metric`
+- `auto_create`
+- `require_scoped_filters`
 
-- P0 阶段优先保证接口简洁和默认行为稳定。
-- capability probe 已经承担了自动选择和自动降级责任。
-- 过早暴露底层旋钮，会让用户文档复杂度远大于收益。
-- `require_scoped_filters` 之所以例外开放，是因为它直接决定检索类接口是否强制作用域约束，属于商用安全策略，而不只是调优项。
+### 6.3 为什么目前不继续开放更多参数
 
-因此当前推荐策略是:
+当前 provider 内部仍有很多行为参数，例如:
 
-- 基础项在接入文档和样例中显式给出
-- 高阶项保留默认值，按需覆盖
-- 暂不继续开放 `payload_storage_mode`、`filter_storage_mode`、`bm25_enabled`、`retry_attempts` 等更底层旋钮
+- `payload_storage_mode`
+- `filter_storage_mode`
+- `bm25_enabled`
+- `retry_attempts`
+- `vector_index_maintenance_work_mem`
 
-### 3.3 环境变量解析
+这些参数暂不进一步开放，原因是:
+
+1. 过多底层旋钮会明显增加用户理解成本。
+2. 当前 capability probe 已承担自动选择和自动降级责任。
+3. 大多数参数属于 provider 内部实现细节，不是接入方第一优先级。
+4. 当前只有 `require_scoped_filters` 直接影响检索安全语义，因此被正式公开。
+
+### 6.4 配置校验逻辑
+
+当前配置层与运行时共同保证以下约束:
+
+1. 如未提供 `connection_string`，则:
+   - `user/password` 必须同时提供
+   - `host/port` 必须同时提供
+2. `deployment_mode` 仅允许:
+   - `centralized`
+   - `distributed`
+3. `vector_index_type` 仅允许:
+   - `gsdiskann`
+   - `gsivfflat`
+4. `vector_metric` 仅允许:
+   - `cosine`
+   - `l2`
+5. 维度限制:
+   - centralized: `<= 4096`
+   - distributed: `<= 1024`
+6. `embedding_model_dims > 1024` 时只允许 `gsdiskann`
+7. 连接池大小:
+   - `minconn >= 1`
+   - `maxconn >= 1`
+   - `maxconn >= minconn`
+
+### 6.5 环境变量兼容
 
 当前支持以下环境变量:
 
@@ -106,17 +272,725 @@ GaussDB provider 只负责向量存储与检索层，不负责:
 
 设计目的:
 
-- 对齐企业环境中“配置来自环境变量”的常见部署方式。
-- 允许连接信息与业务代码解耦。
+- 对齐企业部署常见的环境注入方式
+- 允许连接信息与业务代码解耦
 
-## 4. 连接池设计
+---
 
-### 4.1 当前实现
+## 7. 连接与事务设计
 
-GaussDB 使用 `psycopg2.pool.ThreadedConnectionPool`:
+### 7.1 连接池设计
+
+当前使用 `psycopg2.pool.ThreadedConnectionPool`，默认:
 
 - `minconn=1`
 - `maxconn=5`
+
+设计原因:
+
+1. 与 mem0 现有 SQL 类 provider 的默认规模接近。
+2. 对 SDK 默认值而言足够保守。
+3. 支持多线程应用场景。
+
+### 7.2 为什么选择 psycopg2 兼容方式
+
+GaussDB 官方 Python 驱动示例以 psycopg2 兼容接口为基础，当前 provider 也沿用该方向。  
+这意味着实现优先考虑:
+
+- 官方驱动兼容性
+- 事务控制的可预期性
+- 与 PostgreSQL 风格 SQL/连接 API 的相似性
+
+### 7.3 `_get_cursor()` 的职责
+
+`_get_cursor(commit=False)` 负责:
+
+- 从连接池取连接
+- 设置客户端编码为 `UTF8`
+- 提供游标
+- 正常结束时根据 `commit` 控制提交
+- 失败时回滚
+- 关闭游标
+- 归还连接
+
+这里的 UTF8 强制非常关键。  
+GaussDB 适配里显式设置 `client_encoding="UTF8"`，是为了避免某些非 UTF8 会话或环境下，payload / 文本字段行为不稳定。
+
+### 7.4 为什么 `analyze()` 单独走 autocommit
+
+在分布式场景中，`ANALYZE` 不能在 transaction block 内执行。  
+因此当前实现没有复用 `_get_cursor(commit=True)`，而是:
+
+1. 单独从连接池取连接
+2. 暂时设置 `autocommit=True`
+3. 执行 `ANALYZE`
+4. 恢复原 autocommit 状态
+5. 归还连接
+
+这个设计同时适用于 centralized 和 distributed，避免再维护双路径。
+
+---
+
+## 8. 能力探测与降级设计
+
+### 8.1 为什么需要 capability probe
+
+GaussDB 在不同版本、不同模式、不同部署环境下，向量、JSONB、BM25、表达式索引等能力组合不一定完全一致。  
+如果只根据配置或版本字符串假设能力存在，风险很高。
+
+因此当前 provider 采用“真实建表 / 建索引 / 执行 SQL”的 probe 模式。
+
+### 8.2 探测内容
+
+`_probe_capabilities()` 主要探测:
+
+- `FLOATVECTOR`
+- 向量索引
+- BM25
+- JSONB
+- expression index
+- UUID
+
+并将结果收敛到 `CapabilityReport`。
+
+### 8.3 降级策略
+
+#### JSONB 失败
+
+若 JSONB 本身不可用，则:
+
+- `payload_storage_mode` 从 `jsonb` 降级为 `text`
+- `filter_storage_mode` 从 `json_expression` 降级为 `redundant_columns`
+- `metadata_column_mode` 同步调整
+
+这时普通 metadata filter 能力会明显收缩，只保证 scope 相关冗余列过滤。
+
+#### BM25 失败
+
+若 BM25 probe 失败，则:
+
+- 仅关闭 `bm25_enabled`
+- semantic search 继续可用
+
+#### expression index 失败
+
+若 JSONB 可用，但 expression index 建不起来，则:
+
+- 保持 `filter_storage_mode="json_expression"`
+- 普通 metadata filter 仍继续使用 `payload->>'key'`
+- 仅记录 warning，表示缺少索引加速
+
+这是当前设计的关键改动之一。  
+它把“索引建不起来”与“不能按 metadata 过滤”这两件事彻底拆开了。
+
+### 8.4 与其他 provider 的对齐逻辑
+
+这一策略更接近:
+
+- pgvector
+- Azure MySQL
+- MongoDB
+- Qdrant
+
+这些 provider 通常不会因为某个优化索引不可用，就直接把过滤语义缩成只剩 scope 字段。
+
+---
+
+## 9. 数据模型设计
+
+### 9.1 主表模型
+
+当前 collection 主表至少包含:
+
+| 字段 | 含义 |
+|---|---|
+| `id` | 主键，当前为 UUID |
+| `vector` | 向量列 |
+| `payload` | metadata，默认 JSONB |
+| `memory` | 原始记忆文本 |
+| `text_lemmatized` | 关键词检索使用的衍生文本 |
+| `created_at` | 创建时间 |
+| `updated_at` | 更新时间 |
+| `schema_version` | schema 版本 |
+
+当 `filter_storage_mode="redundant_columns"` 时，还会显式落下:
+
+- `user_id`
+- `agent_id`
+- `run_id`
+
+### 9.2 schema meta 表
+
+除主表外，还维护单独的 `<collection>_schema_meta` 表，用于记录:
+
+- collection 名称
+- schema 版本
+- 更新时间
+- 当前模式元信息
+
+设计目的:
+
+1. 为后续 schema 演进保留锚点
+2. 让 provider 能在 collection 生命周期中做版本识别
+3. 避免把模式状态散落在代码假设里
+
+### 9.3 schema 固定为 `public`
+
+当前 provider 将 `schema` 固定为 `public`，并统一做显式 schema qualification。
+
+这样做的原因:
+
+- 避免不同 session search_path 带来的漂移
+- 保证表名、索引名、meta 表名可预测
+- 降低 DDL 兼容风险
+
+### 9.4 Ustore 与分布式策略
+
+当前主表采用:
+
+- `WITH (storage_type=ustore)`
+
+分布式模式下采用:
+
+- `DISTRIBUTE BY HASH(id)`
+
+这两者一起构成了当前 GaussDB provider 的基础物理模型。
+
+---
+
+## 10. collection 生命周期设计
+
+### 10.1 单实例单 collection
+
+当前设计已明确收敛为:
+
+- 一个 provider 实例
+- 绑定一个 `collection_name`
+- 对应一张主表和一张 schema meta 表
+
+`create_col()` 已不再接受 `name` 参数。  
+这避免了此前“临时建了一张别的表，但实例状态仍指向旧 collection”的半支持问题。
+
+### 10.2 `create_col()` 行为
+
+`create_col(*, vector_size=None, distance=None)` 负责:
+
+1. 创建主表
+2. 创建 schema meta 表
+3. 回写 schema meta
+4. 创建向量索引
+5. 如 BM25 可用则创建 BM25 索引
+6. 创建 scope 相关过滤索引
+
+### 10.3 索引创建的 savepoint 设计
+
+向量索引是主能力的一部分，失败通常应被视为严重错误。  
+但 BM25 和 scope 表达式索引属于增强或加速能力，因此当前设计对这类索引采用 savepoint 包装:
+
+1. 创建 savepoint
+2. 尝试创建索引
+3. 失败则 rollback to savepoint
+4. 打 warning
+5. collection 创建继续完成
+
+这样可以避免“可选索引失败导致 collection 整体创建失败”。
+
+### 10.4 其他生命周期接口
+
+provider 当前还实现:
+
+- `list_cols()`
+- `col_info()`
+- `delete_col()`
+- `reset()`
+
+其中 `reset()` 会删除并重建当前 collection，适合测试与重置场景。
+
+---
+
+## 11. 向量索引与高维策略
+
+### 11.1 支持的索引类型
+
+当前公开支持:
+
+- `gsdiskann`
+- `gsivfflat`
+
+### 11.2 为什么 >1024 维只允许 `gsdiskann`
+
+这是当前配置和运行时共同 enforced 的约束。  
+原因很直接:
+
+- distributed 模式上限本身是 1024
+- centralized 模式要支持更高维时，当前只保留 `gsdiskann` 这条能力路径
+
+这不是随意限制，而是当前数据库能力和适配安全边界共同决定的。
+
+### 11.3 `maintenance_work_mem` 设计
+
+当前 `_set_vector_index_maintenance_work_mem()` 的策略是:
+
+1. 默认目标值为 `128MB`
+2. 若为高维 `gsdiskann` 且仍是默认值，则目标值提升为 `2GB`
+3. 先 `SHOW maintenance_work_mem`
+4. 仅当当前值小于目标值时，才 `SET LOCAL maintenance_work_mem`
+5. 若数据库或 DBA 已配置更高值，则不覆盖
+
+这样做的目的是:
+
+- 保底抬升高维索引构建资源
+- 又不压低客户已调优过的更大内存配置
+
+---
+
+## 12. 写入设计
+
+### 12.1 为什么使用 `MERGE INTO`
+
+当前 `insert()` 使用批量 `MERGE INTO` 做原子 upsert，而不是:
+
+- 先 `UPDATE`
+- 再 `INSERT`
+
+原因:
+
+1. 避免并发条件下出现更新/插入竞态
+2. 保证同一 `id` 的幂等写入语义
+3. 更适合商用批量写入路径
+
+### 12.2 payload 与文本处理
+
+当前写入时会统一处理:
+
+- `payload`
+- `memory`
+- `text_lemmatized`
+
+设计考虑:
+
+- payload 以 JSON 语义承载 metadata
+- `memory` 保留原始业务文本
+- `text_lemmatized` 供关键词检索使用
+
+### 12.3 默认值处理
+
+当前只有在以下情况下才自动补默认值:
+
+- `ids is None`
+- `payloads is None`
+
+如果传的是空列表，则不会被当成“没传”，而是走长度校验。  
+这样避免了调用方误把空输入当成可静默接受的情况。
+
+---
+
+## 13. 检索设计
+
+### 13.1 semantic search
+
+当前 `search()` 的核心逻辑:
+
+1. 根据 `vector_metric` 选择距离操作符
+2. 拼接过滤条件
+3. 执行 top-k SQL
+4. 按距离升序返回
+5. 将 distance 映射为 provider-normalized score
+
+当前支持:
+
+- `cosine`
+- `l2`
+
+### 13.2 为什么返回 normalized score
+
+GaussDB 当前 score 计算为:
+
+```python
+score = 1 / (1 + max(distance, 0))
+```
+
+设计原因不是模仿某一个其他 provider，而是为了:
+
+1. 保持分数为正向值，越大越相关
+2. 让 score 稳定落在 `(0, 1]`
+3. 更贴近 mem0 上层 `threshold` 与融合排序的消费方式
+
+这意味着:
+
+- GaussDB score 不是 raw distance
+- 也不是严格数学意义上的原生相似度
+- 它是 provider-normalized semantic score
+
+### 13.3 与其他 provider 的差异
+
+其他 provider 中常见三种做法:
+
+1. 直接返回 raw distance
+2. 直接返回后端 `_score`
+3. 返回后端 SDK 原生相似度
+
+GaussDB 当前属于第四种:
+
+- provider 自己做了一层统一正向分数映射
+
+因此文档必须明确:
+
+> GaussDB 的 score 不能与其他 provider 的 score 直接横向比较，也不应把多个 provider 的 score 混在一起统一排序。
+
+### 13.4 batch search
+
+`search_batch()` 优先尝试 native SQL 批量查询。  
+若失败，则:
+
+- 打 warning
+- 回退到顺序调用 `search()`
+
+这样做的原因是:
+
+1. 给支持 native batch 的场景更好的性能
+2. 让单条 `search()` 逻辑继续作为兜底主链路
+
+---
+
+## 14. 关键词检索设计
+
+### 14.1 当前定义
+
+GaussDB provider 当前将 `keyword_search()` 明确定义为:
+
+- 基于 BM25 的可选能力
+
+它不是一个“任意文本匹配接口”，而是一条 BM25 检索路径。
+
+### 14.2 centralized 与 distributed 的差异
+
+#### centralized
+
+- probe 成功则开启 BM25
+- `keyword_search()` 可用
+
+#### distributed
+
+- 当前明确关闭 BM25
+- `keyword_search()` 返回 `None`
+
+这是正式能力边界，而不是异常情况。
+
+### 14.3 为什么不强行补其他 fallback
+
+理论上可以给 `keyword_search()` 增加:
+
+- `LIKE/ILIKE`
+- 其他全文检索
+- 自定义文本匹配 SQL
+
+但当前设计没有这样做，原因是:
+
+1. 会显著增加能力分支和解释成本
+2. 相关性不一定能与 BM25 对齐
+3. 现有 mem0 生态本来也允许 provider 完全不支持 `keyword_search()`
+
+因此当前策略是:
+
+- 有 BM25 就支持关键词检索
+- 没有 BM25 就显式返回 `None`
+
+---
+
+## 15. 过滤系统设计
+
+### 15.1 当前正式支持的操作符
+
+字段比较:
+
+- 隐式等值
+- `eq`
+- `ne`
+- `in`
+- `nin`
+- `contains`
+- `icontains`
+
+逻辑操作:
+
+- `$and` / `AND`
+- `$or` / `OR`
+- `$not` / `NOT`
+
+### 15.2 scope guard
+
+当前 provider 默认 `require_scoped_filters=True`。  
+这意味着以下读路径都要求 filters 中至少有一个正向 scope 条件:
+
+- `search`
+- `keyword_search`
+- `search_batch`
+- `list`
+
+scope key 当前固定为:
+
+- `user_id`
+- `agent_id`
+- `run_id`
+
+### 15.3 为什么这样设计
+
+大多数其他 provider 只是“支持这些字段过滤”，但不强制调用方带它们。  
+GaussDB 当前更进一步，是因为它的目标不是只做通用向量库，而是希望在商用多租户场景下提供更安全的默认行为。
+
+### 15.4 防绕过逻辑
+
+当前 `_has_scope_filter()` 不会把以下情况认定为有效 scope:
+
+- 只有 `ne`
+- 只有 `nin`
+- 只在 `NOT` 分支出现
+- 通过宽松 `OR` 试图绕过约束
+
+这样可避免“形式上出现了 scope 字段，实际上却没有真正收敛查询范围”的情况。
+
+### 15.5 范围操作符为什么不支持
+
+当前 `gt/gte/lt/lte` 不作为 typed range 支持，原因是:
+
+- 当前 SQL 路径主要基于 `payload->>'key'`
+- 该表达式会把 JSONB 中的值取成文本
+- 若直接做字符串大小比较，会产生商用错误结果
+
+典型问题就是:
+
+- `10` 与 `2` 的字符串比较不等于数值比较
+
+因此当前策略是:
+
+1. 明确打 warning
+2. 不生成假 range SQL
+3. 退回字面值 dict 等值处理
+
+这是一个“宁可不支持，也不返回错结果”的设计决策。
+
+### 15.6 与其他 provider 的对比
+
+- SQL/JSON 类 provider 往往也没有强类型 range schema
+- Qdrant 这类原生 typed payload provider 可以支持 range
+- 其他多数 provider 即使不支持，也未必显式报错
+
+GaussDB 当前选择的是更可解释的路径:
+
+- 明确边界
+- 不误导用户
+
+---
+
+## 16. 读取、更新、删除设计
+
+### 16.1 当前语义
+
+`get/update/delete` 当前都按 `id` 直操作，不附带 scope filter。
+
+这并不是 GaussDB 的特例，而是与当前多数 provider 一致，也与 `VectorStoreBase` 的公共签名一致。
+
+### 16.2 为什么当前不内建 scope 版 `get/update/delete`
+
+因为公共契约只提供:
+
+- `id`
+
+没有提供:
+
+- `id + filters`
+- `id + scope`
+
+如果 provider 私自追加 scope 参数，会直接破坏现有工厂和上层调用方式。
+
+### 16.3 这意味着什么
+
+这意味着:
+
+- 检索类接口可以由 provider 做默认作用域兜底
+- 管理类 `id` 直达接口仍需依赖上层鉴权
+
+因此要清楚区分:
+
+1. provider 能做的默认安全防护
+2. 业务 API 仍需承担的鉴权职责
+
+---
+
+## 17. 运维、可靠性与观测设计
+
+### 17.1 重试机制
+
+当前 `_run_with_retry()` 会对部分瞬态错误做有限重试。  
+识别的错误片段包括:
+
+- `connection`
+- `timeout`
+- `deadlock`
+- `lock wait`
+- `could not serialize`
+- `serialization failure`
+- `server closed`
+- `terminating connection`
+
+默认:
+
+- `retry_attempts = 2`
+- `retry_backoff_seconds = 0.1`
+
+### 17.2 为什么不把重试暴露成更大配置面
+
+目前它更偏 provider 内部容错策略，不是接入层一开始就必须调的参数。  
+因此先保留内部默认值，避免配置面进一步膨胀。
+
+### 17.3 观测与慢查询
+
+当前 provider 内部维护:
+
+- 简单 metrics 计数
+- latency 记录
+- 慢查询 warning
+
+默认慢查询阈值为:
+
+- `slow_query_ms = 1000`
+
+这套机制的目标不是替代完整 APM，而是帮助定位:
+
+- 哪条 SQL 在拖慢响应
+- 哪类能力在频繁降级或重试
+
+---
+
+## 18. centralized 与 distributed 的差异设计
+
+### 18.1 centralized
+
+当前集中式设计目标是“完整体验优先”，因此:
+
+- 维度上限更高
+- 支持 BM25
+- 支持更完整的向量索引路径
+- 商用主体验证优先围绕 centralized 展开
+
+### 18.2 distributed
+
+当前分布式设计目标是“主链路成立 + 边界清晰”，因此:
+
+- 维度上限收缩到 1024
+- 关闭 BM25
+- `keyword_search()` 不提供
+- `analyze()` 使用 autocommit 以兼容分布式限制
+
+### 18.3 为什么分布式不强补 BM25
+
+因为当前没有稳定、可验证、可解释的实现基础。  
+在这种情况下，明确“不支持”比做一个弱替代实现更稳。
+
+---
+
+## 19. 测试与验证设计
+
+### 19.1 测试分层
+
+当前测试体系分为四层:
+
+| 测试文件 | 角色 |
+|---|---|
+| `test_gaussdb.py` | 轻量单测/契约测试 |
+| `test_gaussdb_commercial_validation.py` | 商用出口门禁 |
+| `test_gaussdb_centralized.py` | centralized live 深度回归 |
+| `test_gaussdb_distributed.py` | distributed live 回归，已分 smoke/full |
+
+### 19.2 为什么要拆 smoke/full
+
+尤其是 distributed 场景，DDL 和索引创建成本很高。  
+若所有 live 用例都作为默认门禁执行，成本过大、抖动也更明显。
+
+因此当前设计是:
+
+- 默认分布式跑 smoke/主链路
+- 更重的 full regression 通过环境变量显式开启
+
+### 19.3 测试命名与边界一致性
+
+本轮测试重构中特别做了两件事:
+
+1. live 默认索引路径改回 `gsdiskann`，对齐 provider 真默认值
+2. `gt/gte/lt/lte` 用例改名为 unsupported-range 语义，避免测试名继续暗示“我们支持 typed range”
+
+---
+
+## 20. 当前设计的主要差异化与 trade-off
+
+### 20.1 相比其他 provider 更严格的地方
+
+1. 默认 scope guard
+2. 显式 UTF8 客户端编码
+3. expression index 与 metadata filter 语义解耦
+4. 范围过滤宁可不支持也不假支持
+
+### 20.2 相比其他 provider 不完全一致的地方
+
+1. score 做了 provider-normalized 映射
+2. centralized 支持 BM25，distributed 显式不支持
+3. 默认行为比很多 provider 更保守
+
+### 20.3 为什么这些差异是合理的
+
+因为当前目标不是把 GaussDB 做成“看起来和别的 provider 一样”，而是:
+
+- 在 mem0 公共契约内稳定工作
+- 商用默认行为更安全
+- 明确告诉用户什么支持、什么不支持
+
+---
+
+## 21. 当前已知边界
+
+当前设计文档必须明确以下边界:
+
+1. `gt/gte/lt/lte` 不支持 typed range
+2. distributed 不支持 BM25 / `keyword_search()`
+3. `get/update/delete` 不带 scope guard
+4. score 不可跨 provider 横向比较
+5. scope guard 关闭后会更像多数其他 provider，但安全性下降
+
+这些边界并不意味着 provider 不可用，而是意味着当前交付时必须把承诺说清楚。
+
+---
+
+## 22. 未来扩展点
+
+如果后续继续增强，最合理的扩展点依次是:
+
+1. typed metadata schema 与 typed range filter
+2. 更细粒度的企业级 scope key 扩展
+3. 更强的关键词检索策略选择
+4. 更统一的 provider score 语义抽象
+5. 更丰富的运行时观测和性能指标输出
+
+这些都应建立在当前主链路稳定的基础上推进，而不是推倒重来。
+
+---
+
+## 23. 总结
+
+当前 GaussDB provider 的设计已经形成一个比较完整的闭环:
+
+- 配置层有明确边界
+- 连接与事务层可控
+- capability probe 可解释
+- collection/索引模型稳定
+- CRUD 与检索主链路齐全
+- 作用域过滤具备商用安全默认值
+- 集中式/分布式差异清晰
+- 测试与文档已开始按商用出口组织
+
+一句话概括当前设计取向:
+
+> GaussDB provider 不是为了做“功能看起来很多”的适配，而是为了在 mem0 当前契约下，提供一套默认更安全、边界更清楚、出错更可解释的商用级实现。
 
 设计考虑:
 
