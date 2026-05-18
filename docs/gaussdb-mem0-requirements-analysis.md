@@ -119,6 +119,8 @@ GaussDB provider 首先要解决的是“可部署、可稳定连接”的问题
 - 支持 SSL 连接参数透传
 - 支持连接池，而不是单连接串行运行
 - 明确客户端编码，避免非 UTF8 会话导致 payload/文本行为异常
+- 明确 UTF8 数据库是推荐与支持前提；如果数据库本身不是 UTF8，需要有风险提示
+- 支持默认使用 `public` schema，同时为客户保留可选的 schema 高级配置出口
 
 这部分看起来基础，但商用项目里最容易先踩的就是这里。
 
@@ -217,7 +219,6 @@ mem0 现有 provider 并没有形成一个“所有行为完全一致”的强�
 - 默认开启 scope guard
 - 不把 `gt/gte/lt/lte` 当真 range
 - `keyword_search()` 与 BM25 能力绑定
-- 返回 provider-normalized positive score
 
 这些差异不是随意为之，而是围绕“避免错误结果”和“更贴近 mem0 上层使用方式”做出的取舍。
 
@@ -254,7 +255,7 @@ P1 不是“没有就不能用”，但会明显影响商用体验。
 | 表达式索引失败不误伤 metadata 过滤语义 | 已满足 |
 | 原子 upsert | 已满足 |
 | 高维向量支持 | centralized 支持到 4096，distributed 到 1024 |
-| autocommit analyze | 已满足 |
+| autocommit analyze（辅助维护接口） | 已满足 |
 | 配置基础项/高阶项收口 | 已满足 |
 
 ### 6.3 当前明确不做的需求
@@ -328,10 +329,10 @@ GaussDB 当前实现最有特点的一点，是把“支持过滤”和“默认
 当前 semantic search 的核心满足了 mem0 的三个要求:
 
 1. 能按向量距离召回
-2. 能返回正向可排序的 score
+2. 能返回稳定可排序的 score
 3. 能接受过滤条件
 
-当前 score 使用 provider-normalized 逻辑，是为了更贴近 mem0 上层 threshold 和融合排序使用方式，而不是为了与 pgvector 的 raw distance 保持表面一致。
+当前 score 直接返回原始距离值，与现有 SQL provider 风格保持一致；这并不改变“不同 provider 的 score 仍不可横向比较”这一事实。
 
 ### 7.6 关键词检索
 
@@ -478,3 +479,52 @@ GaussDB 适配要支撑商用，就不能只靠 unit test，也不能只靠一�
 更准确地说:
 
 > 当前 GaussDB provider 已满足 mem0 的核心适配需求，集中式已具备较完整的商用主链路能力，分布式已具备基础主链路与清晰边界；后续优化重点应放在能力增强，而不是纠结主链路是否成立。
+
+---
+
+## 13. 2026-05-18 Typed Filter 重构补充需求结论
+
+> 本节用于补充本文档早期结论中已经被 typed-filter 重构更新的部分。若本文档其他章节与本节冲突，以本节为准。
+
+### 13.1 需求方向已从“文本比较”升级为“typed-filter”
+
+当前 GaussDB 的 metadata 过滤需求不再停留在：
+
+- `payload->>'key'` 文本抽取
+- `str(value)` 文本比较
+
+而是明确升级为：
+
+- scope 字段正式列化
+- JSONB typed exact
+- 文本 operator 分流
+- 声明类型字段的 typed range
+
+### 13.2 当前正式满足的新增需求
+
+当前已经满足以下新增或更新后的需求：
+
+1. `eq / ne / in / nin` 对 `string / number / bool / null` 的 typed exact 语义
+2. `wildcard` 不再按普通字符串 `'*'` 处理
+3. `null` 与 `missing` 行为分离
+4. provider 级 `exists / missing` 过滤能力
+5. `metadata_schema` 高级配置项
+6. `number / datetime` 声明字段的 typed range
+
+### 13.3 当前仍然明确保留的边界
+
+当前仍然保留以下边界：
+
+1. 未声明类型字段的 range 不做 typed 推断，会记录 warning 并回落到兼容匹配
+2. 已声明类型字段中的坏历史数据行在 range 查询中会被忽略，不会让整次查询报错
+3. `get / update / delete` 仍然按 `id` 工作，不自带 scope guard
+4. 分布式仍默认不支持 BM25 / `keyword_search`
+5. wildcard 在 `Memory` 公共契约层与跨 provider 层面仍存在差异，GaussDB 只承诺本 provider 的现行语义
+
+### 13.4 需求层最终判断
+
+经过本轮重构后，GaussDB 对 mem0 的适配重点已经从“主链路能跑”前进到“metadata/filter 语义站得住”。
+
+因此当前更准确的结论是：
+
+> GaussDB 现在不仅具备 mem0 的核心主链路能力，而且已经建立起一套更接近正式商用 provider 的 typed-filter 语义基础；后续演进重点应放在声明策略、分布式补齐和上层文档契约统一，而不是回到旧的文本比较模型。

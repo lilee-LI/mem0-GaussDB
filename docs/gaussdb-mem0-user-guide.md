@@ -21,9 +21,10 @@
 1. 推荐优先使用 GaussDB 集中式模式。
 2. 数据库建议使用 UTF-8。
 3. `collection_name` 对应一张主表，不支持在同一个 provider 实例里动态切别的表。
-4. 查询时必须带 `user_id`、`agent_id`、`run_id` 中至少一个正向 filter。
-5. 当前不支持真正的 `gt/gte/lt/lte` range 过滤。
-6. 集中式支持 BM25，分布式默认不支持。
+4. `schema` 可以作为高级配置项指定，默认使用 `public`。
+5. 查询时必须带 `user_id`、`agent_id`、`run_id` 中至少一个正向 filter。
+6. `gt/gte/lt/lte` 对声明为 `number/datetime` 的字段执行真正 typed range；未声明字段走 warning + 兼容匹配。
+7. 集中式支持 BM25，分布式默认不支持。
 
 ## 3. 环境准备
 
@@ -67,6 +68,12 @@ pip install -e ".[vector_stores,llms,nlp]"
 
 > 优先建议客户使用 UTF-8 数据库。
 
+更准确地说:
+
+> GaussDB provider 对 mem0 的推荐与支持前提是 UTF-8 数据库，并且当前实现会显式设置 `client_encoding=UTF8`。
+
+如果数据库本身不是 UTF-8，provider 仍然会尝试连接，但会记录 warning；这类环境下文本、JSON、metadata filter 与关键词检索行为可能不稳定，因此不建议作为正式商用部署方式。
+
 ## 4. 支持矩阵
 
 ### 4.1 集中式
@@ -94,7 +101,7 @@ pip install -e ".[vector_stores,llms,nlp]"
 | metadata filter | 支持 |
 | BM25 keyword_search | 默认不支持 |
 | 最大维度 | 1024 |
-| analyze | 已走 autocommit |
+| analyze | 辅助维护接口，已走 autocommit |
 
 ## 5. 基本配置
 
@@ -217,6 +224,72 @@ config = {
 - `auto_create`
 - `require_scoped_filters`
 
+#### `require_scoped_filters` 的实用理解
+
+把它理解成一句话就够了:
+
+> 查询时，是否必须明确说明“要查谁的范围”。
+
+当前 scope 字段是:
+
+- `user_id`
+- `agent_id`
+- `run_id`
+
+当 `require_scoped_filters=True` 时，以下读路径都要求至少带一个**真正收紧范围**的 scope 条件:
+
+- `search`
+- `keyword_search`
+- `search_batch`
+- `list`
+
+推荐的正向 scope 写法:
+
+```python
+{"user_id": "u1"}
+{"user_id": {"eq": "u1"}}
+{"user_id": {"in": ["u1", "u2"]}}
+{"$and": [{"user_id": "u1"}, {"category": "travel"}]}
+{"$or": [{"user_id": "u1"}, {"user_id": "u2"}]}
+```
+
+不算有效正向 scope 的常见写法:
+
+```python
+{"user_id": {"ne": "u1"}}
+{"user_id": {"nin": ["u1"]}}
+{"$not": [{"user_id": "u1"}]}
+{"$or": [{"user_id": "u1"}, {"category": "public"}]}
+{"user_id": "*"}
+{"user_id": {"exists": True}}
+{"user_id": {"missing": True}}
+```
+
+原因很简单:
+
+- 这些写法虽然“看起来用了 scope 字段”
+- 但并没有真正把查询范围收紧到某个 user / agent / run
+
+什么时候建议保持开启:
+
+- 多租户生产环境
+- 面向真实用户的在线服务
+- 不希望出现全表无约束搜索的场景
+
+什么时候可以考虑关闭:
+
+- 单租户调试
+- 离线排障
+- 数据修复
+- 需要做无 scope 的管理类检索
+
+关闭后会发生什么:
+
+- 不再强制必须带 `user_id / agent_id / run_id`
+- 可以只按普通 metadata 检索
+- 行为会更像很多其他 provider 的默认模式
+- 但租户隔离约束也随之放松
+
 最小可用示例:
 
 ```python
@@ -262,6 +335,8 @@ config = {
 ### 6.2 collection_name 是什么
 
 `collection_name` 对应的就是主表名，不是 schema 名。
+
+如果你不额外配置 `schema`，当前默认使用 `public`；如果客户有命名空间隔离要求，可以通过高级配置显式指定 schema。
 
 例如:
 
@@ -440,12 +515,12 @@ payload->>'priority'
 
 ### 9.1 GaussDB 返回的 score 是什么
 
-GaussDB 当前返回的 semantic `score` 不是原始距离，而是 provider 内部归一化后的正向分数。
+GaussDB 当前返回的 semantic `score` 就是数据库返回的原始距离值。
 
 它的目标是:
 
-- 更适配 mem0 上层 `threshold`
-- 更适配 semantic + BM25 + entity boost 的融合排序
+- 与现有 SQL provider 的 score 风格保持一致
+- 避免引入仅 GaussDB 独有的分数语义
 - 让分数语义更接近“越大越相关”
 
 ### 9.2 能不能和其他数据库直接比 score
@@ -454,7 +529,7 @@ GaussDB 当前返回的 semantic `score` 不是原始距离，而是 provider �
 
 原因是 mem0 当前不同 provider 的 `score` 语义并不统一:
 
-- GaussDB: 归一化后的正向分数，越大越好
+- GaussDB: raw distance，越小越好
 - pgvector: raw distance，越小越好
 - Azure MySQL: raw distance，越小越好
 - MongoDB / OpenSearch / Elasticsearch / Qdrant: 后端原生 score，通常越大越好，但范围不统一
@@ -604,24 +679,56 @@ pytest mem0/tests/vector_stores/test_gaussdb_commercial_validation.py -q
 
 因为 provider 默认开启 scope guard，防止全表无约束搜索带来租户泄漏风险。
 
-### 15.2 为什么 `gt/gte/lt/lte` 没生效
+更直白地说:
 
-因为当前没有实现 typed range。  
-这是已知边界，不是偶发 bug。
+- 开着 `require_scoped_filters=True` 时，查询必须明确限制在某个 user / agent / run 范围内
+- 关掉后就可以做更宽松的查询，但也更像普通向量库，安全性下降
 
-### 15.3 为什么 `keyword_search()` 返回 `None`
+### 15.2 `require_scoped_filters` 什么时候该关
+
+建议这样理解:
+
+- **生产多租户环境**: 不要关
+- **单租户调试 / 离线排障 / 数据修复**: 可以考虑关
+
+如果关闭:
+
+- `search`
+- `keyword_search`
+- `search_batch`
+- `list`
+
+都不再强制要求正向 scope。
+
+### 15.3 为什么 `gt/gte/lt/lte` 看起来没生效
+
+当前不是“完全不支持”，而是分两种情况:
+
+- 已声明为 `number` / `datetime` 的字段: 执行真正 typed range
+- 未声明字段: 记录 warning，并按兼容匹配处理，通常不会命中结果
+
+### 15.4 为什么 `keyword_search()` 返回 `None`
 
 通常说明:
 
 - 当前是分布式模式
 - 或者集中式环境里 BM25 probe / BM25 index 创建失败，已自动关闭
 
-### 15.4 为什么 `analyze` 以前报 transaction block
+### 15.5 为什么 `analyze` 以前报 transaction block
 
 这是因为某些 GaussDB 模式下 `ANALYZE` 不能在事务块里执行。  
 当前实现已经改成 autocommit 路径。
 
-### 15.5 为什么推荐 UTF-8
+更实际的使用建议是:
+
+- 把 `analyze()` 当成**辅助维护接口**
+- 它不是 mem0 的核心业务能力
+- 非必要场景下不一定要调用
+- 更适合建表后、批量导入后、离峰维护或人工排障时使用
+
+不建议把它放进高频业务请求链路。
+
+### 15.6 为什么推荐 UTF-8
 
 因为这能显著减少中文和多语言 payload 的编码风险，也是当前商用最稳妥配置。
 
@@ -640,7 +747,7 @@ pytest mem0/tests/vector_stores/test_gaussdb_commercial_validation.py -q
 - 向量能力是否启用
 - JSONB 是否可用
 - BM25 是否被自动关闭
-- 是否误用了 range operator
+- `metadata_schema` 是否已正确声明 range 字段
 - 数据库编码是否为 UTF-8
 
 ## 17. 上线建议
@@ -651,11 +758,11 @@ pytest mem0/tests/vector_stores/test_gaussdb_commercial_validation.py -q
 2. 跑一次真实集中式环境的 live tests
 3. 验证中文与多语言样例
 4. 验证 scope 隔离
-5. 验证你的业务是否依赖 range filter；如果依赖，当前不要直接上线
+5. 验证你的业务是否依赖 typed range；如果依赖，确认 `metadata_schema` 已正确声明字段
 
 ## 18. 当前已知限制汇总
 
-- 当前不支持 typed range
+- `gt/gte/lt/lte` 仅对声明为 `number/datetime` 的字段执行真正 typed range；未声明字段走 warning + 兼容匹配
 - `get/update/delete` 不带 scope guard
 - 分布式默认不支持 BM25
 - `create_col` 不支持动态创建其他 collection
@@ -671,3 +778,164 @@ pytest mem0/tests/vector_stores/test_gaussdb_commercial_validation.py -q
 - 用 commercial validation suite 作为交付门禁
 
 这套用法和当前实现是最贴合、也最稳的。
+
+---
+
+## 20. 2026-05-18 Typed Filter 新用法
+
+> 本节用于覆盖本文档前文中仍基于旧版 filter 设计的说明。若前文与本节冲突，以本节为准。
+
+### 20.1 新增高级配置：`metadata_schema`
+
+当前如果你想使用 typed range，或者希望 provider 对 metadata 类型有显式声明，应配置：
+
+```python
+{
+    "metadata_schema": {
+        "priority": "number",
+        "score": "number",
+        "created_at": "datetime",
+        "flag": "bool",
+        "category": "string"
+    }
+}
+```
+
+当前允许的类型值包括：
+
+- `string`
+- `text`
+- `number`
+- `bool`
+- `datetime`
+
+其中：
+
+- `number` / `datetime` 会影响 range 能力
+- `bool` / `string` / `text` 主要用于语义声明和后续扩展
+
+### 20.2 当前 exact filter 的推荐理解
+
+当前 `eq / ne / in / nin` 已按 typed exact 处理，适用于：
+
+- 字符串
+- 数字
+- 布尔
+- `null`
+
+例如：
+
+```python
+filters = {"user_id": "u1", "flag": True}
+filters = {"user_id": "u1", "flag": {"ne": True}}
+filters = {"user_id": "u1", "deleted_at": None}
+filters = {"user_id": "u1", "priority": {"in": [1, 3, 5]}}
+```
+
+### 20.3 当前 range 的正确使用方式
+
+当前 range 已不再是“统一不支持”，而是：
+
+- **已声明 `number` / `datetime` 字段：支持**
+- **未声明字段或非 `number/datetime` 声明字段：warning + 兼容匹配**
+- **已声明字段中的坏历史数据行：自动忽略，不会让整次查询报错**
+
+例如：
+
+```python
+filters = {"user_id": "u1", "priority": {"gte": 3, "lt": 9}}
+filters = {"user_id": "u1", "created_at": {"lt": "2026-01-01T00:00:00Z"}}
+```
+
+如果你没有在 `metadata_schema` 里声明 `priority` 或 `created_at`，上面的写法不会执行真正的 typed range，而是记录 warning 后按兼容匹配处理，通常不会命中结果。
+
+### 20.4 wildcard / exists / missing / null
+
+当前 provider 级语义如下：
+
+#### wildcard
+
+```python
+filters = {"user_id": "u1", "category": "*"}
+```
+
+含义是：
+
+- `category` 不施加值约束
+- 不会做 `category = '*'` 这样的字面量匹配
+
+注意：
+
+- `{"user_id": "*"}` 不算有效正向 scope
+
+#### exists
+
+```python
+filters = {"user_id": "u1", "optional": {"exists": True}}
+```
+
+表示字段存在，即便字段值是 `null` 也算存在。
+
+#### missing
+
+```python
+filters = {"user_id": "u1", "optional": {"missing": True}}
+```
+
+表示字段不存在。
+
+#### null
+
+```python
+filters = {"user_id": "u1", "optional": None}
+```
+
+表示字段存在，且字段值为 JSON `null`。
+
+因此当前这三者已经区分：
+
+- `exists`
+- `missing`
+- `null`
+
+### 20.5 一个完整示例
+
+```python
+config = {
+    "host": "127.0.0.1",
+    "port": 19995,
+    "database": "lxm_db",
+    "user": "lxm",
+    "password": "Gauss_234",
+    "collection_name": "mem0_prod",
+    "embedding_model_dims": 1536,
+    "deployment_mode": "centralized",
+    "metadata_schema": {
+        "priority": "number",
+        "created_at": "datetime",
+        "flag": "bool"
+    },
+    "require_scoped_filters": True,
+}
+```
+
+查询示例：
+
+```python
+filters = {
+    "user_id": "u1",
+    "priority": {"gte": 3, "lt": 9},
+    "flag": True,
+    "optional": {"exists": True},
+}
+```
+
+### 20.6 当前推荐上线口径
+
+如果你已经使用这版 typed-filter 重构，推荐把上线口径更新为：
+
+1. scope 字段默认正式列化
+2. exact filter 走 typed exact
+3. range 只用于声明类型字段
+4. wildcard / exists / missing / null 的行为按本节理解
+5. 仍然使用 `test_gaussdb_commercial_validation.py` 作为集中式交付门禁

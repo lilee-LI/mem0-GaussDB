@@ -316,6 +316,14 @@ GaussDB 官方 Python 驱动示例以 psycopg2 兼容接口为基础，当前 pr
 这里的 UTF8 强制非常关键。  
 GaussDB 适配里显式设置 `client_encoding="UTF8"`，是为了避免某些非 UTF8 会话或环境下，payload / 文本字段行为不稳定。
 
+当前实现还会在初始化时探测一次 `server_encoding`。如果检测到数据库本身不是 `UTF8`，provider 不会强制阻断连接，但会记录 warning，明确提示:
+
+- GaussDB mem0 部署的推荐与验证前提是 UTF8 数据库
+- `client_encoding=UTF8` 只能保证客户端会话按 UTF8 传输
+- 非 UTF8 数据库下，文本、JSON、metadata filter 与关键词检索行为可能不稳定
+
+因此从设计口径上，非 UTF8 数据库不作为正式商用支持目标。
+
 ### 7.4 为什么 `analyze()` 单独走 autocommit
 
 在分布式场景中，`ANALYZE` 不能在 transaction block 内执行。  
@@ -434,15 +442,18 @@ GaussDB 在不同版本、不同模式、不同部署环境下，向量、JSONB�
 2. 让 provider 能在 collection 生命周期中做版本识别
 3. 避免把模式状态散落在代码假设里
 
-### 9.3 schema 固定为 `public`
+### 9.3 schema 默认 `public`，可作为高级配置覆盖
 
-当前 provider 将 `schema` 固定为 `public`，并统一做显式 schema qualification。
+当前 provider 将 `schema` 作为高级配置项暴露，默认值为 `public`，并统一做显式 schema qualification。
 
 这样做的原因:
 
 - 避免不同 session search_path 带来的漂移
 - 保证表名、索引名、meta 表名可预测
 - 降低 DDL 兼容风险
+- 在客户有命名空间隔离要求时，提供不破坏主链路的可配置出口
+
+如果用户不配置 `schema`，行为与旧版保持一致；如果客户有 DBA 治理或命名空间隔离要求，可以显式指定其他安全 schema 名称。
 
 ### 9.4 Ustore 与分布式策略
 
@@ -595,32 +606,22 @@ provider 当前还实现:
 2. 拼接过滤条件
 3. 执行 top-k SQL
 4. 按距离升序返回
-5. 将 distance 映射为 provider-normalized score
+5. 直接返回数据库距离值作为 `score`
 
 当前支持:
 
 - `cosine`
 - `l2`
 
-### 13.2 为什么返回 normalized score
+### 13.2 为什么现在直接返回 raw distance
 
-GaussDB 当前 score 计算为:
+GaussDB 当前不再对距离做 provider 专属归一化，而是直接返回数据库计算出的距离值。
 
-```python
-score = 1 / (1 + max(distance, 0))
-```
+这样做的原因是:
 
-设计原因不是模仿某一个其他 provider，而是为了:
-
-1. 保持分数为正向值，越大越相关
-2. 让 score 稳定落在 `(0, 1]`
-3. 更贴近 mem0 上层 `threshold` 与融合排序的消费方式
-
-这意味着:
-
-- GaussDB score 不是 raw distance
-- 也不是严格数学意义上的原生相似度
-- 它是 provider-normalized semantic score
+1. 与 `pgvector`、`Azure MySQL` 等 SQL provider 的 score 风格更一致
+2. 避免 GaussDB 成为当前 mem0 provider 中唯一一个自定义归一化 score 语义的特例
+3. 不再让用户误以为 GaussDB 的 score 可以天然跨 provider 对齐
 
 ### 13.3 与其他 provider 的差异
 
@@ -630,9 +631,9 @@ score = 1 / (1 + max(distance, 0))
 2. 直接返回后端 `_score`
 3. 返回后端 SDK 原生相似度
 
-GaussDB 当前属于第四种:
+GaussDB 当前属于第一种:
 
-- provider 自己做了一层统一正向分数映射
+- 直接返回 raw distance
 
 因此文档必须明确:
 
@@ -749,26 +750,6 @@ GaussDB 当前更进一步，是因为它的目标不是只做通用向量库，
 - 通过宽松 `OR` 试图绕过约束
 
 这样可避免“形式上出现了 scope 字段，实际上却没有真正收敛查询范围”的情况。
-
-### 15.5 范围操作符为什么不支持
-
-当前 `gt/gte/lt/lte` 不作为 typed range 支持，原因是:
-
-- 当前 SQL 路径主要基于 `payload->>'key'`
-- 该表达式会把 JSONB 中的值取成文本
-- 若直接做字符串大小比较，会产生商用错误结果
-
-典型问题就是:
-
-- `10` 与 `2` 的字符串比较不等于数值比较
-
-因此当前策略是:
-
-1. 明确打 warning
-2. 不生成假 range SQL
-3. 退回字面值 dict 等值处理
-
-这是一个“宁可不支持，也不返回错结果”的设计决策。
 
 ### 15.6 与其他 provider 的对比
 
@@ -918,7 +899,7 @@ GaussDB 当前选择的是更可解释的路径:
 本轮测试重构中特别做了两件事:
 
 1. live 默认索引路径改回 `gsdiskann`，对齐 provider 真默认值
-2. `gt/gte/lt/lte` 用例改名为 unsupported-range 语义，避免测试名继续暗示“我们支持 typed range”
+2. `gt/gte/lt/lte` 用例按“声明字段支持 typed range、未声明字段 warning + 兼容匹配”的现口径重构，避免旧测试名继续暗示过时语义
 
 ---
 
@@ -933,9 +914,8 @@ GaussDB 当前选择的是更可解释的路径:
 
 ### 20.2 相比其他 provider 不完全一致的地方
 
-1. score 做了 provider-normalized 映射
-2. centralized 支持 BM25，distributed 显式不支持
-3. 默认行为比很多 provider 更保守
+1. centralized 支持 BM25，distributed 显式不支持
+2. 默认行为比很多 provider 更保守
 
 ### 20.3 为什么这些差异是合理的
 
@@ -951,7 +931,7 @@ GaussDB 当前选择的是更可解释的路径:
 
 当前设计文档必须明确以下边界:
 
-1. `gt/gte/lt/lte` 不支持 typed range
+1. `gt/gte/lt/lte` 仅对声明为 `number/datetime` 的字段执行 typed range；未声明字段走 warning + 兼容匹配
 2. distributed 不支持 BM25 / `keyword_search()`
 3. `get/update/delete` 不带 scope guard
 4. score 不可跨 provider 横向比较
@@ -1288,19 +1268,19 @@ distance ASC, id ASC
 返回分数:
 
 ```text
-score = 1 / (1 + max(distance, 0))
+score = distance
 ```
 
 设计原因:
 
-- 对上层暴露单调可比较的正向分数
-- 保持结果稳定性
+- 与现有 SQL provider 的 score 风格保持一致
+- 避免引入仅 GaussDB 独有的 provider-normalized 分数语义
 
 注意:
 
-- 这个 `score` 是 **GaussDB provider 自己归一化后的 semantic score**
-- 它不是原始距离，也不是严格数学意义上的 cosine similarity
-- 它的设计目标是适配 mem0 上层 `threshold` 与混合排序逻辑
+- 这个 `score` 是 **GaussDB 返回的原始距离值**
+- 它不是严格数学意义上的 cosine similarity
+- 不同 provider 的 `score` 语义仍然不统一
 
 因此:
 
@@ -1311,7 +1291,7 @@ score = 1 / (1 + max(distance, 0))
 
 | Provider | score 语义 |
 |---|---|
-| GaussDB | provider-normalized semantic score，越大越好 |
+| GaussDB | raw distance，越小越好 |
 | pgvector | raw distance，越小越好 |
 | Azure MySQL | raw distance，越小越好 |
 | MongoDB / OpenSearch / Elasticsearch / Qdrant | 后端原生 score，通常越大越好，但量纲不统一 |
@@ -1401,20 +1381,13 @@ score = 1 / (1 + max(distance, 0))
 - `OR/$or`
 - `NOT/$not`
 
-### 10.3 当前不支持的 operator
+### 10.3 当前 range operator 语义
 
-`gt/gte/lt/lte` 当前不支持 typed range。
+`gt/gte/lt/lte` 当前采用受控 typed range 策略：
 
-当前行为:
-
-- 记录 warning
-- 按 dict 字面值做等值比较
-
-为什么这么设计:
-
-- 当前 SQL 走的是 `payload->>'key'`，得到的是文本
-- 如果直接用字符串比较，`10 > 2` 会出现错误结果
-- 错误结果比显式不支持更危险
+- 已声明为 `number` / `datetime` 的字段：执行真正的 typed range
+- 未声明字段或非 `number/datetime` 声明字段：记录 warning，并回落到兼容匹配
+- 已声明字段中的脏历史数据行：忽略坏行，不让整次查询报错
 
 ### 10.4 为什么不直接删掉这些 operator
 
@@ -1423,15 +1396,15 @@ provider 需要有明确响应，而不是完全不认识该结构。
 
 当前策略是:
 
-- 明确 warning
-- 保证不会误做错误的 range 语义
+- 声明字段真支持 typed range
+- 未声明字段明确 warning，并保证不会误做错误的 range 语义
 
 ### 10.5 与其他 provider 对比
 
 | Provider | range 支持情况 |
 |---|---|
 | Qdrant | 原生支持 typed range |
-| GaussDB 当前 | 不支持 typed range |
+| GaussDB 当前 | 已声明 `number/datetime` 字段支持 typed range；未声明字段 warning + 兼容匹配 |
 | pgvector | 通常不做真正 typed payload range |
 | Azure MySQL | 通常也是 JSON 文本抽取思路 |
 
@@ -1491,6 +1464,21 @@ recreate collection
 
 - 分布式环境已验证 `ANALYZE` 不能在 transaction block 中执行
 - 集中式与分布式统一走 autocommit 更稳
+
+当前对它的定位应当是:
+
+- **辅助维护接口**
+- 不是 mem0 主链路必需能力
+- 非必要场景下不一定要调用
+
+更适合的使用时机:
+
+- 建表后
+- 大批量导入后
+- 离峰维护窗口
+- 测试或排障时手工触发
+
+不建议把 `analyze()` 放进高频业务请求路径。
 
 ## 12. retry 与观测设计
 
@@ -1580,3 +1568,93 @@ GaussDB 当前设计不是“能力最多”的 provider，但它已经形成了
 - 用明确 warning 代替错误的伪兼容
 
 从工程判断上看，这套设计是稳的，也适合继续向交付文档和生产门禁推进。
+
+---
+
+## 16. 2026-05-18 Typed Filter 重构现行口径
+
+> 本节用于覆盖本文档中较早阶段的旧实现描述。若本文档其他章节与本节冲突，以本节为准。
+
+### 16.1 scope 字段已从“冗余列”升级为正式列
+
+当前 `user_id`、`agent_id`、`run_id` 不再只是 fallback 或降级模式下的冗余列，而是主表中的正式列。
+
+这意味着：
+
+- scope 过滤默认优先走实体列
+- scope 索引走真实列索引
+- `insert / update / upsert` 会同步写入 scope 列
+- scope guard 仍然默认开启
+
+### 16.2 typed exact 已替代 `str(value)` 文本比较
+
+当前普通 metadata 的 `eq / ne / in / nin` 不再依赖 Python `str(value)` 再去比较 `payload->>'key'`。
+
+现行实现改为基于 JSONB 语义的 typed exact：
+
+- `eq` / `in` 走 `payload @> ...::JSONB`
+- `ne` / `nin` 走 `(payload @> ...::JSONB) IS NOT TRUE`
+- `bool`、`number`、`null`、`string` 都按 JSON 标量语义匹配
+
+这一步的目的，是把布尔值、空值和普通标量从“文本偶然匹配”切换到“JSON 语义正确匹配”。
+
+### 16.3 range 已改为“声明类型后支持”
+
+旧口径里曾把 `gt/gte/lt/lte` 统一视为“不支持 typed range”。当前实现已经更新为：
+
+- 未声明类型字段或非 `number/datetime` 声明字段：记录 warning，并回落到兼容匹配
+- 已声明 `number` / `datetime` 字段：允许 typed range
+- 已声明字段中的脏历史数据行：忽略坏行，不让整次查询报错
+
+对应高级配置项是：
+
+- `metadata_schema`
+
+当前推荐的声明方式例如：
+
+```python
+metadata_schema = {
+    "priority": "number",
+    "score": "number",
+    "created_at": "datetime",
+}
+```
+
+因此，本文档中所有“当前完全不支持 range”的旧描述，应理解为：
+
+> 当前对**未声明类型字段**的 range 不执行真正的 typed range，而是记录 warning 后回落到兼容匹配；对**声明类型字段**已支持 typed range，并会忽略坏历史数据行。
+
+### 16.4 wildcard / exists / missing / null 语义
+
+当前 typed-filter 第二阶段口径如下：
+
+- 普通 metadata 字段上的 `*`：跳过该字段约束，不做字面量匹配
+- scope 字段上的 `*`：不算有效正向 scope
+- `{"field": None}`：表示 JSON `null`
+- `{"field": {"exists": True}}`：字段存在
+- `{"field": {"missing": True}}`：字段不存在
+
+这意味着：
+
+- `null` 与 `missing` 已经区分
+- wildcard 不再被当作普通字符串 `'*'`
+- `exists / missing` 已经进入 provider 级正式能力
+
+### 16.5 跨路径对齐
+
+当前以下读路径共享同一套 typed-filter 规则：
+
+- `search`
+- `list`
+- `search_batch`
+- `keyword_search`
+
+也就是说，typed exact、declared range、wildcard、exists/missing 的主要行为不再只在单一路径成立，而是按 provider 级统一语义执行。
+
+### 16.6 当前阶段验证状态
+
+截至本轮重构，以下验证已通过：
+
+- 本地单测：`tests/vector_stores/test_gaussdb.py`
+- 商用门禁：`tests/vector_stores/test_gaussdb_commercial_validation.py`
+- 集中式真库验证：新增 typed exact、declared range、wildcard、exists/missing 场景均已通过
