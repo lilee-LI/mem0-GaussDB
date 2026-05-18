@@ -9,6 +9,11 @@ from mem0.llms.minimax import MiniMaxLLM
 from mem0.utils.factory import LlmFactory
 
 
+def clear_minimax_env():
+    for name in ("MINIMAX_API_BASE", "MINIMAX_BASE_URL", "MINIMAX_MODEL", "MINIMAX_API_KEY"):
+        os.environ.pop(name, None)
+
+
 @pytest.fixture
 def mock_minimax_client():
     with patch("mem0.llms.minimax.OpenAI") as mock_openai:
@@ -19,19 +24,20 @@ def mock_minimax_client():
 
 def test_minimax_llm_default_base_url():
     """Default config uses MiniMax official base URL."""
-    config = BaseLlmConfig(
-        model="MiniMax-M2.7", temperature=0.7, max_tokens=100, top_p=1.0, api_key="api_key"
-    )
-    llm = MiniMaxLLM(config)
-    # OpenAI client may normalize URL with trailing slash
-    assert str(llm.client.base_url).rstrip("/") == "https://api.minimax.io/v1"
+    with patch.dict(os.environ, {}, clear=False):
+        clear_minimax_env()
+        config = BaseLlmConfig(model="MiniMax-M2.7", temperature=0.7, max_tokens=100, top_p=1.0, api_key="api_key")
+        llm = MiniMaxLLM(config)
+        # OpenAI client may normalize URL with trailing slash
+        assert str(llm.client.base_url).rstrip("/") == "https://api.minimax.io/v1"
 
 
 def test_minimax_llm_env_base_url():
     """Config uses MINIMAX_API_BASE env variable when set."""
-    provider_base_url = "https://api.provider.com/v1/"
-    os.environ["MINIMAX_API_BASE"] = provider_base_url
-    try:
+    with patch.dict(os.environ, {}, clear=False):
+        clear_minimax_env()
+        provider_base_url = "https://api.provider.com/v1/"
+        os.environ["MINIMAX_API_BASE"] = provider_base_url
         config = MinimaxConfig(
             model="MiniMax-M2.7",
             temperature=0.7,
@@ -41,8 +47,23 @@ def test_minimax_llm_env_base_url():
         )
         llm = MiniMaxLLM(config)
         assert str(llm.client.base_url).rstrip("/") == provider_base_url.rstrip("/")
-    finally:
-        os.environ.pop("MINIMAX_API_BASE", None)
+
+
+def test_minimax_llm_env_base_url_alias():
+    """Config also supports MINIMAX_BASE_URL env variable."""
+    with patch.dict(os.environ, {}, clear=False):
+        clear_minimax_env()
+        provider_base_url = "https://api.minimaxi.com/v1/"
+        os.environ["MINIMAX_BASE_URL"] = provider_base_url
+        config = MinimaxConfig(
+            model="MiniMax-M2.7",
+            temperature=0.7,
+            max_tokens=100,
+            top_p=1.0,
+            api_key="api_key",
+        )
+        llm = MiniMaxLLM(config)
+        assert str(llm.client.base_url).rstrip("/") == provider_base_url.rstrip("/")
 
 
 def test_minimax_llm_config_base_url():
@@ -62,15 +83,28 @@ def test_minimax_llm_config_base_url():
 
 def test_minimax_llm_default_model(mock_minimax_client):
     """Default model is MiniMax-M2.7 when not specified."""
-    config = MinimaxConfig(temperature=0.7, max_tokens=100, api_key="api_key")
-    llm = MiniMaxLLM(config)
-    assert llm.config.model == "MiniMax-M2.7"
+    with patch.dict(os.environ, {}, clear=False):
+        clear_minimax_env()
+        config = MinimaxConfig(temperature=0.7, max_tokens=100, api_key="api_key")
+        llm = MiniMaxLLM(config)
+        assert llm.config.model == "MiniMax-M2.7"
+
+
+def test_minimax_llm_env_model(mock_minimax_client):
+    """Default model can be supplied via MINIMAX_MODEL."""
+    with patch.dict(os.environ, {}, clear=False):
+        clear_minimax_env()
+        os.environ["MINIMAX_MODEL"] = "MiniMax-M2.7"
+        config = MinimaxConfig(temperature=0.7, max_tokens=100, api_key="api_key")
+        llm = MiniMaxLLM(config)
+        assert llm.config.model == "MiniMax-M2.7"
 
 
 def test_minimax_llm_env_api_key():
     """Uses MINIMAX_API_KEY env when api_key not in config."""
-    os.environ["MINIMAX_API_KEY"] = "env-api-key"
-    try:
+    with patch.dict(os.environ, {}, clear=False):
+        clear_minimax_env()
+        os.environ["MINIMAX_API_KEY"] = "env-api-key"
         with patch("mem0.llms.minimax.OpenAI") as mock_openai:
             mock_client = Mock()
             mock_openai.return_value = mock_client
@@ -80,15 +114,11 @@ def test_minimax_llm_env_api_key():
                 api_key="env-api-key",
                 base_url="https://api.minimax.io/v1",
             )
-    finally:
-        os.environ.pop("MINIMAX_API_KEY", None)
 
 
 def test_generate_response_without_tools(mock_minimax_client):
     """generate_response returns text when no tools provided."""
-    config = BaseLlmConfig(
-        model="MiniMax-M2.7", temperature=0.7, max_tokens=100, top_p=1.0, api_key="api_key"
-    )
+    config = BaseLlmConfig(model="MiniMax-M2.7", temperature=0.7, max_tokens=100, top_p=1.0, api_key="api_key")
     llm = MiniMaxLLM(config)
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -102,16 +132,19 @@ def test_generate_response_without_tools(mock_minimax_client):
     response = llm.generate_response(messages)
 
     mock_minimax_client.chat.completions.create.assert_called_once_with(
-        model="MiniMax-M2.7", messages=messages, temperature=0.7, max_tokens=100, top_p=1.0
+        model="MiniMax-M2.7",
+        messages=messages,
+        temperature=0.7,
+        max_completion_tokens=100,
+        top_p=1.0,
+        extra_body={"reasoning_split": True},
     )
     assert response == "I'm doing well, thank you for asking!"
 
 
 def test_generate_response_with_tools(mock_minimax_client):
     """generate_response returns tool_calls when tools provided."""
-    config = BaseLlmConfig(
-        model="MiniMax-M2.7", temperature=0.7, max_tokens=100, top_p=1.0, api_key="api_key"
-    )
+    config = BaseLlmConfig(model="MiniMax-M2.7", temperature=0.7, max_tokens=100, top_p=1.0, api_key="api_key")
     llm = MiniMaxLLM(config)
     messages = [
         {"role": "system", "content": "You are a helpful assistant."},
@@ -150,8 +183,9 @@ def test_generate_response_with_tools(mock_minimax_client):
         model="MiniMax-M2.7",
         messages=messages,
         temperature=0.7,
-        max_tokens=100,
+        max_completion_tokens=100,
         top_p=1.0,
+        extra_body={"reasoning_split": True},
         tools=tools,
         tool_choice="auto",
     )
@@ -164,9 +198,7 @@ def test_generate_response_with_tools(mock_minimax_client):
 
 def test_generate_response_with_response_format(mock_minimax_client):
     """generate_response passes response_format to the API."""
-    config = BaseLlmConfig(
-        model="MiniMax-M2.7", temperature=0.7, max_tokens=100, top_p=1.0, api_key="api_key"
-    )
+    config = BaseLlmConfig(model="MiniMax-M2.7", temperature=0.7, max_tokens=100, top_p=1.0, api_key="api_key")
     llm = MiniMaxLLM(config)
     messages = [{"role": "user", "content": "Return JSON."}]
     response_format = {"type": "json_object"}
@@ -181,9 +213,39 @@ def test_generate_response_with_response_format(mock_minimax_client):
         model="MiniMax-M2.7",
         messages=messages,
         temperature=0.7,
+        max_completion_tokens=100,
+        top_p=1.0,
+        extra_body={"reasoning_split": True},
+        response_format={"type": "json_object"},
+    )
+
+
+def test_generate_response_allows_disabling_reasoning_split(mock_minimax_client):
+    """reasoning_split can be disabled for MiniMax-compatible gateways that do not support it."""
+    config = MinimaxConfig(
+        model="MiniMax-M2.7",
+        temperature=0.7,
         max_tokens=100,
         top_p=1.0,
-        response_format={"type": "json_object"},
+        api_key="api_key",
+        reasoning_split=False,
+    )
+    llm = MiniMaxLLM(config)
+    messages = [{"role": "user", "content": "Return plain text."}]
+
+    mock_response = Mock()
+    mock_response.choices = [Mock(message=Mock(content="ok"))]
+    mock_minimax_client.chat.completions.create.return_value = mock_response
+
+    llm.generate_response(messages)
+
+    mock_minimax_client.chat.completions.create.assert_called_once_with(
+        model="MiniMax-M2.7",
+        messages=messages,
+        temperature=0.7,
+        max_completion_tokens=100,
+        top_p=1.0,
+        extra_body={"reasoning_split": False},
     )
 
 
