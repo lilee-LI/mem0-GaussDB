@@ -26,6 +26,9 @@ logger = logging.getLogger(__name__)
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
 _FILTER_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _MEMORY_SETTING_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([A-Za-z]+)\s*$")
+_ISO_8601_TIMESTAMPTZ_PATTERN = (
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
 _RETRYABLE_ERROR_FRAGMENTS = (
     "connection",
     "timeout",
@@ -94,11 +97,14 @@ class GaussDB(VectorStoreBase):
         maxconn: int = 5,
         sslmode: Optional[str] = None,
         sslrootcert: Optional[str] = None,
+        schema: str = "public",
+        schema_name: Optional[str] = None,
         deployment_mode: str = "centralized",
         vector_index_type: str = "gsdiskann",
         vector_metric: str = "cosine",
         auto_create: bool = True,
         require_scoped_filters: bool = True,
+        metadata_schema: Optional[Dict[str, str]] = None,
     ):
         connection_string = connection_string or _first_env("GAUSSDB_CONNECTION_STRING", "GAUSSDB_DSN", "GAUSSDB_URL")
         database = _first_env("GAUSSDB_DATABASE", "GAUSSDB_DBNAME") or database
@@ -108,6 +114,7 @@ class GaussDB(VectorStoreBase):
         port = port or _first_env("GAUSSDB_PORT")
         sslmode = sslmode or _first_env("GAUSSDB_SSLMODE")
         sslrootcert = sslrootcert or _first_env("GAUSSDB_SSLROOTCERT")
+        schema = _first_env("GAUSSDB_SCHEMA") or schema_name or schema
 
         self.database = database
         self.collection_name = self._validate_identifier(collection_name, "collection_name")
@@ -147,7 +154,7 @@ class GaussDB(VectorStoreBase):
 
         # Hardcoded internal defaults
         self.client_encoding = "UTF8"
-        self.schema = "public"
+        self.schema = self._validate_identifier(schema, "schema")
         self.table_storage = "ustore"
         self.id_column_type = "uuid"
         self.gsdiskann_subgraph_count = 1
@@ -162,6 +169,7 @@ class GaussDB(VectorStoreBase):
         self.require_scoped_filters = bool(require_scoped_filters)
         self.scope_filter_keys = ("user_id", "agent_id", "run_id")
         self.allowed_filter_keys = None
+        self.metadata_schema: Dict[str, str] = dict(metadata_schema or {})
         self.enable_observability = True
         self.slow_query_ms = 1000
         self.retry_attempts = 2
@@ -185,6 +193,7 @@ class GaussDB(VectorStoreBase):
 
         self.connection_pool = self._create_connection_pool()
         self._probe_capabilities()
+        self._warn_if_server_encoding_is_not_utf8()
 
         if not self.require_scoped_filters:
             logger.warning(
@@ -225,6 +234,52 @@ class GaussDB(VectorStoreBase):
             self.metadata_column_mode = "redundant_columns"
         else:
             self.metadata_column_mode = "jsonb"
+
+    def _warn_if_server_encoding_is_not_utf8(self) -> None:
+        conn = self.connection_pool.getconn()
+        try:
+            server_encoding = None
+            get_parameter_status = getattr(conn, "get_parameter_status", None)
+            if callable(get_parameter_status):
+                value = get_parameter_status("server_encoding")
+                if isinstance(value, str) and value:
+                    server_encoding = value
+
+            if server_encoding is None:
+                cur = conn.cursor()
+                try:
+                    cur.execute("SHOW server_encoding")
+                    row = cur.fetchone()
+                finally:
+                    cur.close()
+                if row and row[0]:
+                    server_encoding = row[0]
+        except Exception as exc:
+            logger.warning("Unable to verify GaussDB server_encoding during initialization: %s", exc)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            self.connection_pool.putconn(conn)
+            return
+
+        if not server_encoding:
+            logger.warning(
+                "Unable to determine GaussDB server_encoding during initialization. "
+                "GaussDB mem0 deployments are recommended to use UTF8 databases."
+            )
+            self.connection_pool.putconn(conn)
+            return
+
+        server_encoding = str(server_encoding).upper()
+        if server_encoding != "UTF8":
+            logger.warning(
+                "GaussDB mem0 deployments are designed and validated for UTF8 databases, "
+                "but detected server_encoding=%s. client_encoding remains UTF8, "
+                "and non-UTF8 databases may cause unstable text, JSON, or metadata-filter behavior.",
+                server_encoding,
+            )
+        self.connection_pool.putconn(conn)
 
     @classmethod
     def _validate_identifier(cls, value: str, field_name: str = "identifier") -> str:
@@ -615,8 +670,10 @@ class GaussDB(VectorStoreBase):
                         text_lemmatized TEXT,
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        schema_version INTEGER DEFAULT 1
-                        {self._redundant_column_sql()}
+                        schema_version INTEGER DEFAULT 1,
+                        user_id VARCHAR(128),
+                        agent_id VARCHAR(128),
+                        run_id VARCHAR(128)
                     ) {self._create_table_suffix_sql("id")}
                     """
                 )
@@ -625,11 +682,6 @@ class GaussDB(VectorStoreBase):
                 self._ensure_indexes(cur, table)
 
         return self._run_with_retry("create_col", op)
-
-    def _redundant_column_sql(self) -> str:
-        if self.filter_storage_mode != "redundant_columns":
-            return ""
-        return ", user_id VARCHAR(128), agent_id VARCHAR(128), run_id VARCHAR(128)"
 
     def _create_schema_meta(self, cur):
         cur.execute(
@@ -759,12 +811,7 @@ class GaussDB(VectorStoreBase):
             savepoint = self._quote_identifier(f"mem0_filter_idx_{uuid.uuid4().hex[:8]}")
             cur.execute(f"SAVEPOINT {savepoint}")
             try:
-                if self.filter_storage_mode == "redundant_columns" and safe_key in self._redundant_scope_columns:
-                    cur.execute(
-                        f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({self._quote_identifier(safe_key)})"
-                    )
-                elif self.filter_storage_mode == "json_expression":
-                    cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ((payload->>'{safe_key}'))")
+                cur.execute(f"CREATE INDEX IF NOT EXISTS {index_name} ON {table} ({self._quote_identifier(safe_key)})")
                 cur.execute(f"RELEASE SAVEPOINT {savepoint}")
             except Exception as exc:
                 try:
@@ -794,9 +841,7 @@ class GaussDB(VectorStoreBase):
         ]
         if not rows:
             return None
-        columns = ["id", "vector", "payload", "memory", "text_lemmatized", "schema_version"]
-        if self.filter_storage_mode == "redundant_columns":
-            columns.extend(self._redundant_scope_columns)
+        columns = ["id", "vector", "payload", "memory", "text_lemmatized", "schema_version", *self._redundant_scope_columns]
         update_columns = [column for column in columns if column != "id"]
         update_set_sql = ", ".join(
             f"{self._quote_identifier(column)} = src.{self._quote_identifier(column)}" for column in update_columns
@@ -855,8 +900,7 @@ class GaussDB(VectorStoreBase):
             text_lemmatized,
             1,
         ]
-        if self.filter_storage_mode == "redundant_columns":
-            row.extend(payload.get(key) for key in self._redundant_scope_columns)
+        row.extend(payload.get(key) for key in self._redundant_scope_columns)
         return tuple(row)
 
     def search(
@@ -879,16 +923,11 @@ class GaussDB(VectorStoreBase):
                 )
                 rows = cur.fetchall()
             return [
-                OutputData(
-                    id=str(row[0]), score=self._normalize_score(float(row[1])), payload=self._decode_payload(row[2])
-                )
+                OutputData(id=str(row[0]), score=float(row[1]), payload=self._decode_payload(row[2]))
                 for row in rows
             ]
 
         return self._run_with_retry("search", op)
-
-    def _normalize_score(self, distance: float) -> float:
-        return 1.0 / (1.0 + max(distance, 0.0))
 
     def keyword_search(self, query: str, top_k: int = 5, filters: Optional[dict] = None):
         if not self.bm25_enabled:
@@ -979,7 +1018,7 @@ class GaussDB(VectorStoreBase):
                     grouped[int(query_index)].append(
                         OutputData(
                             id=str(row_id),
-                            score=self._normalize_score(float(distance)),
+                            score=float(distance),
                             payload=self._decode_payload(payload),
                         )
                     )
@@ -1015,11 +1054,10 @@ class GaussDB(VectorStoreBase):
             text_lemmatized = payload.get("text_lemmatized") or memory
             set_clauses.extend(["payload = %s", "memory = %s", "text_lemmatized = %s"])
             params.extend([self._payload_value(payload), memory, text_lemmatized])
-            if self.filter_storage_mode == "redundant_columns":
-                for key in self._redundant_scope_columns:
-                    if key in payload:
-                        set_clauses.append(f"{self._quote_identifier(key)} = %s")
-                        params.append(payload.get(key))
+            for key in self._redundant_scope_columns:
+                if key in payload:
+                    set_clauses.append(f"{self._quote_identifier(key)} = %s")
+                    params.append(payload.get(key))
         set_clauses.append("updated_at = CURRENT_TIMESTAMP")
         params.append(vector_id)
 
@@ -1317,12 +1355,13 @@ class GaussDB(VectorStoreBase):
                 for item in value:
                     expr, sub_params = self._build_filter_expression(item)
                     if expr:
-                        expressions.append(f"NOT ({expr})")
+                        expressions.append(f"(({expr}) IS NOT TRUE)")
                         params.extend(sub_params)
             else:
                 expr, sub_params = self._build_field_filter(normalized_key, value)
-                expressions.append(expr)
-                params.extend(sub_params)
+                if expr:
+                    expressions.append(expr)
+                    params.extend(sub_params)
         return " AND ".join(expressions), params
 
     def _build_field_filter(self, key: str, value: Any) -> Tuple[str, List[Any]]:
@@ -1330,24 +1369,28 @@ class GaussDB(VectorStoreBase):
         if not isinstance(value, dict):
             if isinstance(value, list):
                 return self._field_in_expression(key, value, negate=False)
-            field_sql, params = self._field_sql(key)
-            return f"{field_sql} = %s", [*params, str(value)]
+            if value is None:
+                return self._field_exact_expression(key, value, negate=False)
+            if key in self.scope_filter_keys:
+                field_sql, params = self._field_sql(key)
+                return f"{field_sql} = %s", [*params, value]
+            if value == "*":
+                return "", []
+            return self._field_exact_expression(key, value, negate=False)
 
         ops = set(value.keys())
         range_ops = {"gt", "gte", "lt", "lte"}
         if ops & range_ops:
-            logger.warning(
-                "GaussDB range filter operators %s are not supported; treating filter on %s as literal equality",
-                sorted(ops & range_ops),
-                key,
-            )
-            field_sql, params = self._field_sql(key)
-            return f"{field_sql} = %s", [*params, str(value)]
+            return self._build_range_filter(key, value)
+        if ops & {"exists", "not_exists", "missing"}:
+            return self._build_presence_filter(key, value)
         if "eq" in value:
             return self._build_field_filter(key, value["eq"])
         if "ne" in value:
-            field_sql, params = self._field_sql(key)
-            return f"{field_sql} <> %s", [*params, str(value["ne"])]
+            if key in self.scope_filter_keys:
+                field_sql, params = self._field_sql(key)
+                return f"{field_sql} <> %s", [*params, value["ne"]]
+            return self._field_exact_expression(key, value["ne"], negate=True)
         if "in" in value:
             return self._field_in_expression(key, value["in"], negate=False)
         if "nin" in value:
@@ -1367,13 +1410,24 @@ class GaussDB(VectorStoreBase):
         values = list(values)
         if not values:
             return ("1 = 1" if negate else "1 = 0"), []
-        field_sql, params = self._field_sql(key)
-        placeholders = ", ".join(["%s"] * len(values))
-        operator = "NOT IN" if negate else "IN"
-        return f"{field_sql} {operator} ({placeholders})", [*params, *[str(value) for value in values]]
+        if key in self.scope_filter_keys:
+            field_sql, params = self._field_sql(key)
+            placeholders = ", ".join(["%s"] * len(values))
+            operator = "NOT IN" if negate else "IN"
+            return f"{field_sql} {operator} ({placeholders})", [*params, *values]
+        if len(values) == 1:
+            return self._field_exact_expression(key, values[0], negate=negate)
+        operator = " OR " if not negate else " AND "
+        expressions = []
+        params: List[Any] = []
+        for item in values:
+            expr, expr_params = self._field_exact_expression(key, item, negate=negate)
+            expressions.append(f"({expr})")
+            params.extend(expr_params)
+        return operator.join(expressions), params
 
     def _field_sql(self, key: str) -> Tuple[str, List[Any]]:
-        if self.filter_storage_mode == "redundant_columns" and key in self._redundant_scope_columns:
+        if key in self._redundant_scope_columns:
             return self._quote_identifier(key), []
         if self.filter_storage_mode == "json_expression":
             self._validate_filter_key(key)
@@ -1382,6 +1436,70 @@ class GaussDB(VectorStoreBase):
             f"Filter key {key!r} is not available in filter_storage_mode={self.filter_storage_mode!r}; "
             "use redundant_columns for scoped filters or json_expression for payload filters."
         )
+
+    def _field_exact_expression(self, key: str, value: Any, negate: bool) -> Tuple[str, List[Any]]:
+        self._validate_filter_key(key)
+        payload = json.dumps({key: value}, ensure_ascii=False, separators=(",", ":"))
+        expression = "(payload @> %s::JSONB) IS NOT TRUE" if negate else "payload @> %s::JSONB"
+        return expression, [payload]
+
+    def _build_presence_filter(self, key: str, value: dict) -> Tuple[str, List[Any]]:
+        self._validate_filter_key(key)
+        if len(value) != 1:
+            raise ValueError(
+                f"Presence filter for field {key!r} must specify exactly one of exists/not_exists/missing."
+            )
+        operator, raw_flag = next(iter(value.items()))
+        if not isinstance(raw_flag, bool):
+            raise ValueError(f"Presence filter {operator!r} for field {key!r} must be a boolean.")
+
+        if operator == "exists":
+            exists = raw_flag
+        elif operator in {"not_exists", "missing"}:
+            exists = not raw_flag
+        else:
+            raise ValueError(f"Unsupported presence filter operator for field {key!r}: {operator!r}")
+
+        expression = "payload ? %s" if exists else "(payload ? %s) IS NOT TRUE"
+        return expression, [key]
+
+    def _build_range_filter(self, key: str, value: dict) -> Tuple[str, List[Any]]:
+        field_type = self.metadata_schema.get(key)
+        if field_type not in {"number", "datetime"}:
+            logger.warning(
+                "Range filter operators on field %r do not have a declared number/datetime metadata type; "
+                "falling back to literal compatibility matching.",
+                key,
+            )
+            return self._field_exact_expression(key, value, negate=False)
+
+        expressions = []
+        params: List[Any] = []
+        if field_type == "number":
+            column_expr = (
+                f"CASE WHEN jsonb_typeof(payload->'{key}') = 'number' "
+                f"THEN CAST(payload->>'{key}' AS DOUBLE PRECISION) END"
+            )
+        else:
+            column_expr = (
+                f"CASE WHEN jsonb_typeof(payload->'{key}') = 'string' "
+                f"AND payload->>'{key}' ~ %s "
+                f"THEN CAST(payload->>'{key}' AS TIMESTAMPTZ) END"
+            )
+            params.append(_ISO_8601_TIMESTAMPTZ_PATTERN)
+        mapping = {
+            "gt": ">",
+            "gte": ">=",
+            "lt": "<",
+            "lte": "<=",
+        }
+        for op_name in ("gt", "gte", "lt", "lte"):
+            if op_name in value:
+                expressions.append(f"{column_expr} {mapping[op_name]} %s")
+                params.append(value[op_name])
+        if not expressions:
+            raise ValueError(f"Unsupported range filter for field {key!r}")
+        return " AND ".join(expressions), params
 
     def close(self):
         """Explicitly release the connection pool."""

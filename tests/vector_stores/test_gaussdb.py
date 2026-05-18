@@ -1,3 +1,4 @@
+import json
 import logging
 
 import pytest
@@ -13,6 +14,8 @@ def make_gaussdb(**kwargs):
     mock_conn = MagicMock()
     mock_cursor = MagicMock()
     mock_conn.cursor.return_value = mock_cursor
+    mock_conn.get_parameter_status.return_value = "UTF8"
+    mock_cursor.fetchone.return_value = ("UTF8",)
     mock_pool = MagicMock()
     mock_pool.getconn.return_value = mock_conn
 
@@ -51,6 +54,7 @@ def test_gaussdb_config_defaults():
     assert cfg.vector_index_type == "gsdiskann"
     assert cfg.vector_metric == "cosine"
     assert cfg.collection_name == "mem0"
+    assert cfg.schema == "public"
     assert cfg.embedding_model_dims == 1536
     assert cfg.minconn == 1
     assert cfg.maxconn == 5
@@ -87,6 +91,52 @@ def test_gaussdb_config_accepts_require_scoped_filters_override():
     )
 
     assert cfg.require_scoped_filters is False
+
+
+def test_gaussdb_config_accepts_metadata_schema():
+    cfg = GaussDBConfig(
+        host="localhost",
+        port=5432,
+        user="test",
+        password="test",
+        metadata_schema={"priority": "number", "title": "text", "flag": "bool"},
+    )
+
+    assert cfg.metadata_schema == {"priority": "number", "title": "text", "flag": "bool"}
+
+
+def test_gaussdb_config_accepts_custom_schema():
+    cfg = GaussDBConfig(
+        host="localhost",
+        port=5432,
+        user="test",
+        password="test",
+        schema="mem0_app",
+    )
+
+    assert cfg.schema == "mem0_app"
+
+
+def test_gaussdb_config_rejects_invalid_schema():
+    with pytest.raises(Exception, match="schema"):
+        GaussDBConfig(
+            host="localhost",
+            port=5432,
+            user="test",
+            password="test",
+            schema="bad-schema",
+        )
+
+
+def test_gaussdb_config_rejects_invalid_metadata_schema_type():
+    with pytest.raises(Exception, match="metadata_schema"):
+        GaussDBConfig(
+            host="localhost",
+            port=5432,
+            user="test",
+            password="test",
+            metadata_schema={"priority": "decimal"},
+        )
 
 
 def test_gaussdb_config_rejects_centralized_with_too_high_dims():
@@ -282,11 +332,14 @@ def test_create_col_generates_ustore_vector_bm25_and_filter_indexes():
     sql = executed_sql(mock_cursor)
     assert "WITH (storage_type=ustore)" in sql
     assert "FLOATVECTOR(3)" in sql
+    assert "user_id VARCHAR(128)" in sql
+    assert "agent_id VARCHAR(128)" in sql
+    assert "run_id VARCHAR(128)" in sql
     assert "SET LOCAL maintenance_work_mem" in sql
     assert "USING gsdiskann (vector COSINE)" in sql
     assert "USING bm25 (text_lemmatized)" in sql
     assert "storage_type='USTORE'" in sql
-    assert "payload->>'user_id'" in sql
+    assert '("user_id")' in sql or "user_id)" in sql
     mock_cursor.execute.assert_any_call("SET LOCAL maintenance_work_mem = %s", ("128MB",))
     mock_conn.commit.assert_called()
 
@@ -405,7 +458,7 @@ def test_filter_index_creation_failure_warns_and_keeps_filter_mode(caplog):
     caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
 
     def execute_side_effect(sql, *args):
-        if "CREATE INDEX IF NOT EXISTS" in str(sql) and "payload->>'user_id'" in str(sql):
+        if "CREATE INDEX IF NOT EXISTS" in str(sql) and "user_id" in str(sql):
             raise Exception("expression index unsupported")
 
     mock_cursor.execute.side_effect = execute_side_effect
@@ -470,7 +523,7 @@ def test_create_col_keeps_collection_when_bm25_index_fails():
     assert "USING gsdiskann (vector COSINE)" in sql
     assert "USING bm25 (text_lemmatized)" in sql
     assert "ROLLBACK TO SAVEPOINT" in sql
-    assert "payload->>'user_id'" in sql
+    assert '"user_id"' in sql
     assert db.bm25_enabled is False
     assert db.metrics["gaussdb_fallback_count"] == 1
     mock_conn.commit.assert_called()
@@ -502,6 +555,7 @@ def test_insert_uses_merge_into_and_vector_cast():
     assert "%s::FLOATVECTOR" in sql
     assert merge_args[1] == "[0.1,0.2,0.3]"
     assert merge_args[3] == "hello"
+    assert merge_args[6] == "u1"
 
 
 def test_insert_many_rows_uses_single_merge_statement():
@@ -524,7 +578,7 @@ def test_insert_many_rows_uses_single_merge_statement():
     calls = mock_cursor.execute.call_args_list
     assert len(calls) == 1
     assert "MERGE INTO" in str(calls[0].args[0])
-    assert len(calls[0].args[1]) == 18
+    assert len(calls[0].args[1]) == 27
 
 
 def test_insert_raises_on_mismatched_lengths():
@@ -560,7 +614,7 @@ def test_insert_none_payloads_and_ids_use_defaults():
 # ============================================================
 
 
-def test_search_uses_cosine_operator_and_normalized_score():
+def test_search_uses_cosine_operator_and_raw_distance_score():
     db, _, _, mock_cursor = make_gaussdb()
     mock_cursor.fetchall.return_value = [("id1", 0.25, {"data": "hello", "user_id": "u1"})]
 
@@ -568,10 +622,198 @@ def test_search_uses_cosine_operator_and_normalized_score():
 
     sql = executed_sql(mock_cursor)
     assert "vector <+> %s::FLOATVECTOR AS distance" in sql
-    assert "payload->>'user_id' = %s" in sql
+    assert '"user_id" = %s' in sql
     assert results[0].id == "id1"
-    assert results[0].score == pytest.approx(0.8)
+    assert results[0].score == pytest.approx(0.25)
     assert results[0].payload["data"] == "hello"
+
+
+def test_search_typed_bool_filter_uses_jsonb_containment():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = [("id1", 0.1, {"data": "hello", "flag": True, "user_id": "u1"})]
+
+    results = db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": True})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "payload @> %s::JSONB" in sql
+    assert '"user_id" = %s' in sql
+    assert params[1] == "u1"
+    assert params[2] == '{"flag":true}'
+    assert results[0].id == "id1"
+
+
+def test_search_wildcard_filter_is_skipped_not_literal_match():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "category": "*"})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "category" not in sql
+    assert params == ("[0.1,0.2,0.3]", "u1", 5)
+
+
+def test_search_all_wildcard_metadata_filters_do_not_leave_dangling_and():
+    db, _, _, mock_cursor = make_gaussdb(require_scoped_filters=False)
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"category": "*", "tag": "*"})
+
+    sql = executed_sql(mock_cursor)
+    assert "WHERE" not in sql or "WHERE  ORDER" not in sql
+    assert "AND  ORDER" not in sql
+    assert "category" not in sql
+    assert "tag" not in sql
+
+
+def test_search_eq_null_uses_jsonb_null_containment():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "deleted_at": None})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "payload @> %s::JSONB" in sql
+    assert params[2] == '{"deleted_at":null}'
+
+
+def test_search_ne_bool_uses_typed_jsonb_negation():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"ne": True}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "(payload @> %s::JSONB) IS NOT TRUE" in sql
+    assert params[2] == '{"flag":true}'
+
+
+def test_search_exists_filter_uses_jsonb_key_presence():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": True}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "payload ? %s" in sql
+    assert params[2] == "flag"
+
+
+def test_search_missing_filter_uses_jsonb_key_absence():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"missing": True}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "(payload ? %s) IS NOT TRUE" in sql
+    assert params[2] == "flag"
+
+
+def test_search_exists_false_aliases_to_missing():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": False}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "(payload ? %s) IS NOT TRUE" in sql
+    assert params[2] == "flag"
+
+
+def test_search_presence_filter_rejects_non_boolean_flag():
+    db, _, _, _ = make_gaussdb()
+
+    with pytest.raises(ValueError, match="must be a boolean"):
+        db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": "yes"}})
+
+
+def test_search_presence_filter_requires_single_operator():
+    db, _, _, _ = make_gaussdb()
+
+    with pytest.raises(ValueError, match="exactly one"):
+        db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": True, "missing": True}})
+
+
+def test_search_not_uses_is_not_true_semantics():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "$not": [{"category": "food"}]})
+
+    sql = executed_sql(mock_cursor)
+    assert "((payload @> %s::JSONB) IS NOT TRUE)" in sql
+
+
+def test_search_range_on_undeclared_field_warns_and_falls_back_to_literal_match(caplog):
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "priority": {"gte": 3}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "payload @> %s::JSONB" in sql
+    assert params[2] == '{"priority":{"gte":3}}'
+    assert "falling back to literal compatibility matching" in caplog.text
+
+
+def test_search_declared_numeric_range_uses_typed_numeric_cast():
+    db, _, _, mock_cursor = make_gaussdb()
+    db.metadata_schema = {"priority": "number"}
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "priority": {"gte": 3, "lt": 7}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "CASE WHEN jsonb_typeof(payload->'priority') = 'number'" in sql
+    assert "THEN CAST(payload->>'priority' AS DOUBLE PRECISION) END >= %s" in sql
+    assert "THEN CAST(payload->>'priority' AS DOUBLE PRECISION) END < %s" in sql
+    assert params[1] == "u1"
+    assert params[2] == 3
+    assert params[3] == 7
+
+
+def test_list_declared_datetime_range_uses_timestamptz_cast_and_guard():
+    db, _, _, mock_cursor = make_gaussdb()
+    db.require_scoped_filters = False
+    db.metadata_schema = {"created_at": "datetime"}
+    mock_cursor.fetchall.return_value = []
+
+    db.list(filters={"created_at": {"lt": "2026-01-01T00:00:00Z"}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "CASE WHEN jsonb_typeof(payload->'created_at') = 'string'" in sql
+    assert "payload->>'created_at' ~ %s" in sql
+    assert "THEN CAST(payload->>'created_at' AS TIMESTAMPTZ) END < %s" in sql
+    assert params[0].startswith("^\\d{4}-\\d{2}-\\d{2}T")
+    assert params[1] == "2026-01-01T00:00:00Z"
+    assert params[2] == 100
+
+
+def test_range_on_non_range_declared_type_warns_and_falls_back(caplog):
+    db, _, _, mock_cursor = make_gaussdb()
+    db.metadata_schema = {"category": "string"}
+    mock_cursor.fetchall.return_value = []
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "category": {"gte": "a"}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "payload @> %s::JSONB" in sql
+    assert params[2] == '{"category":{"gte":"a"}}'
+    assert "falling back to literal compatibility matching" in caplog.text
 
 
 def test_search_requires_scoped_filters_by_default():
@@ -591,6 +833,41 @@ def test_constructor_can_disable_scoped_filters_with_warning(caplog):
     assert db.search("hello", [0.1, 0.2, 0.3], filters={"category": "test"}) == []
 
 
+def test_constructor_warns_when_server_encoding_is_not_utf8(caplog):
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
+    db, _, mock_conn, _ = make_gaussdb()
+    mock_conn.get_parameter_status.return_value = "SQL_ASCII"
+
+    db._warn_if_server_encoding_is_not_utf8()
+
+    assert "designed and validated for UTF8 databases" in caplog.text
+    assert "server_encoding=SQL_ASCII" in caplog.text
+
+
+def test_constructor_does_not_warn_when_server_encoding_is_utf8(caplog):
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
+    db, _, mock_conn, _ = make_gaussdb()
+    mock_conn.get_parameter_status.return_value = "UTF8"
+
+    db._warn_if_server_encoding_is_not_utf8()
+
+    assert "server_encoding" not in caplog.text
+
+
+def test_constructor_accepts_metadata_schema():
+    db, _, _, _ = make_gaussdb(metadata_schema={"priority": "number", "created_at": "datetime"})
+
+    assert db.metadata_schema == {"priority": "number", "created_at": "datetime"}
+
+
+def test_constructor_accepts_custom_schema_and_uses_qualified_names():
+    db, _, _, _ = make_gaussdb(schema="mem0_app")
+
+    assert db.schema == "mem0_app"
+    assert db.table_name == '"mem0_app"."test_collection"'
+    assert db.schema_meta_table_name == '"mem0_app"."test_collection_schema_meta"'
+
+
 @pytest.mark.parametrize(
     "filters",
     [
@@ -599,6 +876,9 @@ def test_constructor_can_disable_scoped_filters_with_warning(caplog):
         {"NOT": [{"user_id": "alice"}]},
         {"user_id": {"ne": "alice"}},
         {"user_id": {"nin": ["alice"]}},
+        {"user_id": "*"},
+        {"user_id": {"exists": True}},
+        {"user_id": {"missing": True}},
     ],
 )
 def test_search_rejects_non_constraining_scope_filters(filters):
@@ -637,6 +917,21 @@ def test_filter_builder_rejects_unsafe_keys():
         db.list(filters={"bad-key": "x"})
 
 
+def test_list_uses_scope_columns_and_typed_bool_filters():
+    db, _, _, mock_cursor = make_gaussdb()
+    db.require_scoped_filters = False
+    mock_cursor.fetchall.return_value = []
+
+    db.list(filters={"user_id": "u1", "flag": True})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert '"user_id" = %s' in sql
+    assert "payload @> %s::JSONB" in sql
+    assert params[0] == "u1"
+    assert params[1] == '{"flag":true}'
+
+
 # ============================================================
 # Keyword search tests
 # ============================================================
@@ -655,6 +950,21 @@ def test_keyword_search_uses_bm25_defaults_and_filters():
     assert "text_lemmatized ### %s AS score" in sql
     assert "ORDER BY score DESC" in sql
     assert results[0].score == 2.5
+
+
+def test_keyword_search_uses_scope_columns_and_typed_exact_filters():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.keyword_search("hello", top_k=3, filters={"user_id": "u1", "flag": True})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert '"user_id" = %s' in sql
+    assert "payload @> %s::JSONB" in sql
+    assert "hello" in params
+    assert "u1" in params
+    assert '{"flag":true}' in params
 
 
 def test_keyword_search_empty_query_returns_empty_list():
@@ -714,6 +1024,24 @@ def test_search_batch_returns_one_result_list_per_query():
     sql = executed_sql(mock_cursor)
     assert "ROW_NUMBER() OVER" in sql
     assert "PARTITION BY q.query_index" in sql
+
+
+def test_search_batch_uses_scope_columns_and_typed_exact_filters():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.search_batch(
+        queries=["hello"],
+        vectors_list=[[0.1, 0.2, 0.3]],
+        filters={"user_id": "u1", "flag": True},
+    )
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert '"user_id" = %s' in sql
+    assert "payload @> %s::JSONB" in sql
+    assert params[1] == "u1"
+    assert params[2] == '{"flag":true}'
 
 
 def test_search_batch_falls_back_to_sequential_on_failure():
@@ -847,7 +1175,7 @@ def test_icontains_filter_escapes_backslash():
 
 
 @pytest.mark.parametrize("op", ["gt", "gte", "lt", "lte"])
-def test_range_filter_operator_dict_is_treated_as_literal_value(op, caplog):
+def test_range_filter_operator_dict_warns_and_falls_back_without_declared_type(op, caplog):
     db, _, _, mock_cursor = make_gaussdb()
     db.require_scoped_filters = False
     mock_cursor.fetchall.return_value = []
@@ -857,13 +1185,9 @@ def test_range_filter_operator_dict_is_treated_as_literal_value(op, caplog):
 
     sql = executed_sql(mock_cursor)
     params = mock_cursor.execute.call_args.args[1]
-    assert f"payload->>'priority' = %s" in sql
-    assert "payload->>'priority' > %s" not in sql
-    assert "payload->>'priority' >= %s" not in sql
-    assert "payload->>'priority' < %s" not in sql
-    assert "payload->>'priority' <= %s" not in sql
-    assert params == (str({op: 2}), 100)
-    assert "range filter operators" in caplog.text
+    assert "payload @> %s::JSONB" in sql
+    assert params[0] == json.dumps({"priority": {op: 2}}, ensure_ascii=False, separators=(",", ":"))
+    assert "falling back to literal compatibility matching" in caplog.text
 
 
 # ============================================================

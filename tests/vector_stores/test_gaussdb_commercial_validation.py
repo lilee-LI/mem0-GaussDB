@@ -160,7 +160,7 @@ def test_commercial_centralized_crud_scope_and_batch_paths():
         assert db.get(bob_only) is None
 
 
-def test_commercial_centralized_filter_matrix_and_unsupported_range(caplog):
+def test_commercial_centralized_filter_matrix_and_undeclared_range_compatibility(caplog):
     with _managed_db(prefix="commercial_filter") as db:
         travel_id = _uuid(9201)
         food_id = _uuid(9202)
@@ -251,7 +251,267 @@ def test_commercial_centralized_filter_matrix_and_unsupported_range(caplog):
                 filters={"user_id": "commercial_filter", "priority": {"gte": 5}},
             )
         _assert_exact_ids(rows, set())
-        assert "range filter operators" in caplog.text
+        assert "falling back to literal compatibility matching" in caplog.text
+
+
+def test_commercial_centralized_typed_exact_bool_and_null_filters():
+    with _managed_db(prefix="commercial_typed_exact") as db:
+        true_id = _uuid(9251)
+        false_id = _uuid(9252)
+        null_id = _uuid(9253)
+
+        _insert_memories(
+            db,
+            [
+                (
+                    true_id,
+                    VECTOR_COFFEE,
+                    {
+                        "data": "bool true record",
+                        "text_lemmatized": "bool true record",
+                        "user_id": "commercial_typed",
+                        "flag": True,
+                        "deleted_at": "2026-01-01T00:00:00Z",
+                    },
+                ),
+                (
+                    false_id,
+                    VECTOR_WINDOW,
+                    {
+                        "data": "bool false record",
+                        "text_lemmatized": "bool false record",
+                        "user_id": "commercial_typed",
+                        "flag": False,
+                        "deleted_at": "2026-02-01T00:00:00Z",
+                    },
+                ),
+                (
+                    null_id,
+                    VECTOR_AISLE,
+                    {
+                        "data": "null record",
+                        "text_lemmatized": "null record",
+                        "user_id": "commercial_typed",
+                        "flag": True,
+                        "deleted_at": None,
+                    },
+                ),
+            ],
+        )
+
+        _assert_exact_ids(
+            db.search("typed", VECTOR_COFFEE, top_k=10, filters={"user_id": "commercial_typed", "flag": True}),
+            {true_id, null_id},
+        )
+        _assert_exact_ids(
+            db.search("typed", VECTOR_COFFEE, top_k=10, filters={"user_id": "commercial_typed", "flag": {"ne": True}}),
+            {false_id},
+        )
+        _assert_exact_ids(
+            db.search("typed", VECTOR_COFFEE, top_k=10, filters={"user_id": "commercial_typed", "deleted_at": None}),
+            {null_id},
+        )
+
+
+def test_commercial_centralized_wildcard_exists_missing_and_null_distinction():
+    with _managed_db(prefix="commercial_presence") as db:
+        value_id = _uuid(9254)
+        null_id = _uuid(9255)
+        missing_id = _uuid(9256)
+
+        _insert_memories(
+            db,
+            [
+                (
+                    value_id,
+                    VECTOR_COFFEE,
+                    {
+                        "data": "presence value record",
+                        "text_lemmatized": "presence value record",
+                        "user_id": "commercial_presence",
+                        "category": "food",
+                        "optional": "set",
+                    },
+                ),
+                (
+                    null_id,
+                    VECTOR_WINDOW,
+                    {
+                        "data": "presence null record",
+                        "text_lemmatized": "presence null record",
+                        "user_id": "commercial_presence",
+                        "category": "travel",
+                        "optional": None,
+                    },
+                ),
+                (
+                    missing_id,
+                    VECTOR_AISLE,
+                    {
+                        "data": "presence missing record",
+                        "text_lemmatized": "presence missing record",
+                        "user_id": "commercial_presence",
+                        "category": "books",
+                    },
+                ),
+            ],
+        )
+
+        _assert_exact_ids(
+            db.search("presence", VECTOR_COFFEE, top_k=10, filters={"user_id": "commercial_presence", "optional": {"exists": True}}),
+            {value_id, null_id},
+        )
+        _assert_exact_ids(
+            db.search("presence", VECTOR_COFFEE, top_k=10, filters={"user_id": "commercial_presence", "optional": {"missing": True}}),
+            {missing_id},
+        )
+        _assert_exact_ids(
+            db.search("presence", VECTOR_COFFEE, top_k=10, filters={"user_id": "commercial_presence", "optional": None}),
+            {null_id},
+        )
+        _assert_exact_ids(
+            db.search("presence", VECTOR_COFFEE, top_k=10, filters={"user_id": "commercial_presence", "category": "*"}),
+            {value_id, null_id, missing_id},
+        )
+
+
+def test_commercial_centralized_declared_numeric_range_and_undeclared_compatibility(caplog):
+    with _managed_db(
+        prefix="commercial_range",
+        metadata_schema={"priority": "number"},
+    ) as db:
+        low_id = _uuid(9261)
+        mid_id = _uuid(9262)
+        high_id = _uuid(9263)
+        dirty_id = _uuid(9267)
+
+        _insert_memories(
+            db,
+            [
+                (
+                    low_id,
+                    VECTOR_COFFEE,
+                    {
+                        "data": "priority low",
+                        "text_lemmatized": "priority low",
+                        "user_id": "commercial_range",
+                        "priority": 2,
+                    },
+                ),
+                (
+                    mid_id,
+                    VECTOR_WINDOW,
+                    {
+                        "data": "priority mid",
+                        "text_lemmatized": "priority mid",
+                        "user_id": "commercial_range",
+                        "priority": 5,
+                    },
+                ),
+                (
+                    high_id,
+                    VECTOR_FLIGHT,
+                    {
+                        "data": "priority high",
+                        "text_lemmatized": "priority high",
+                        "user_id": "commercial_range",
+                        "priority": 9,
+                    },
+                ),
+                (
+                    dirty_id,
+                    VECTOR_AISLE,
+                    {
+                        "data": "priority dirty",
+                        "text_lemmatized": "priority dirty",
+                        "user_id": "commercial_range",
+                        "priority": "abc",
+                    },
+                ),
+            ],
+        )
+
+        _assert_exact_ids(
+            db.search("range", VECTOR_COFFEE, top_k=10, filters={"user_id": "commercial_range", "priority": {"gte": 3, "lt": 9}}),
+            {mid_id},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            rows = db.search("range", VECTOR_COFFEE, top_k=10, filters={"user_id": "commercial_range", "category": {"gte": "a"}})
+        _assert_exact_ids(rows, set())
+        assert "falling back to literal compatibility matching" in caplog.text
+
+
+def test_commercial_centralized_cross_path_typed_filter_parity():
+    with _managed_db(
+        prefix="commercial_parity",
+        metadata_schema={"priority": "number"},
+    ) as db:
+        primary_id = _uuid(9264)
+        secondary_id = _uuid(9265)
+        archived_id = _uuid(9266)
+
+        _insert_memories(
+            db,
+            [
+                (
+                    primary_id,
+                    VECTOR_COFFEE,
+                    {
+                        "data": "latte parity record",
+                        "text_lemmatized": "latte parity record",
+                        "user_id": "commercial_parity",
+                        "flag": True,
+                        "priority": 5,
+                    },
+                ),
+                (
+                    secondary_id,
+                    VECTOR_AISLE,
+                    {
+                        "data": "backup parity record",
+                        "text_lemmatized": "backup parity record",
+                        "user_id": "commercial_parity",
+                        "flag": True,
+                        "priority": 2,
+                    },
+                ),
+                (
+                    archived_id,
+                    VECTOR_WINDOW,
+                    {
+                        "data": "archived parity record",
+                        "text_lemmatized": "archived parity record",
+                        "user_id": "commercial_parity",
+                        "flag": False,
+                        "priority": 8,
+                    },
+                ),
+            ],
+        )
+
+        _assert_exact_ids(
+            _list_flat(db, filters={"user_id": "commercial_parity", "flag": True}, top_k=10),
+            {primary_id, secondary_id},
+        )
+        _assert_exact_ids(
+            _list_flat(db, filters={"user_id": "commercial_parity", "priority": {"gte": 3}}, top_k=10),
+            {primary_id, archived_id},
+        )
+
+        batch_rows = db.search_batch(
+            ["parity", "backup"],
+            [VECTOR_COFFEE, VECTOR_AISLE],
+            top_k=10,
+            filters={"user_id": "commercial_parity", "flag": True},
+        )
+        assert [set(_ids(rows)) for rows in batch_rows] == [{primary_id, secondary_id}, {primary_id, secondary_id}]
+
+        if db.bm25_enabled:
+            _assert_exact_ids(
+                db.keyword_search("latte", top_k=10, filters={"user_id": "commercial_parity", "flag": True}),
+                {primary_id},
+            )
 
 
 def test_commercial_centralized_vector_order_and_topk():
@@ -482,15 +742,17 @@ def test_commercial_distributed_collection_lifecycle():
 
 @pytest.mark.skipif(not _env_bool("GAUSSDB_TEST_DISTRIBUTED"), reason="Set GAUSSDB_TEST_DISTRIBUTED=true to run distributed commercial validation")
 def test_commercial_distributed_filter_and_range_semantics(caplog):
-    db = _new_dist_db()
+    db = _new_dist_db(metadata_schema={"priority": "number"})
     try:
         low_id = _uuid(9701)
         high_id = _uuid(9702)
+        missing_id = _uuid(9703)
         _insert_memories(
             db,
             [
-                (low_id, [1.0, 0.0, 0.0, 0.0], {"data": "food", "user_id": "dist_filter", "category": "food", "priority": "3"}),
-                (high_id, [0.0, 1.0, 0.0, 0.0], {"data": "travel", "user_id": "dist_filter", "category": "travel", "priority": "8"}),
+                (low_id, [1.0, 0.0, 0.0, 0.0], {"data": "food", "user_id": "dist_filter", "category": "food", "priority": 3, "optional": None}),
+                (high_id, [0.0, 1.0, 0.0, 0.0], {"data": "travel", "user_id": "dist_filter", "category": "travel", "priority": 8, "optional": "set"}),
+                (missing_id, [0.0, 0.0, 1.0, 0.0], {"data": "books", "user_id": "dist_filter", "category": "books"}),
             ],
         )
 
@@ -498,16 +760,27 @@ def test_commercial_distributed_filter_and_range_semantics(caplog):
             db.search("distributed", [1.0, 0.0, 0.0, 0.0], top_k=10, filters={"user_id": "dist_filter", "category": {"in": ["food", "travel"]}}),
             {low_id, high_id},
         )
+        _assert_exact_ids(
+            db.search("distributed", [1.0, 0.0, 0.0, 0.0], top_k=10, filters={"user_id": "dist_filter", "priority": {"gt": 5}}),
+            {high_id},
+        )
+        _assert_exact_ids(
+            db.search("distributed", [1.0, 0.0, 0.0, 0.0], top_k=10, filters={"user_id": "dist_filter", "optional": {"exists": True}}),
+            {low_id, high_id},
+        )
+        _assert_exact_ids(
+            db.search("distributed", [1.0, 0.0, 0.0, 0.0], top_k=10, filters={"user_id": "dist_filter", "optional": {"missing": True}}),
+            {missing_id},
+        )
+        _assert_exact_ids(
+            db.search("distributed", [1.0, 0.0, 0.0, 0.0], top_k=10, filters={"user_id": "dist_filter", "category": "*"}),
+            {low_id, high_id, missing_id},
+        )
 
         with caplog.at_level(logging.WARNING):
-            rows = db.search(
-                "distributed",
-                [1.0, 0.0, 0.0, 0.0],
-                top_k=10,
-                filters={"user_id": "dist_filter", "priority": {"gt": "5"}},
-            )
+            rows = db.search("distributed", [1.0, 0.0, 0.0, 0.0], top_k=10, filters={"user_id": "dist_filter", "score": {"gt": 5}})
         _assert_exact_ids(rows, set())
-        assert "range filter operators" in caplog.text
+        assert "falling back to literal compatibility matching" in caplog.text
     finally:
         db.delete_col()
 
