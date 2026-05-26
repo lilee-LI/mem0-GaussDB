@@ -1167,8 +1167,6 @@ class GaussDB(VectorStoreBase):
                     "Use AND to combine them as separate conditions."
                 )
             return self._build_range_filter(key, value)
-        if ops & {"exists", "not_exists", "missing"}:
-            return self._build_presence_filter(key, value)
         if "eq" in value:
             return self._build_field_filter(key, value["eq"])
         if "ne" in value:
@@ -1232,26 +1230,6 @@ class GaussDB(VectorStoreBase):
         payload = json.dumps({key: value}, ensure_ascii=False, separators=(",", ":"))
         expression = "(payload @> %s::JSONB) IS NOT TRUE" if negate else "payload @> %s::JSONB"
         return expression, [payload]
-
-    def _build_presence_filter(self, key: str, value: dict) -> Tuple[str, List[Any]]:
-        self._validate_filter_key(key)
-        if len(value) != 1:
-            raise ValueError(
-                f"Presence filter for field {key!r} must specify exactly one of exists/not_exists/missing."
-            )
-        operator, raw_flag = next(iter(value.items()))
-        if not isinstance(raw_flag, bool):
-            raise ValueError(f"Presence filter {operator!r} for field {key!r} must be a boolean.")
-
-        if operator == "exists":
-            exists = raw_flag
-        elif operator in {"not_exists", "missing"}:
-            exists = not raw_flag
-        else:
-            raise ValueError(f"Unsupported presence filter operator for field {key!r}: {operator!r}")
-
-        expression = "payload ? %s" if exists else "(payload ? %s) IS NOT TRUE"
-        return expression, [key]
 
     def _build_range_filter(self, key: str, value: dict) -> Tuple[str, List[Any]]:
         field_type = self._resolve_range_field_type(key, value)

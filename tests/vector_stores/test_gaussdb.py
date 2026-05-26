@@ -697,54 +697,11 @@ def test_search_ne_bool_uses_typed_jsonb_negation():
     assert params[2] == '{"flag":true}'
 
 
-def test_search_exists_filter_uses_jsonb_key_presence():
-    db, _, _, mock_cursor = make_gaussdb()
-    mock_cursor.fetchall.return_value = []
-
-    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": True}})
-
-    sql = executed_sql(mock_cursor)
-    params = mock_cursor.execute.call_args.args[1]
-    assert "payload ? %s" in sql
-    assert params[2] == "flag"
-
-
-def test_search_missing_filter_uses_jsonb_key_absence():
-    db, _, _, mock_cursor = make_gaussdb()
-    mock_cursor.fetchall.return_value = []
-
-    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"missing": True}})
-
-    sql = executed_sql(mock_cursor)
-    params = mock_cursor.execute.call_args.args[1]
-    assert "(payload ? %s) IS NOT TRUE" in sql
-    assert params[2] == "flag"
-
-
-def test_search_exists_false_aliases_to_missing():
-    db, _, _, mock_cursor = make_gaussdb()
-    mock_cursor.fetchall.return_value = []
-
-    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": False}})
-
-    sql = executed_sql(mock_cursor)
-    params = mock_cursor.execute.call_args.args[1]
-    assert "(payload ? %s) IS NOT TRUE" in sql
-    assert params[2] == "flag"
-
-
-def test_search_presence_filter_rejects_non_boolean_flag():
+def test_search_rejects_provider_specific_presence_filters():
     db, _, _, _ = make_gaussdb()
 
-    with pytest.raises(ValueError, match="must be a boolean"):
-        db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": "yes"}})
-
-
-def test_search_presence_filter_requires_single_operator():
-    db, _, _, _ = make_gaussdb()
-
-    with pytest.raises(ValueError, match="exactly one"):
-        db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": True, "missing": True}})
+    with pytest.raises(ValueError, match="Unsupported filter operator"):
+        db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": True}})
 
 
 def test_search_not_uses_is_not_true_semantics():
@@ -928,8 +885,6 @@ def test_constructor_accepts_custom_schema_and_uses_qualified_names():
         {"user_id": {"ne": "alice"}},
         {"user_id": {"nin": ["alice"]}},
         {"user_id": "*"},
-        {"user_id": {"exists": True}},
-        {"user_id": {"missing": True}},
     ],
 )
 def test_search_accepts_various_scope_filter_shapes(filters):
@@ -1912,13 +1867,6 @@ def test_build_filter_expression_and_field_helpers_cover_error_and_edge_paths():
     assert expr == "payload->>%s"
     assert params == ["category"]
 
-    with pytest.raises(ValueError):
-        db._build_presence_filter("category", {"exists": True, "missing": False})
-    with pytest.raises(ValueError):
-        db._build_presence_filter("category", {"exists": "yes"})
-    with pytest.raises(ValueError):
-        db._build_presence_filter("category", {"unknown": True})
-
     expr, params = db._build_range_filter("created_at", {})
     assert expr == "payload @> %s::JSONB"
     assert params == ['{"created_at":{}}']
@@ -2215,28 +2163,25 @@ def test_scope_in_and_nin_with_none_expand_to_null_aware_sql():
     assert params == []
 
 
-def test_scope_ne_uses_logical_negation_for_non_null_values():
+def test_scope_ne_uses_not_equal_for_non_null_values():
     db, *_ = make_gaussdb()
 
     expr, params = db._build_filter_expression({"user_id": {"ne": "u1"}})
     assert expr == '("user_id" = %s) IS NOT TRUE'
     assert params == ["u1"]
 
+    # $not still uses IS NOT TRUE (includes NULL rows)
     expr, params = db._build_filter_expression({"$not": [{"user_id": "u1"}]})
     assert expr == '(("user_id" = %s) IS NOT TRUE)'
     assert params == ["u1"]
 
 
-def test_scope_not_null_filter_differs_from_exists_true():
+def test_scope_not_null_filter_uses_column_semantics():
     db, *_ = make_gaussdb()
 
     expr, params = db._build_filter_expression({"user_id": {"ne": None}})
     assert expr == '"user_id" IS NOT NULL'
     assert params == []
-
-    expr, params = db._build_filter_expression({"user_id": {"exists": True}})
-    assert expr == "payload ? %s"
-    assert params == ["user_id"]
 
 
 # ══════════════════════════════════════════════════════════

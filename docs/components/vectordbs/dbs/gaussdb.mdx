@@ -261,23 +261,21 @@ In practice this means range filters can work directly for fields such as:
 
 If a range filter uses a field or value shape that cannot be inferred as JSON `number` or standard datetime, the provider stops treating `gt/gte/lt/lte` as typed range semantics for that field shape and falls back to literal JSON equality behavior.
 
-## Wildcard, exists, missing, null
+## Wildcard and null
 
-The provider supports explicit metadata semantics for:
+The provider follows Mem0's shared metadata filter DSL for wildcard and null values:
 
 - wildcard `*`
-- `exists`
-- `missing`
 - `null`
 
 Examples:
 
 ```python
 {"category": "*"}
-{"optional": {"exists": True}}
-{"optional": {"missing": True}}
 {"optional": None}
 ```
+
+Provider-specific key-presence operators such as `exists`, `missing`, and `not_exists` are intentionally not exposed. Unsupported operators raise `ValueError`, matching Qdrant's enhanced filter behavior instead of silently falling back to PGVector-style string equality.
 
 ## Score semantics
 
