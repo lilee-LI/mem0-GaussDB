@@ -63,6 +63,13 @@ class OutputData(BaseModel):
 
 
 @dataclass
+class _FilterBuildResult:
+    expression: str
+    params: List[Any]
+    degraded: bool = False
+
+
+@dataclass
 class CapabilityReport:
     baseline: str
     vector_enabled: bool = False
@@ -1101,16 +1108,21 @@ class GaussDB(VectorStoreBase):
     def _build_where_clause(self, filters: Optional[dict]) -> Tuple[str, List[Any]]:
         if not filters:
             return "", []
-        expression, params = self._build_filter_expression(filters)
-        if not expression:
+        result = self._build_filter_expression_result(filters)
+        if not result.expression:
             return "", []
-        return f"WHERE {expression}", params
+        return f"WHERE {result.expression}", result.params
 
     def _build_filter_expression(self, filters: dict) -> Tuple[str, List[Any]]:
+        result = self._build_filter_expression_result(filters)
+        return result.expression, result.params
+
+    def _build_filter_expression_result(self, filters: dict) -> _FilterBuildResult:
         if not isinstance(filters, dict):
             raise ValueError("filters must be a dictionary")
         expressions = []
         params: List[Any] = []
+        degraded = False
         for key, value in filters.items():
             normalized_key = {"$and": "AND", "$or": "OR", "$not": "NOT"}.get(key, key)
             if normalized_key in {"AND", "OR"}:
@@ -1118,10 +1130,11 @@ class GaussDB(VectorStoreBase):
                     raise ValueError(f"{normalized_key} filter value must be a list")
                 sub_expressions = []
                 for item in value:
-                    expr, sub_params = self._build_filter_expression(item)
-                    if expr:
-                        sub_expressions.append(f"({expr})")
-                        params.extend(sub_params)
+                    result = self._build_filter_expression_result(item)
+                    if result.expression:
+                        sub_expressions.append(f"({result.expression})")
+                        params.extend(result.params)
+                        degraded = degraded or result.degraded
                 if sub_expressions:
                     joiner = " AND " if normalized_key == "AND" else " OR "
                     expressions.append(f"({joiner.join(sub_expressions)})")
@@ -1129,21 +1142,30 @@ class GaussDB(VectorStoreBase):
                 if not isinstance(value, list):
                     raise ValueError("NOT filter value must be a list")
                 for item in value:
-                    expr, sub_params = self._build_filter_expression(item)
-                    if expr:
-                        expressions.append(f"(({expr}) IS NOT TRUE)")
-                        params.extend(sub_params)
+                    result = self._build_filter_expression_result(item)
+                    if result.expression:
+                        if result.degraded:
+                            logger.warning(
+                                "Degraded filter expression inside NOT subtree; forcing this NOT branch to match no rows."
+                            )
+                            expressions.append("1 = 0")
+                            degraded = True
+                        else:
+                            expressions.append(f"(({result.expression}) IS NOT TRUE)")
+                            params.extend(result.params)
             else:
                 ops_map = self._normalize_field_value(value)
-                expr, sub_params = self._build_field_clauses(normalized_key, value, ops_map)
-                if expr:
-                    expressions.append(expr)
-                    params.extend(sub_params)
-        return " AND ".join(expressions), params
+                result = self._build_field_clauses(normalized_key, value, ops_map)
+                if result.expression:
+                    expressions.append(result.expression)
+                    params.extend(result.params)
+                    degraded = degraded or result.degraded
+        return _FilterBuildResult(expression=" AND ".join(expressions), params=params, degraded=degraded)
 
     def _build_field_filter(self, key: str, value: Any) -> Tuple[str, List[Any]]:
         ops_map = self._normalize_field_value(value)
-        return self._build_field_clauses(key, value, ops_map)
+        result = self._build_field_clauses(key, value, ops_map)
+        return result.expression, result.params
 
     def _normalize_field_value(self, value: Any) -> Dict[str, Any]:
         if isinstance(value, dict):
@@ -1154,10 +1176,10 @@ class GaussDB(VectorStoreBase):
             return {"in": value}
         return {"eq": value}
 
-    def _build_field_clauses(self, key: str, original_value: Any, ops_map: Dict[str, Any]) -> Tuple[str, List[Any]]:
+    def _build_field_clauses(self, key: str, original_value: Any, ops_map: Dict[str, Any]) -> _FilterBuildResult:
         self._validate_filter_key(key)
         if ops_map.get("wildcard") is True and len(ops_map) == 1:
-            return "", []
+            return _FilterBuildResult(expression="", params=[])
 
         ops = set(ops_map.keys())
         range_ops = {"gt", "gte", "lt", "lte"}
@@ -1169,106 +1191,109 @@ class GaussDB(VectorStoreBase):
                 sorted(unsupported_ops),
                 key,
             )
-            return self._field_exact_expression(key, original_value, negate=False)
+            expr, params = self._field_exact_expression(key, original_value, negate=False)
+            return _FilterBuildResult(expression=expr, params=params, degraded=True)
 
+        clauses: List[str] = []
+        params: List[Any] = []
         active_range_ops = ops & range_ops
-        active_non_range_ops = ops - range_ops
-        if active_range_ops and active_non_range_ops:
+        if active_range_ops:
+            range_value = {op: ops_map[op] for op in ("gt", "gte", "lt", "lte") if op in ops_map}
+            range_result = self._build_range_filter_result(key, range_value, fallback_value=original_value)
+            if range_result.degraded:
+                return range_result
+            clauses.append(range_result.expression)
+            params.extend(range_result.params)
+
+        for op_name in ("eq", "ne", "in", "nin", "contains", "icontains"):
+            if op_name not in ops_map:
+                continue
+            clause_result = self._build_single_operator_clause(key, op_name, ops_map[op_name], original_value)
+            if clause_result.degraded:
+                return clause_result
+            clauses.append(clause_result.expression)
+            params.extend(clause_result.params)
+
+        if not clauses:
             logger.warning(
-                "Mixed range and non-range operators %s for field %r; degrading to exact equality semantics.",
+                "Unrecognized normalized filter state %s for field %r; degrading to exact equality semantics.",
                 sorted(ops),
                 key,
             )
-            return self._field_exact_expression(key, original_value, negate=False)
+            expr, degraded_params = self._field_exact_expression(key, original_value, negate=False)
+            return _FilterBuildResult(expression=expr, params=degraded_params, degraded=True)
 
-        if len(active_non_range_ops) > 1:
-            logger.warning(
-                "Multiple non-range operators %s for field %r; degrading to exact equality semantics.",
-                sorted(active_non_range_ops),
-                key,
-            )
-            return self._field_exact_expression(key, original_value, negate=False)
+        return _FilterBuildResult(expression=" AND ".join(clauses), params=params)
 
-        if active_range_ops:
-            range_value = {op: ops_map[op] for op in ("gt", "gte", "lt", "lte") if op in ops_map}
-            return self._build_range_filter(key, range_value)
-
-        if "eq" in ops_map:
-            value = ops_map["eq"]
+    def _build_single_operator_clause(
+        self, key: str, op_name: str, value: Any, original_value: Any
+    ) -> _FilterBuildResult:
+        if op_name == "eq":
             if isinstance(value, (list, tuple, dict)):
                 logger.warning(
                     "Non-scalar operand %r for 'eq' on field %r; degrading to exact equality semantics.",
                     value,
                     key,
                 )
-                return self._field_exact_expression(key, original_value, negate=False)
+                expr, params = self._field_exact_expression(key, original_value, negate=False)
+                return _FilterBuildResult(expression=expr, params=params, degraded=True)
             if key in self._redundant_scope_columns:
-                field_sql, params = self._field_sql(key)
+                field_sql, scope_params = self._field_sql(key)
                 if value is None:
-                    return f"{field_sql} IS NULL", params
-                return f"{field_sql} = %s", [*params, value]
-            return self._field_exact_expression(key, value, negate=False)
+                    return _FilterBuildResult(expression=f"{field_sql} IS NULL", params=scope_params)
+                return _FilterBuildResult(expression=f"{field_sql} = %s", params=[*scope_params, value])
+            expr, expr_params = self._field_exact_expression(key, value, negate=False)
+            return _FilterBuildResult(expression=expr, params=expr_params)
 
-        if "ne" in ops_map:
-            value = ops_map["ne"]
+        if op_name == "ne":
             if isinstance(value, (list, tuple, dict)):
                 logger.warning(
                     "Non-scalar operand %r for 'ne' on field %r; degrading to exact equality semantics.",
                     value,
                     key,
                 )
-                return self._field_exact_expression(key, original_value, negate=False)
+                expr, params = self._field_exact_expression(key, original_value, negate=False)
+                return _FilterBuildResult(expression=expr, params=params, degraded=True)
             if key in self._redundant_scope_columns:
-                field_sql, params = self._field_sql(key)
+                field_sql, scope_params = self._field_sql(key)
                 if value is None:
-                    return f"{field_sql} IS NOT NULL", params
-                return f"({field_sql} = %s) IS NOT TRUE", [*params, value]
-            return self._field_exact_expression(key, value, negate=True)
+                    return _FilterBuildResult(expression=f"{field_sql} IS NOT NULL", params=scope_params)
+                return _FilterBuildResult(expression=f"({field_sql} = %s) IS NOT TRUE", params=[*scope_params, value])
+            expr, expr_params = self._field_exact_expression(key, value, negate=True)
+            return _FilterBuildResult(expression=expr, params=expr_params)
 
-        if "in" in ops_map:
-            value = ops_map["in"]
+        if op_name in {"in", "nin"}:
             if not isinstance(value, (list, tuple)):
                 logger.warning(
-                    "Non-sequence operand %r for 'in' on field %r; degrading to exact equality semantics.",
+                    "Non-sequence operand %r for %r on field %r; degrading to exact equality semantics.",
                     value,
+                    op_name,
                     key,
                 )
-                return self._field_exact_expression(key, original_value, negate=False)
-            return self._field_in_expression(key, list(value), negate=False)
+                expr, params = self._field_exact_expression(key, original_value, negate=False)
+                return _FilterBuildResult(expression=expr, params=params, degraded=True)
+            expr, expr_params = self._field_in_expression(key, list(value), negate=(op_name == "nin"))
+            return _FilterBuildResult(expression=expr, params=expr_params)
 
-        if "nin" in ops_map:
-            value = ops_map["nin"]
-            if not isinstance(value, (list, tuple)):
-                logger.warning(
-                    "Non-sequence operand %r for 'nin' on field %r; degrading to exact equality semantics.",
-                    value,
-                    key,
-                )
-                return self._field_exact_expression(key, original_value, negate=False)
-            return self._field_in_expression(key, list(value), negate=True)
-
-        if "contains" in ops_map or "icontains" in ops_map:
-            op = "icontains" if "icontains" in ops_map else "contains"
-            value = ops_map[op]
+        if op_name in {"contains", "icontains"}:
             if not isinstance(value, str):
                 logger.warning(
                     "Non-string operand %r for %s on field %r; degrading to exact equality semantics.",
                     value,
-                    op,
+                    op_name,
                     key,
                 )
-                return self._field_exact_expression(key, original_value, negate=False)
+                expr, params = self._field_exact_expression(key, original_value, negate=False)
+                return _FilterBuildResult(expression=expr, params=params, degraded=True)
             escaped = self._escape_like(value)
             if key in self._redundant_scope_columns:
-                # Scope columns are VARCHAR — LIKE works directly
-                field_sql, params = self._field_sql(key)
-                if op == "icontains":
+                field_sql, scope_params = self._field_sql(key)
+                if op_name == "icontains":
                     expression = f"LOWER({field_sql}) LIKE LOWER(%s) ESCAPE '!'"
                 else:
                     expression = f"{field_sql} LIKE %s ESCAPE '!'"
-                return expression, [*params, f"%{escaped}%"]
-            # JSONB columns — guard with jsonb_typeof to only match string-typed values
-            if op == "icontains":
+                return _FilterBuildResult(expression=expression, params=[*scope_params, f"%{escaped}%"])
+            if op_name == "icontains":
                 expression = (
                     "jsonb_typeof(payload->%s) = 'string' "
                     "AND LOWER(payload->>%s) LIKE LOWER(%s) ESCAPE '!'"
@@ -1278,14 +1303,15 @@ class GaussDB(VectorStoreBase):
                     "jsonb_typeof(payload->%s) = 'string' "
                     "AND payload->>%s LIKE %s ESCAPE '!'"
                 )
-            return expression, [key, key, f"%{escaped}%"]
+            return _FilterBuildResult(expression=expression, params=[key, key, f"%{escaped}%"])
 
         logger.warning(
-            "Unrecognized normalized filter state %s for field %r; degrading to exact equality semantics.",
-            sorted(ops),
+            "Unrecognized operator %r on field %r; degrading to exact equality semantics.",
+            op_name,
             key,
         )
-        return self._field_exact_expression(key, original_value, negate=False)
+        expr, params = self._field_exact_expression(key, original_value, negate=False)
+        return _FilterBuildResult(expression=expr, params=params, degraded=True)
 
     def _field_in_expression(self, key: str, values: Iterable[Any], negate: bool) -> Tuple[str, List[Any]]:
         values = list(values)
@@ -1328,6 +1354,12 @@ class GaussDB(VectorStoreBase):
         return expression, [payload]
 
     def _build_range_filter(self, key: str, value: dict) -> Tuple[str, List[Any]]:
+        result = self._build_range_filter_result(key, value, fallback_value=value)
+        return result.expression, result.params
+
+    def _build_range_filter_result(
+        self, key: str, value: dict, fallback_value: Any
+    ) -> _FilterBuildResult:
         field_type = self._resolve_range_field_type(key, value)
         if field_type is None:
             logger.warning(
@@ -1336,7 +1368,8 @@ class GaussDB(VectorStoreBase):
                 "that do not implement typed range semantics for this field shape.",
                 key,
             )
-            return self._field_exact_expression(key, value, negate=False)
+            expr, params = self._field_exact_expression(key, fallback_value, negate=False)
+            return _FilterBuildResult(expression=expr, params=params, degraded=True)
 
         expressions = []
         params: List[Any] = []
@@ -1366,7 +1399,7 @@ class GaussDB(VectorStoreBase):
                     params.extend([key, key, _ISO_8601_TIMESTAMPTZ_PATTERN, key, value[op_name]])
         if not expressions:
             raise ValueError(f"Unsupported range filter for field {key!r}")
-        return " AND ".join(expressions), params
+        return _FilterBuildResult(expression=" AND ".join(expressions), params=params)
 
     def _resolve_range_field_type(self, key: str, value: dict) -> Optional[str]:
         range_values = [value[op] for op in ("gt", "gte", "lt", "lte") if op in value]

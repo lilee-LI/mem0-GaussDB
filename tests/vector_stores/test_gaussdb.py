@@ -751,18 +751,19 @@ def test_search_inferred_numeric_range_uses_typed_numeric_cast():
     assert params[5:8] == ("priority", "priority", 7)
 
 
-def test_search_degrades_mixed_range_and_non_range_operators_for_same_field(caplog):
+def test_search_supports_mixed_range_and_non_range_operators_for_same_field():
     db, _, _, mock_cursor = make_gaussdb()
     mock_cursor.fetchall.return_value = []
-    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
 
     db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "priority": {"gt": 3, "eq": 7}})
 
     sql = executed_sql(mock_cursor)
     params = mock_cursor.execute.call_args.args[1]
+    assert "THEN CAST(payload->>%s AS DOUBLE PRECISION) END > %s" in sql
     assert "payload @> %s::JSONB" in sql
-    assert params[2] == '{"priority":{"gt":3,"eq":7}}'
-    assert "Mixed range and non-range operators" in caplog.text
+    assert params[1] == "u1"
+    assert params[2:5] == ("priority", "priority", 3)
+    assert params[5] == '{"priority":7}'
 
 
 def test_search_supports_explicit_and_for_range_and_non_range_same_field():
@@ -784,15 +785,45 @@ def test_search_supports_explicit_and_for_range_and_non_range_same_field():
     assert params[4] == '{"priority":7}'
 
 
-def test_field_filter_degrades_multiple_non_range_operators_to_exact_equality(caplog):
+def test_field_filter_supports_multiple_non_range_operators():
     db, *_ = make_gaussdb()
-    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
 
     expr, params = db._build_field_filter("status", {"eq": "active", "ne": "deleted"})
 
-    assert expr == "payload @> %s::JSONB"
-    assert params == ['{"status":{"eq":"active","ne":"deleted"}}']
-    assert "Multiple non-range operators" in caplog.text
+    assert expr == "payload @> %s::JSONB AND (payload @> %s::JSONB) IS NOT TRUE"
+    assert params == ['{"status":"active"}', '{"status":"deleted"}']
+
+
+def test_search_supports_memory_merged_same_field_and_filters():
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "priority": {"gte": 5, "lte": 100, "ne": 50}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "THEN CAST(payload->>%s AS DOUBLE PRECISION) END >= %s" in sql
+    assert "THEN CAST(payload->>%s AS DOUBLE PRECISION) END <= %s" in sql
+    assert "(payload @> %s::JSONB) IS NOT TRUE" in sql
+    assert params[1] == "u1"
+    assert params[2:5] == ("priority", "priority", 5)
+    assert params[5:8] == ("priority", "priority", 100)
+    assert params[8] == '{"priority":50}'
+
+
+def test_search_not_with_degraded_subexpression_matches_no_rows(caplog):
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
+
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "$not": [{"flag": {"exists": True}}]})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert '"user_id" = %s' in sql
+    assert "1 = 0" in sql
+    assert params[1] == "u1"
+    assert "forcing this NOT branch to match no rows" in caplog.text
 
 
 def test_list_undeclared_datetime_range_auto_infers_timestamptz_cast_and_guard():

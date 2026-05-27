@@ -277,7 +277,11 @@ Examples:
 
 Provider-specific key-presence operators such as `exists`, `missing`, and `not_exists` are intentionally not exposed.
 
-For direct provider calls, unsupported field-level operator maps and same-field mixed combinations degrade to literal JSON equality semantics instead of partially evaluating only part of the condition. For example, a filter such as `{"price": {"gt": 5, "eq": 7}}` is treated as an exact JSON match on the whole object shape. This keeps behavior conservative and avoids returning overly broad results from silently dropped operators.
+For direct provider calls, supported operators on the same field are combined with `AND`. That means merged filters such as `{"price": {"gte": 5, "lte": 100, "ne": 50}}` are executed as one same-field conjunction instead of degrading to an exact object match.
+
+Unsupported field-level operator maps still degrade to literal JSON equality semantics instead of partially evaluating only part of the condition. For example, a filter such as `{"price": {"between": [5, 7]}}` is treated as an exact JSON match on the whole object shape.
+
+If a degraded expression appears inside a `NOT` subtree, GaussDB forces that `NOT` branch to match no rows instead of inverting the degraded exact-equality expression into an overly broad result set.
 
 ## Score semantics
 
