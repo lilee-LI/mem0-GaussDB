@@ -202,7 +202,7 @@ class GaussDB(VectorStoreBase):
                     cur.execute(
                         "SELECT 1 FROM pg_indexes "
                         "WHERE schemaname = %s AND tablename = %s "
-                        "AND indexdef LIKE '%USING bm25%'",
+                        "AND indexdef LIKE '%%USING bm25%%'",
                         (self.schema_name, self.collection_name),
                     )
                     self.bm25_enabled = cur.fetchone() is not None
@@ -1134,62 +1134,158 @@ class GaussDB(VectorStoreBase):
                         expressions.append(f"(({expr}) IS NOT TRUE)")
                         params.extend(sub_params)
             else:
-                expr, sub_params = self._build_field_filter(normalized_key, value)
+                ops_map = self._normalize_field_value(value)
+                expr, sub_params = self._build_field_clauses(normalized_key, value, ops_map)
                 if expr:
                     expressions.append(expr)
                     params.extend(sub_params)
         return " AND ".join(expressions), params
 
     def _build_field_filter(self, key: str, value: Any) -> Tuple[str, List[Any]]:
+        ops_map = self._normalize_field_value(value)
+        return self._build_field_clauses(key, value, ops_map)
+
+    def _normalize_field_value(self, value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return dict(value)
+        if value == "*":
+            return {"wildcard": True}
+        if isinstance(value, list):
+            return {"in": value}
+        return {"eq": value}
+
+    def _build_field_clauses(self, key: str, original_value: Any, ops_map: Dict[str, Any]) -> Tuple[str, List[Any]]:
         self._validate_filter_key(key)
-        if not isinstance(value, dict):
-            if value == "*":
-                return "", []
-            if isinstance(value, list):
-                return self._field_in_expression(key, value, negate=False)
+        if ops_map.get("wildcard") is True and len(ops_map) == 1:
+            return "", []
+
+        ops = set(ops_map.keys())
+        range_ops = {"gt", "gte", "lt", "lte"}
+        supported_ops = {"eq", "ne", "in", "nin", "contains", "icontains", *range_ops}
+        unsupported_ops = ops - supported_ops
+        if unsupported_ops:
+            logger.warning(
+                "Unsupported filter operators %s for field %r; degrading to exact equality semantics.",
+                sorted(unsupported_ops),
+                key,
+            )
+            return self._field_exact_expression(key, original_value, negate=False)
+
+        active_range_ops = ops & range_ops
+        active_non_range_ops = ops - range_ops
+        if active_range_ops and active_non_range_ops:
+            logger.warning(
+                "Mixed range and non-range operators %s for field %r; degrading to exact equality semantics.",
+                sorted(ops),
+                key,
+            )
+            return self._field_exact_expression(key, original_value, negate=False)
+
+        if len(active_non_range_ops) > 1:
+            logger.warning(
+                "Multiple non-range operators %s for field %r; degrading to exact equality semantics.",
+                sorted(active_non_range_ops),
+                key,
+            )
+            return self._field_exact_expression(key, original_value, negate=False)
+
+        if active_range_ops:
+            range_value = {op: ops_map[op] for op in ("gt", "gte", "lt", "lte") if op in ops_map}
+            return self._build_range_filter(key, range_value)
+
+        if "eq" in ops_map:
+            value = ops_map["eq"]
+            if isinstance(value, (list, tuple, dict)):
+                logger.warning(
+                    "Non-scalar operand %r for 'eq' on field %r; degrading to exact equality semantics.",
+                    value,
+                    key,
+                )
+                return self._field_exact_expression(key, original_value, negate=False)
             if key in self._redundant_scope_columns:
                 field_sql, params = self._field_sql(key)
                 if value is None:
                     return f"{field_sql} IS NULL", params
                 return f"{field_sql} = %s", [*params, value]
-            if value is None:
-                return self._field_exact_expression(key, value, negate=False)
             return self._field_exact_expression(key, value, negate=False)
 
-        ops = set(value.keys())
-        range_ops = {"gt", "gte", "lt", "lte"}
-        if ops & range_ops:
-            non_range_ops = ops - range_ops
-            if non_range_ops:
-                raise ValueError(
-                    f"Cannot mix range operators ({sorted(ops & range_ops)}) with "
-                    f"non-range operators ({sorted(non_range_ops)}) for field {key!r}. "
-                    "Use AND to combine them as separate conditions."
+        if "ne" in ops_map:
+            value = ops_map["ne"]
+            if isinstance(value, (list, tuple, dict)):
+                logger.warning(
+                    "Non-scalar operand %r for 'ne' on field %r; degrading to exact equality semantics.",
+                    value,
+                    key,
                 )
-            return self._build_range_filter(key, value)
-        if "eq" in value:
-            return self._build_field_filter(key, value["eq"])
-        if "ne" in value:
+                return self._field_exact_expression(key, original_value, negate=False)
             if key in self._redundant_scope_columns:
                 field_sql, params = self._field_sql(key)
-                if value["ne"] is None:
+                if value is None:
                     return f"{field_sql} IS NOT NULL", params
-                return f"({field_sql} = %s) IS NOT TRUE", [*params, value["ne"]]
-            return self._field_exact_expression(key, value["ne"], negate=True)
-        if "in" in value:
-            return self._field_in_expression(key, value["in"], negate=False)
-        if "nin" in value:
-            return self._field_in_expression(key, value["nin"], negate=True)
-        if "contains" in value or "icontains" in value:
-            op = "icontains" if "icontains" in value else "contains"
-            field_sql, params = self._field_sql(key)
-            escaped = self._escape_like(value[op])
+                return f"({field_sql} = %s) IS NOT TRUE", [*params, value]
+            return self._field_exact_expression(key, value, negate=True)
+
+        if "in" in ops_map:
+            value = ops_map["in"]
+            if not isinstance(value, (list, tuple)):
+                logger.warning(
+                    "Non-sequence operand %r for 'in' on field %r; degrading to exact equality semantics.",
+                    value,
+                    key,
+                )
+                return self._field_exact_expression(key, original_value, negate=False)
+            return self._field_in_expression(key, list(value), negate=False)
+
+        if "nin" in ops_map:
+            value = ops_map["nin"]
+            if not isinstance(value, (list, tuple)):
+                logger.warning(
+                    "Non-sequence operand %r for 'nin' on field %r; degrading to exact equality semantics.",
+                    value,
+                    key,
+                )
+                return self._field_exact_expression(key, original_value, negate=False)
+            return self._field_in_expression(key, list(value), negate=True)
+
+        if "contains" in ops_map or "icontains" in ops_map:
+            op = "icontains" if "icontains" in ops_map else "contains"
+            value = ops_map[op]
+            if not isinstance(value, str):
+                logger.warning(
+                    "Non-string operand %r for %s on field %r; degrading to exact equality semantics.",
+                    value,
+                    op,
+                    key,
+                )
+                return self._field_exact_expression(key, original_value, negate=False)
+            escaped = self._escape_like(value)
+            if key in self._redundant_scope_columns:
+                # Scope columns are VARCHAR — LIKE works directly
+                field_sql, params = self._field_sql(key)
+                if op == "icontains":
+                    expression = f"LOWER({field_sql}) LIKE LOWER(%s) ESCAPE '!'"
+                else:
+                    expression = f"{field_sql} LIKE %s ESCAPE '!'"
+                return expression, [*params, f"%{escaped}%"]
+            # JSONB columns — guard with jsonb_typeof to only match string-typed values
             if op == "icontains":
-                expression = f"LOWER({field_sql}) LIKE LOWER(%s) ESCAPE '!'"
+                expression = (
+                    "jsonb_typeof(payload->%s) = 'string' "
+                    "AND LOWER(payload->>%s) LIKE LOWER(%s) ESCAPE '!'"
+                )
             else:
-                expression = f"{field_sql} LIKE %s ESCAPE '!'"
-            return expression, [*params, f"%{escaped}%"]
-        raise ValueError(f"Unsupported filter operator(s) for field {key!r}: {sorted(ops)}")
+                expression = (
+                    "jsonb_typeof(payload->%s) = 'string' "
+                    "AND payload->>%s LIKE %s ESCAPE '!'"
+                )
+            return expression, [key, key, f"%{escaped}%"]
+
+        logger.warning(
+            "Unrecognized normalized filter state %s for field %r; degrading to exact equality semantics.",
+            sorted(ops),
+            key,
+        )
+        return self._field_exact_expression(key, original_value, negate=False)
 
     def _field_in_expression(self, key: str, values: Iterable[Any], negate: bool) -> Tuple[str, List[Any]]:
         values = list(values)

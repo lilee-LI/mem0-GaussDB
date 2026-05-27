@@ -275,7 +275,9 @@ Examples:
 {"optional": None}
 ```
 
-Provider-specific key-presence operators such as `exists`, `missing`, and `not_exists` are intentionally not exposed. Unsupported operators raise `ValueError`, matching Qdrant's enhanced filter behavior instead of silently falling back to PGVector-style string equality.
+Provider-specific key-presence operators such as `exists`, `missing`, and `not_exists` are intentionally not exposed.
+
+For direct provider calls, unsupported field-level operator maps and same-field mixed combinations degrade to literal JSON equality semantics instead of partially evaluating only part of the condition. For example, a filter such as `{"price": {"gt": 5, "eq": 7}}` is treated as an exact JSON match on the whole object shape. This keeps behavior conservative and avoids returning overly broad results from silently dropped operators.
 
 ## Score semantics
 

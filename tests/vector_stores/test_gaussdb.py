@@ -697,11 +697,18 @@ def test_search_ne_bool_uses_typed_jsonb_negation():
     assert params[2] == '{"flag":true}'
 
 
-def test_search_rejects_provider_specific_presence_filters():
-    db, _, _, _ = make_gaussdb()
+def test_search_degrades_provider_specific_presence_filters_to_exact_equality(caplog):
+    db, _, _, mock_cursor = make_gaussdb()
+    mock_cursor.fetchall.return_value = []
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
 
-    with pytest.raises(ValueError, match="Unsupported filter operator"):
-        db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": True}})
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "flag": {"exists": True}})
+
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "payload @> %s::JSONB" in sql
+    assert params[2] == '{"flag":{"exists":true}}'
+    assert "degrading to exact equality semantics" in caplog.text
 
 
 def test_search_not_uses_is_not_true_semantics():
@@ -744,14 +751,18 @@ def test_search_inferred_numeric_range_uses_typed_numeric_cast():
     assert params[5:8] == ("priority", "priority", 7)
 
 
-def test_search_rejects_mixed_range_and_non_range_operators_for_same_field():
+def test_search_degrades_mixed_range_and_non_range_operators_for_same_field(caplog):
     db, _, _, mock_cursor = make_gaussdb()
     mock_cursor.fetchall.return_value = []
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
 
-    with pytest.raises(ValueError, match="Cannot mix range operators"):
-        db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "priority": {"gt": 3, "eq": 7}})
+    db.search("hello", [0.1, 0.2, 0.3], filters={"user_id": "u1", "priority": {"gt": 3, "eq": 7}})
 
-    assert mock_cursor.execute.call_count == 0
+    sql = executed_sql(mock_cursor)
+    params = mock_cursor.execute.call_args.args[1]
+    assert "payload @> %s::JSONB" in sql
+    assert params[2] == '{"priority":{"gt":3,"eq":7}}'
+    assert "Mixed range and non-range operators" in caplog.text
 
 
 def test_search_supports_explicit_and_for_range_and_non_range_same_field():
@@ -771,6 +782,17 @@ def test_search_supports_explicit_and_for_range_and_non_range_same_field():
     assert "payload @> %s::JSONB" in sql
     assert params[1:4] == ("priority", "priority", 3)
     assert params[4] == '{"priority":7}'
+
+
+def test_field_filter_degrades_multiple_non_range_operators_to_exact_equality(caplog):
+    db, *_ = make_gaussdb()
+    caplog.set_level(logging.WARNING, logger="mem0.vector_stores.gaussdb")
+
+    expr, params = db._build_field_filter("status", {"eq": "active", "ne": "deleted"})
+
+    assert expr == "payload @> %s::JSONB"
+    assert params == ['{"status":{"eq":"active","ne":"deleted"}}']
+    assert "Multiple non-range operators" in caplog.text
 
 
 def test_list_undeclared_datetime_range_auto_infers_timestamptz_cast_and_guard():
@@ -1857,8 +1879,12 @@ def test_build_filter_expression_and_field_helpers_cover_error_and_edge_paths():
     assert params == ["u1", "u2", "u3"]
 
     assert db._build_field_filter("category", "*") == ("", [])
-    with pytest.raises(ValueError):
-        db._build_field_filter("category", {"regex": "x"})
+    expr, params = db._build_field_filter("category", {"regex": "x"})
+    assert expr == "payload @> %s::JSONB"
+    assert params == ['{"category":{"regex":"x"}}']
+    expr, params = db._build_field_filter("category", {"eq": "*"})
+    assert expr == "payload @> %s::JSONB"
+    assert params == ['{"category":"*"}']
 
     assert db._field_in_expression("category", [], negate=False) == ("1 = 0", [])
     assert db._field_in_expression("category", [], negate=True) == ("1 = 1", [])
@@ -1929,7 +1955,7 @@ def test_init_auto_create_verifies_bm25_present_when_collection_exists():
     # Verify pg_indexes query was executed
     sql = executed_sql(mock_cursor)
     assert "pg_indexes" in sql
-    assert "USING bm25" in sql
+    assert "%%USING bm25%%" in sql  # psycopg2 requires %% for literal % in parameterized queries
 
 
 def test_init_auto_create_detects_bm25_absent_when_collection_exists():
@@ -1953,7 +1979,7 @@ def test_init_auto_create_detects_bm25_absent_when_collection_exists():
     assert db.capabilities.bm25 is False
     sql = executed_sql(mock_cursor)
     assert "pg_indexes" in sql
-    assert "USING bm25" in sql
+    assert "%%USING bm25%%" in sql  # psycopg2 requires %% for literal % in parameterized queries
 
 
 def test_init_rejects_maxconn_less_than_minconn():
@@ -2104,8 +2130,9 @@ def test_build_field_filter_covers_scope_ne_nin_contains_and_list_singleton():
     assert len(params) == 2
 
     expr, params = db._build_field_filter("title", {"contains": "100%_ok"})
-    assert "LIKE %s ESCAPE '!'" in expr
-    assert params == ["title", "%100!%!_ok%"]
+    assert "jsonb_typeof(payload->%s) = 'string'" in expr
+    assert "payload->>%s LIKE %s ESCAPE '!'"
+    assert params == ["title", "title", "%100!%!_ok%"]
 
     expr, params = db._build_field_filter("title", ["x"])
     assert expr == "payload @> %s::JSONB"
@@ -2788,3 +2815,70 @@ class TestLogicBugAndEdgeCases:
         # The outer $and should combine them with AND
         assert " OR " in sql
         assert " AND " in sql
+
+
+# ===========================================================
+# Operand type guard tests: eq/ne + non-scalar, contains/icontains jsonb_typeof
+# ===========================================================
+
+
+def test_eq_with_list_operand_degrades_to_exact_expression():
+    db, *_ = make_gaussdb()
+
+    # scope column: eq + list degrades to payload @> (can't bind list to %s)
+    expr, params = db._build_field_filter("user_id", {"eq": ["a", "b"]})
+    assert expr == "payload @> %s::JSONB"
+    assert 'user_id' in params[0]
+
+    # JSONB column: eq + list degrades to payload @> containment
+    expr, params = db._build_field_filter("category", {"eq": ["a", "b"]})
+    assert expr == "payload @> %s::JSONB"
+    assert 'category' in params[0]
+
+
+def test_ne_with_list_operand_degrades_to_exact_expression():
+    db, *_ = make_gaussdb()
+
+    # All unsupported scenarios degrade to payload @> (negate=False),
+    # producing zero results rather than wrong results
+    expr, params = db._build_field_filter("user_id", {"ne": ["a", "b"]})
+    assert expr == "payload @> %s::JSONB"
+    assert 'user_id' in params[0]
+
+    expr, params = db._build_field_filter("category", {"ne": ["a", "b"]})
+    assert expr == "payload @> %s::JSONB"
+    assert 'category' in params[0]
+
+
+def test_eq_with_dict_operand_degrades():
+    db, *_ = make_gaussdb()
+    expr, params = db._build_field_filter("category", {"eq": {"nested": True}})
+    assert expr == "payload @> %s::JSONB"
+
+
+def test_contains_on_jsonb_column_includes_jsonb_typeof_guard():
+    db, *_ = make_gaussdb()
+
+    expr, params = db._build_field_filter("category", {"contains": "hello"})
+    assert "jsonb_typeof(payload->%s) = 'string'" in expr
+    assert "payload->>%s LIKE %s ESCAPE '!'"
+    assert params == ["category", "category", "%hello%"]
+
+
+def test_icontains_on_jsonb_column_includes_jsonb_typeof_guard():
+    db, *_ = make_gaussdb()
+
+    expr, params = db._build_field_filter("category", {"icontains": "hello"})
+    assert "jsonb_typeof(payload->%s) = 'string'" in expr
+    assert "LOWER(payload->>%s) LIKE LOWER(%s) ESCAPE '!'" in expr
+    assert params == ["category", "category", "%hello%"]
+
+
+def test_contains_on_scope_column_no_jsonb_typeof_guard():
+    db, *_ = make_gaussdb()
+
+    # user_id is a scope column (VARCHAR), LIKE works directly without jsonb_typeof
+    expr, params = db._build_field_filter("user_id", {"contains": "alice"})
+    assert "jsonb_typeof" not in expr
+    assert "LIKE %s ESCAPE '!'" in expr
+    assert params == ["%alice%"]
